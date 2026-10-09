@@ -1,0 +1,17 @@
+[package]
+name = "rubricas"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.6.0"
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+csv = "1.4.0"
+getrandom = "0.4.3"
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal"] }
+toml = "1.1.8"

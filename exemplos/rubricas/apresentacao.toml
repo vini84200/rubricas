@@ -1,0 +1,28 @@
+titulo = "Apresentação"
+
+[[criterios]]
+nome = "Demonstrou o programa funcionando"
+escala = { tipo = "binaria", pontos = 1.0 }
+
+[[criterios]]
+nome = "Explica o próprio código"
+descricao = "Responde às perguntas sobre trechos escolhidos pelo avaliador."
+
+[criterios.escala]
+tipo = "niveis"
+
+[[criterios.escala.niveis]]
+rotulo = "Domina"
+pontos = 2.0
+
+[[criterios.escala.niveis]]
+rotulo = "Com ajuda"
+pontos = 1.0
+
+[[criterios.escala.niveis]]
+rotulo = "Não explica"
+pontos = 0.0
+
+[[criterios]]
+nome = "Respeitou o tempo"
+escala = { tipo = "binaria", pontos = 0.5 }

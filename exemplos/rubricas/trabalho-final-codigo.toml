@@ -1,0 +1,70 @@
+titulo = "Trabalho final: código"
+descricao = "Avaliação do código entregue. Um arquivo por rubrica; os ids podem ser omitidos e são gerados a partir dos nomes."
+
+[[criterios]]
+nome = "Compila sem erros"
+descricao = "gcc -Wall, sem alterações no código entregue."
+escala = { tipo = "binaria", pontos = 1.0 }
+
+[[criterios]]
+nome = "Funcionalidades"
+descricao = "O programa faz o que o enunciado pede: movimentação, coleta de itens, fim de jogo."
+
+[criterios.escala]
+tipo = "niveis"
+
+[[criterios.escala.niveis]]
+rotulo = "Completo"
+descritor = "Todas as funcionalidades do enunciado, sem falhas visíveis."
+pontos = 3.0
+
+[[criterios.escala.niveis]]
+rotulo = "Quase tudo"
+descritor = "Falta uma funcionalidade ou há falhas pontuais."
+pontos = 2.0
+
+[[criterios.escala.niveis]]
+rotulo = "Parcial"
+descritor = "Só o básico funciona."
+pontos = 1.0
+
+[[criterios.escala.niveis]]
+rotulo = "Não funciona"
+descritor = "Não executa ou não faz o mínimo."
+pontos = 0.0
+
+[[criterios]]
+nome = "Modularização"
+descricao = "Funções com responsabilidade única, sem variáveis globais desnecessárias."
+
+[criterios.escala]
+tipo = "niveis"
+
+[[criterios.escala.niveis]]
+rotulo = "Excelente"
+descritor = "Funções curtas e bem nomeadas; main só coordena."
+pontos = 2.0
+
+[[criterios.escala.niveis]]
+rotulo = "Bom"
+descritor = "Usa funções, mas algumas fazem coisas demais."
+pontos = 1.5
+
+[[criterios.escala.niveis]]
+rotulo = "Fraco"
+descritor = "Poucas funções; lógica concentrada na main."
+pontos = 0.5
+
+[[criterios.escala.niveis]]
+rotulo = "Ausente"
+descritor = "Tudo na main."
+pontos = 0.0
+
+[[criterios]]
+nome = "Uso de structs e arquivos"
+escala = { tipo = "ponto_unico", esperado = "Estado do jogo em structs; salva e carrega a partida em arquivo binário.", max = 2.0 }
+
+[[criterios]]
+nome = "Legibilidade"
+descricao = "Indentação, nomes e comentários."
+escala = { tipo = "livre", max = 2.0, passo = 0.25 }
