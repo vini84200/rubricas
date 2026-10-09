@@ -20,6 +20,8 @@ O binário é único: a aplicação web vai embutida nele.
 | `rubricas servir [--dados DIR] [--endereco IP:PORTA] [--web DIR]` | Sobe o servidor. `--web` serve a pasta `web/` do disco em vez da embutida, para desenvolver sem recompilar. |
 | `rubricas usuario NOME [--dados DIR]` | Cria o usuário ou troca a senha. Com `RUBRICAS_SENHA` no ambiente, não pergunta. |
 | `rubricas usuario NOME --remover` | Remove o usuário; as sessões dele deixam de valer na hora. |
+| `rubricas token NOME [--remover]` | Cria o token de API do usuário (substitui o anterior) ou o remove. Veja [Claude e scripts](#claude-e-scripts). |
+| `rubricas skill instalar` | Copia a skill do Claude Code para `~/.claude/skills/rubricas/`. |
 
 ## A pasta de dados
 
@@ -29,7 +31,7 @@ dados/
   turmas/<nome>.csv               lista de alunos
   avaliacoes/<id>.json            título, turma e uma cópia das rubricas usadas
   correcoes/<avaliacao>/<aluno>.json
-  usuarios.toml                   usuários e hashes Argon2id das senhas
+  usuarios.toml                   usuários, hashes Argon2id das senhas e SHA-256 dos tokens
   .sessoes.json                   sessões abertas (só o hash de cada token)
 ```
 
@@ -40,6 +42,11 @@ servidor no ar. As gravações são atômicas (arquivo temporário + renomear).
 
 ```toml
 titulo = "Trabalho final: código"
+
+[[criterios]]
+tipo = "roteiro"                                      # passo de roteiro: orienta, não vale nota
+nome = "Rode com entrada vazia"
+descricao = "Execute `python main.py` e aperte Enter. Deve pedir de novo."
 
 [[criterios]]
 nome = "Compila sem erros"
@@ -71,6 +78,12 @@ nome = "Structs e arquivos"
 escala = { tipo = "ponto_unico", esperado = "Estado em structs; salva em arquivo.", max = 2.0 }
 ```
 
+**Passos de roteiro** (`tipo = "roteiro"`) ficam intercalados com os critérios, na ordem do
+arquivo: são as instruções a seguir durante a correção (o que rodar, que entrada testar). Não têm
+`escala` nem `peso`, não entram na nota, no CSV nem na contagem de critérios. A `descricao` de
+passos e critérios aceita Markdown simples: `código`, blocos ``` (com botão de copiar), listas,
+**negrito** e *itálico*.
+
 Os campos `id` de critérios e níveis são opcionais em arquivos escritos à mão (saem do nome); o
 editor web os grava explicitamente, para que renomear um critério não mude sua identidade. Um
 arquivo inválido não derruba nada: aparece como aviso na lista de rubricas.
@@ -97,7 +110,7 @@ nota = nota_maxima × Σ peso_rubrica × (pontos ÷ máximo da rubrica) ÷ Σ pe
 pontos da rubrica = Σ peso_critério × pontos do critério
 ```
 
-Critério sem marcação conta zero. A nota é mostrada com duas casas, arredondando meio para cima.
+Critério sem marcação conta zero; passos de roteiro não contam. A nota é mostrada com duas casas, arredondando meio para cima.
 A conta e o arredondamento existem em dois lugares que precisam andar juntos: `src/modelo.rs` e
 `src/api.rs` (exportação), `web/js/nota.js` e `web/js/util.js` (tela).
 
@@ -120,6 +133,13 @@ alguns segundos depois de marcar, um botão "Desfazer" devolve o critério ao qu
 | | `Enter` | no resumo: próximo aluno |
 | | `[` `]` | aluno anterior / seguinte |
 
+**Roteiro.** Um passo de roteiro tem cartão próprio, sem marcação: deslizar para qualquer lado,
+`→`, `←`, `Enter` ou o botão "Seguir" passam ao item seguinte, e o texto rola dentro do cartão.
+Depois de marcar, a avaliação para no roteiro do próximo critério sem marcação, e pula os passos
+de critérios já marcados. Quando se chega a um critério sem passar pelo roteiro dele (pela trilha,
+pelo resumo, ao voltar ou ao desfazer), os nomes dos passos aparecem resumidos no topo do cartão.
+Tocar no cartão do passo também segue, e `Z` desfaz a última marcação mesmo com o passo na tela.
+
 Em tela larga a lista de alunos e as opções do critério ficam sempre visíveis. Os três botões
 abaixo do cartão fazem o mesmo que os gestos.
 
@@ -130,9 +150,28 @@ critério, então dois avaliadores no mesmo aluno não apagam as marcações um 
 critério, vale a última). A fila é separada por usuário. Se a rubrica mudou enquanto havia
 marcações na fila, as que ainda cabem são gravadas e as outras aparecem num aviso na tela.
 
+## Claude e scripts
+
+Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
+servidor com `rubricas token NOME`, mostrado uma vez só e guardado como SHA-256. Ele tem os mesmos
+poderes do usuário e deixa de valer quando o usuário troca a senha ou é removido.
+
+Para gastar poucos tokens, as rubricas também são lidas e gravadas em texto:
+
+| Pedido | Resposta |
+| --- | --- |
+| `GET /api/rubricas.txt` | uma linha por rubrica: `id \| título \| N critérios \| M passos` |
+| `GET /api/rubricas/{id}.toml` | o arquivo, sem os `id` que saem dos nomes |
+| `PUT /api/rubricas/{id}.toml` | valida, grava (ou cria) e responde numa linha; erro com linha e coluna |
+
+No `PUT`, critérios e níveis sem `id` herdam o id do item de mesmo nome na versão gravada: reescrever
+o arquivo inteiro não muda identidades. A skill em `claude/skills/rubricas/SKILL.md` ensina isso ao
+Claude Code. Instale com `rubricas skill instalar` e defina `RUBRICAS_URL` e `RUBRICAS_TOKEN` no
+ambiente da máquina onde o Claude roda.
+
 ## Autenticação e publicação
 
-- Usuários são criados só pela linha de comando; não há cadastro pela web.
+- Usuários e tokens são criados só pela linha de comando; não há cadastro pela web.
 - Sessão por cookie `HttpOnly`, `SameSite=Strict`, 30 dias; ganha `Secure` quando o pedido chega
   com `X-Forwarded-Proto: https`.
 - Trocar a senha, remover ou recriar um usuário encerra as sessões abertas dele.
@@ -148,6 +187,15 @@ O padrão é escutar só em `127.0.0.1`. Para usar no celular, publique atrás d
 rubricas.exemplo.org {
     reverse_proxy 127.0.0.1:8080
 }
+```
+
+Com Docker, há um `Dockerfile` (binário sobre `distroless`) e um `compose.yaml` de exemplo que
+publica só em `127.0.0.1:8080`, para o proxy HTTPS ficar na frente:
+
+```sh
+docker compose up -d --build
+docker compose run --rm rubricas usuario vini --dados /dados
+docker compose run --rm rubricas token vini --dados /dados
 ```
 
 ## Desenvolver

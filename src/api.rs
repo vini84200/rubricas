@@ -1,4 +1,5 @@
-//! Rotas HTTP. Tudo sob `/api` exige sessão, menos `/api/entrar`.
+//! Rotas HTTP. Tudo sob `/api` exige sessão (cookie) ou token de API
+//! (`Authorization: Bearer …`), menos `/api/entrar`.
 
 use crate::auth::{self, Auth, ErroLogin};
 use crate::dados::{self, Dados};
@@ -52,6 +53,7 @@ pub fn rotas(estado: Estado) -> Router {
     let protegidas = Router::new()
         .route("/sessao", get(sessao))
         .route("/rubricas", get(listar_rubricas).post(criar_rubrica))
+        .route("/rubricas.txt", get(listar_rubricas_texto))
         .route("/rubricas/{id}", get(ler_rubrica).put(salvar_rubrica).delete(apagar_rubrica))
         .route("/turmas", get(listar_turmas).post(criar_turma))
         .route("/turmas/{id}", get(ler_turma).put(salvar_turma).delete(apagar_turma))
@@ -119,8 +121,16 @@ fn cookie(headers: &HeaderMap, valor: &str, duracao: u64) -> HeaderValue {
         .unwrap()
 }
 
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ").map(str::trim)
+}
+
 async fn exigir_sessao(State(e): State<Estado>, mut req: Request, next: Next) -> Response {
-    match token(req.headers()).and_then(|t| e.auth.usuario(&t)) {
+    let usuario = match bearer(req.headers()) {
+        Some(t) => e.auth.usuario_por_token(t),
+        None => token(req.headers()).and_then(|t| e.auth.usuario(&t)),
+    };
+    match usuario {
         Some(nome) => {
             req.extensions_mut().insert(Usuario(nome));
             let mut r = next.run(req).await;
@@ -178,16 +188,49 @@ async fn listar_rubricas(State(e): State<Estado>) -> Res<Json<Value>> {
     Ok(Json(json!({ "rubricas": rubricas, "problemas": problemas })))
 }
 
-async fn ler_rubrica(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Rubrica>> {
-    Ok(Json(e.dados.ler_rubrica(&id)?))
+/// Para quem gasta tokens lendo (o Claude): uma linha por rubrica.
+async fn listar_rubricas_texto(State(e): State<Estado>) -> Res<Response> {
+    let (rubricas, problemas) = e.dados.listar_rubricas()?;
+    let mut texto = String::new();
+    for r in &rubricas {
+        let (criterios, passos) = r.contagem();
+        texto.push_str(&format!("{} | {} | {criterios} critérios | {passos} passos\n", r.id, r.titulo));
+    }
+    for p in problemas {
+        texto.push_str(&format!("! {p}\n"));
+    }
+    Ok(texto_puro(texto))
+}
+
+fn texto_puro(texto: String) -> Response {
+    let mut r = texto.into_response();
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    r
+}
+
+/// `GET /rubricas/{id}` dá JSON; `GET /rubricas/{id}.toml`, o TOML enxuto.
+async fn ler_rubrica(State(e): State<Estado>, Path(id): Path<String>) -> Res<Response> {
+    Ok(match id.strip_suffix(".toml") {
+        Some(id) => texto_puro(e.dados.rubrica_toml(id)?),
+        None => Json(e.dados.ler_rubrica(&id)?).into_response(),
+    })
 }
 
 async fn criar_rubrica(State(e): State<Estado>, Json(r): Json<Rubrica>) -> Res<Json<Rubrica>> {
     Ok(Json(e.dados.salvar_rubrica(None, r)?))
 }
 
-async fn salvar_rubrica(State(e): State<Estado>, Path(id): Path<String>, Json(r): Json<Rubrica>) -> Res<Json<Rubrica>> {
-    Ok(Json(e.dados.salvar_rubrica(Some(&id), r)?))
+/// `PUT /rubricas/{id}` recebe JSON (editor web); `PUT /rubricas/{id}.toml`, o
+/// arquivo inteiro em TOML, e responde com uma linha só.
+async fn salvar_rubrica(State(e): State<Estado>, Path(id): Path<String>, corpo: String) -> Res<Response> {
+    if let Some(id) = id.strip_suffix(".toml") {
+        let r = e.dados.salvar_rubrica_toml(id, &corpo)?;
+        let (criterios, passos) = r.contagem();
+        return Ok(texto_puro(format!("Gravada: {} ({criterios} critérios, {passos} passos)\n", r.id)));
+    }
+    let r: Rubrica =
+        serde_json::from_str(&corpo).map_err(|err| Erro(StatusCode::UNPROCESSABLE_ENTITY, format!("Pedido inválido: {err}")))?;
+    Ok(Json(e.dados.salvar_rubrica(Some(&id), r)?).into_response())
 }
 
 async fn apagar_rubrica(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {
@@ -381,7 +424,7 @@ pub fn notas_csv(av: &Avaliacao, turma: &Turma, correcoes: &std::collections::BT
     let varias = av.rubricas.len() > 1;
     let mut cab = vec!["matricula".to_string(), "nome".to_string()];
     for ra in &av.rubricas {
-        for c in &ra.rubrica.criterios {
+        for c in ra.rubrica.criterios.iter().filter(|c| !c.roteiro()) {
             cab.push(texto_csv(&if varias { format!("{}: {}", ra.rubrica.titulo, c.nome) } else { c.nome.clone() }));
         }
         if varias {
@@ -398,7 +441,7 @@ pub fn notas_csv(av: &Avaliacao, turma: &Turma, correcoes: &std::collections::BT
         let mut comentarios = Vec::new();
         for (ra, parcial) in av.rubricas.iter().zip(&r.rubricas) {
             let respostas = correcao.and_then(|c| c.respostas.get(&ra.origem));
-            for c in &ra.rubrica.criterios {
+            for c in ra.rubrica.criterios.iter().filter(|c| !c.roteiro()) {
                 let resposta = respostas.and_then(|m| m.get(&c.id));
                 let pontos = resposta.and_then(|x| c.pontos(&x.marcacao).ok());
                 linha.push(pontos.map(|p| numero(p * c.peso, br)).unwrap_or_default());
@@ -468,5 +511,33 @@ mod testes {
         assert_eq!(numero(-0.004, false), "0");
         assert_eq!(texto_csv("=1+1"), "'=1+1");
         assert_eq!(texto_csv("Ana"), "Ana");
+    }
+
+    #[test]
+    fn csv_nao_tem_coluna_para_passo_de_roteiro() {
+        let mut r: Rubrica = toml::from_str(
+            r#"
+            titulo = "Prática"
+            [[criterios]]
+            tipo = "roteiro"
+            nome = "Rode com entrada vazia"
+            [[criterios]]
+            nome = "Trata entrada vazia"
+            escala = { tipo = "binaria", pontos = 1.0 }
+            "#,
+        )
+        .unwrap();
+        r.normalizar();
+        let av = Avaliacao {
+            id: "p".into(),
+            titulo: "P".into(),
+            turma: "d".into(),
+            nota_maxima: 10.0,
+            rubricas: vec![RubricaAplicada { origem: "p".into(), peso: 1.0, rubrica: r }],
+        };
+        let turma = Turma { id: "d".into(), alunos: vec![Aluno { id: "1".into(), nome: "Ana".into() }] };
+        let csv = notas_csv(&av, &turma, &Default::default(), false);
+        assert_eq!(csv.lines().next().unwrap(), "matricula,nome,Trata entrada vazia,nota,situacao,comentarios");
+        assert_eq!(csv.lines().nth(1).unwrap(), "1,Ana,,,não avaliado,");
     }
 }

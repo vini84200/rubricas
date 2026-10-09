@@ -224,10 +224,16 @@ input[type='file'] { font-size: 15px; }
 .criterios { display: grid; gap: 10px; }
 .criterio { border: 1.5px solid var(--linha); border-radius: 12px; background: #fff; }
 .criterio.aberto { border-color: var(--quadro); }
+.criterio.passo { border-style: dashed; background: var(--papel); }
+.criterio.passo .criterio-ordem { color: var(--meio); }
+.acoes-lista { display: flex; flex-wrap: wrap; gap: 8px; }
 .criterio-cabeca {
   display: grid; grid-template-columns: auto 1fr auto; align-items: baseline; gap: 12px;
   width: 100%; padding: 14px; border: 0; background: none; text-align: left;
 }
+.criterio-linha { display: flex; align-items: center; }
+.criterio-linha .criterio-cabeca { flex: 1; min-width: 0; }
+.criterio-setas { display: flex; gap: 2px; padding-right: 8px; }
 .criterio-ordem { font-weight: 700; color: var(--tinta-2); font-variant-numeric: tabular-nums; }
 .criterio-nome { font-weight: 700; min-width: 0; }
 .criterio-resumo { font-size: 15px; color: var(--tinta-2); white-space: nowrap; }
@@ -334,6 +340,8 @@ html.avaliando, html.avaliando body { height: 100%; overflow: hidden; overscroll
 .trecho[data-tom='nao']::before { background: var(--nao-giz); }
 .trecho[aria-current]::before { top: 7px; height: 12px; outline: 2px solid var(--giz-branco); outline-offset: 1px; }
 .trecho.fim { flex: 0 0 18px; }
+.trecho[data-tipo='passo'] { flex: 0 0 6px; min-width: 6px; }
+.trecho[data-tipo='passo']::before { left: 1px; right: 1px; top: 11px; height: 4px; background: rgba(237, 242, 234, .14); }
 .trecho.fim::before { left: 3px; right: 3px; top: 7px; height: 12px; border-radius: 50%; }
 
 .av-palco { grid-area: palco; display: grid; place-items: center; padding: 14px 20px 10px; min-height: 0; position: relative; }
@@ -423,6 +431,30 @@ html.avaliando, html.avaliando body { height: 100%; overflow: hidden; overscroll
 .carimbo.livre[data-tom='nao'] { color: var(--nao); }
 .ficha[data-dir='direita'] .carimbo.sim, .ficha[data-dir='esquerda'] .carimbo.nao { opacity: var(--forca); }
 .ficha.fantasma[data-dir='cima'] .carimbo.livre:not(:empty) { opacity: 1; }
+
+/* Passo de roteiro: cartão de instrução, sem níveis. O texto rola. */
+.ficha.passo { background: var(--papel); }
+.ficha.passo .ficha-onde { border-bottom-color: var(--giz); }
+.ficha-rotulo-passo { font-weight: 700; color: var(--meio); text-transform: uppercase; letter-spacing: .06em; font-size: 13px; }
+.ficha.passo .ficha-texto { overflow-y: auto; touch-action: pan-y; overscroll-behavior: contain; -webkit-mask-image: none; mask-image: none; color: var(--tinta); }
+.ficha.passo .dica.cima { grid-column: 1 / -1; }
+.ficha.passo .carimbo.sim, .ficha.passo .carimbo.nao { color: var(--meio); }
+.ficha.passo[data-pronto][data-dir='direita'], .ficha.passo[data-pronto][data-dir='esquerda'] { box-shadow: 0 0 0 5px var(--giz), 0 16px 30px -12px rgba(0, 0, 0, .6); }
+.ficha-passos { flex: none; display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 0; padding: 0; list-style: none; font-size: 14px; color: var(--meio); }
+.ficha-passos::before { content: 'Roteiro:'; font-weight: 700; }
+.ficha-passos li { padding: 1px 8px; border-radius: 999px; background: var(--meio-fundo); }
+
+/* Markdown das descrições */
+.md { display: grid; align-content: start; gap: 8px; }
+.md p, .md ul, .md ol { margin: 0; }
+.md ul, .md ol { padding-left: 1.3em; }
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md code { padding: 0 4px; border-radius: 4px; background: rgba(21, 32, 27, .08); font-family: ui-monospace, 'SFMono-Regular', Menlo, monospace; font-size: .9em; }
+.md-codigo { position: relative; }
+.md-codigo pre { margin: 0; padding: 10px 12px; padding-right: 76px; border-radius: 8px; background: var(--quadro); color: var(--giz-branco); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; }
+.md-codigo pre code { padding: 0; background: none; font-size: inherit; }
+.md-copiar { position: absolute; top: 6px; right: 6px; min-height: 32px; padding: 4px 10px; border: 1.5px solid rgba(237, 242, 234, .5); border-radius: 6px; background: var(--quadro-claro); color: var(--giz-branco); font-size: 13px; font-weight: 700; }
 
 .solte {
   position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 12px;

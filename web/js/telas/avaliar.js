@@ -7,12 +7,16 @@
 //   ↓ baixo    = voltar      ↓  ou Backspace
 //                            1–9 escolhe o nível, S pula, C comenta, Z desfaz,
 //                            Enter próximo aluno, [ e ] trocam de aluno
+//
+// Passos de roteiro ganham um cartão próprio, sem marcação: deslizar para os lados,
+// →, ←, Enter ou espaço seguem para o próximo item.
 import { html, useState, useEffect, useRef, useMemo } from '../../vendor/preact-htm.js';
 import { carregarPacote, fila, guardarCorrecoes, aplicarLote } from '../api.js';
 import {
   calcular, itens as listarItens, marcacaoRapida, niveisOrdenados, rotulo, tom, pontos, maximo,
-  temIntermediarios, passoDe, DESEMPENHOS,
+  temIntermediarios, passoDe, DESEMPENHOS, ehRoteiro, pesoDe,
 } from '../nota.js';
+import { Markdown } from '../markdown.js';
 import { ir, rota, num, campo, lerNum, cls, vibrar, semAcento, plural } from '../util.js';
 import { Estado } from './comum.js';
 
@@ -34,9 +38,26 @@ function respostaDe(correcao, item) {
   return correcao?.respostas?.[item.origem]?.[item.criterio.id] || null;
 }
 
-function primeiroSemResposta(itens, correcao) {
-  const i = itens.findIndex((it) => pontos(it.criterio, respostaDe(correcao, it)) === null);
-  return i < 0 ? itens.length : i;
+function semResposta(itens, correcao, i) {
+  return pontos(itens[i].criterio, respostaDe(correcao, itens[i])) === null;
+}
+
+/** Onde parar: critério sem marcação, ou passo de roteiro que leva a um. Passos
+    de critérios já marcados ficam para trás. */
+function primeiroSemResposta(itens, correcao, de = 0) {
+  for (let i = de; i < itens.length; i += 1) {
+    let alvo = i;
+    while (alvo < itens.length && ehRoteiro(itens[alvo].criterio)) alvo += 1;
+    if (alvo < itens.length && semResposta(itens, correcao, alvo)) return i;
+  }
+  return itens.length;
+}
+
+/** Passos de roteiro logo antes do item `i`. */
+function passosAntes(itens, i) {
+  let j = i;
+  while (j > 0 && ehRoteiro(itens[j - 1].criterio)) j -= 1;
+  return itens.slice(j, i).map((it) => it.criterio);
 }
 
 /** Rótulo e pontos do que o deslize lateral marca. */
@@ -49,14 +70,17 @@ function rapido(criterio, positivo) {
 // Cartão do critério
 // ---------------------------------------------------------------------------
 
-function Ficha({ item, resposta, posicao, total, mostrarRubrica, entrada, comentario, desfazer, aoPositivo, aoNegativo, aoCima, aoBaixo, controle }) {
+const SEGUIR = { texto: 'Seguir' };
+
+function Ficha({ item, resposta, posicao, mostrarRubrica, entrada, comentario, desfazer, passos, aoPositivo, aoNegativo, aoCima, aoBaixo, controle }) {
   const ref = useRef(null);
   const gesto = useRef(null);
   const toque = useRef(false);
   const c = item.criterio;
-  const pos = rapido(c, true);
-  const neg = rapido(c, false);
-  const intermediarios = temIntermediarios(c);
+  const passo = ehRoteiro(c);
+  const pos = passo ? SEGUIR : rapido(c, true);
+  const neg = passo ? SEGUIR : rapido(c, false);
+  const intermediarios = !passo && temIntermediarios(c);
 
   function repousar() {
     const el = ref.current;
@@ -162,7 +186,7 @@ function Ficha({ item, resposta, posicao, total, mostrarRubrica, entrada, coment
         (g.dx > 0 ? aoPositivo : aoNegativo)();
         return;
       }
-    } else if (Math.abs(g.dy) >= LIMIAR_Y || impulso(g.dy, antes.dy)) {
+    } else if ((Math.abs(g.dy) >= LIMIAR_Y || impulso(g.dy, antes.dy)) && !(passo && g.dy < 0)) {
       repousar();
       (g.dy < 0 ? aoCima : aoBaixo)();
       return;
@@ -176,11 +200,33 @@ function Ficha({ item, resposta, posicao, total, mostrarRubrica, entrada, coment
   }
 
   function aoClicar(e) {
-    if (toque.current && !e.target.closest('button, a, textarea, input')) aoCima('toque');
+    // Tocar segue no passo de roteiro; no critério, abre as opções.
+    if (toque.current && !e.target.closest('button, a, textarea, input')) (passo ? aoPositivo : () => aoCima('toque'))();
     toque.current = false;
   }
 
   const marcado = resposta ? tom(c, resposta) : '';
+  if (passo) {
+    return html`
+      <article class=${cls('ficha', 'passo', `entra-${entrada}`)} ref=${ref} aria-roledescription="passo de roteiro"
+        onPointerDown=${aoDescer} onPointerMove=${aoMover} onPointerUp=${aoSoltar} onPointerCancel=${aoCancelar} onClick=${aoClicar}>
+        <span class="carimbo sim" aria-hidden="true">Seguir</span>
+        <span class="carimbo nao" aria-hidden="true">Seguir</span>
+        <span class="carimbo livre" aria-hidden="true"></span>
+        <p class="ficha-onde">
+          ${desfazer
+            ? html`<button type="button" class="ficha-desfazer" onClick=${desfazer.acao}>Desfazer “${desfazer.texto}”</button>`
+            : html`<span class="ficha-rotulo-passo">Roteiro</span>`}
+          <span>${posicao}</span>
+        </p>
+        <h2 class="ficha-nome">${c.nome}</h2>
+        ${c.descricao && html`<${Markdown} classe="ficha-texto" texto=${c.descricao} />`}
+        <div class="ficha-dicas" aria-hidden="true">
+          <span class="dica cima">toque ou deslize para seguir</span>
+        </div>
+      </article>
+    `;
+  }
   return html`
     <article class=${cls('ficha', `entra-${entrada}`)} ref=${ref} aria-roledescription="cartão de critério"
       onPointerDown=${aoDescer} onPointerMove=${aoMover} onPointerUp=${aoSoltar} onPointerCancel=${aoCancelar} onClick=${aoClicar}>
@@ -191,11 +237,16 @@ function Ficha({ item, resposta, posicao, total, mostrarRubrica, entrada, coment
         ${desfazer
           ? html`<button type="button" class="ficha-desfazer" onClick=${desfazer.acao}>Desfazer “${desfazer.texto}”</button>`
           : mostrarRubrica && html`<span class="ficha-rubrica">${item.rubrica}</span>`}
-        <span>${posicao} de ${total}</span>
+        <span>${posicao}</span>
       </p>
+      ${passos?.length > 0 && html`
+        <ul class="ficha-passos" aria-label="Passos de roteiro antes deste critério">
+          ${passos.map((p) => html`<li>${p.nome}</li>`)}
+        </ul>
+      `}
       <h2 class="ficha-nome">${c.nome}</h2>
       <div class="ficha-texto">
-        ${c.descricao && html`<p>${c.descricao}</p>`}
+        ${c.descricao && html`<${Markdown} texto=${c.descricao} />`}
         ${c.escala.tipo === 'ponto_unico' && html`<p><strong>Esperado:</strong> ${c.escala.esperado}</p>`}
       </div>
       ${resposta && html`
@@ -471,6 +522,7 @@ function Resumo({ aluno, avaliacao, itens, correcao, resultado, desfazer, aoIrPa
         <ul class="resumo-lista">
           ${ra.rubrica.criterios.map((criterio) => {
             i += 1;
+            if (ehRoteiro(criterio)) return null;
             const pos = i;
             const it = itens[pos];
             const r = respostaDe(correcao, it);
@@ -480,7 +532,7 @@ function Resumo({ aluno, avaliacao, itens, correcao, resultado, desfazer, aoIrPa
                 <button type="button" class="resumo-item" data-tom=${tom(criterio, r)} onClick=${() => aoIrPara(pos)}>
                   <span class="resumo-ponto" aria-hidden="true"></span>
                   <span class="resumo-criterio">${criterio.nome}</span>
-                  <span class="resumo-pontos">${p === null ? '' : `${num(p * criterio.peso)} / ${num(maximo(criterio) * criterio.peso)}`}</span>
+                  <span class="resumo-pontos">${p === null ? '' : `${num(p * pesoDe(criterio))} / ${num(maximo(criterio) * pesoDe(criterio))}`}</span>
                   <span class="resumo-marca">${p === null ? 'sem marcação' : rotulo(criterio, r)}</span>
                   ${r?.comentario && html`<span class="resumo-comentario">“${r.comentario}”</span>`}
                 </button>
@@ -522,6 +574,7 @@ export function Avaliar({ id, alunoId }) {
   const [erro, setErro] = useState(null);
   const [correcoes, setCorrecoes] = useState({});
   const [idx, setIdx] = useState(0);
+  const [veioDe, setVeioDe] = useState(-1); // item anterior, para saber se o roteiro já foi visto
   const [entrada, setEntrada] = useState('frente');
   const [bandeja, setBandeja] = useState(false);
   const [listaAberta, setListaAberta] = useState(false);
@@ -611,6 +664,7 @@ export function Avaliar({ id, alunoId }) {
   useEffect(() => {
     if (!pacote || !aluno) return;
     setIdx(primeiroSemResposta(itens, correcoes[aluno.id]));
+    setVeioDe(-1);
     setEntrada('frente');
     setBandeja(false);
     setListaAberta(false);
@@ -660,6 +714,12 @@ export function Avaliar({ id, alunoId }) {
       else if (a.noResumo) {
         if (k === 'Enter') a.seguir();
         else if (k === 'ArrowDown' || k === 'Backspace') a.irPara(a.idx - 1);
+        else return;
+      } else if (ehRoteiro(a.item.criterio)) {
+        if (k === 'ArrowRight' || k === 'd' || k === 'Enter' || k === ' ' || k === 's') a.avancar('direita');
+        else if (k === 'ArrowLeft' || k === 'a') a.avancar('esquerda');
+        else if (k === 'ArrowDown' || k === 'Backspace') a.irPara(a.idx - 1);
+        else if (k === 'z') a.desfazer();
         else return;
       } else if (k === 'ArrowRight' || k === 'd') a.marcar(marcacaoRapida(a.item.criterio, true), 'direita');
       else if (k === 'ArrowLeft' || k === 'a') a.marcar(marcacaoRapida(a.item.criterio, false), 'esquerda');
@@ -711,7 +771,8 @@ export function Avaliar({ id, alunoId }) {
   const resultado = resultados[aluno.id];
   const noResumo = idx >= itens.length;
   const item = noResumo ? null : itens[idx];
-  const resposta = item ? respostaDe(correcao, item) : null;
+  const passo = !!item && ehRoteiro(item.criterio);
+  const resposta = item && !passo ? respostaDe(correcao, item) : null;
   const chaveItem = item ? fila.chave(item.origem, item.criterio.id) : '';
   const comentario = item ? (resposta ? resposta.comentario || '' : rascunhos[`${aluno.id}\n${chaveItem}`] || '') : '';
   const posAluno = alunos.findIndex((a) => a.id === aluno.id);
@@ -734,13 +795,21 @@ export function Avaliar({ id, alunoId }) {
     gravar(item, nova);
     vibrar();
     setUltima({ aluno: aluno.id, idx, anterior: resposta, texto: rotulo(item.criterio, nova) });
-    // Segue para o próximo critério ainda sem marcação; se não há mais, para o resumo.
-    // Assim, revisar um critério no meio não obriga a passar de novo pelos já marcados.
-    let destino = idx + 1;
-    while (destino < itens.length && pontos(itens[destino].criterio, respostaDe(correcao, itens[destino])) !== null) destino += 1;
+    // Segue para o próximo critério ainda sem marcação (ou para o roteiro dele); se
+    // não há mais, para o resumo. Assim, revisar um critério no meio não obriga a
+    // passar de novo pelos já marcados.
     setEntrada('frente');
     setBandeja(false);
-    setIdx(destino);
+    setVeioDe(idx);
+    setIdx(primeiroSemResposta(itens, correcao, idx + 1));
+  }
+
+  function avancar(dir) {
+    if (!passo) return;
+    controle.current?.voar(dir);
+    setEntrada('frente');
+    setVeioDe(idx);
+    setIdx(idx + 1);
   }
 
   function desfazer() {
@@ -748,6 +817,7 @@ export function Avaliar({ id, alunoId }) {
     gravar(itens[ultima.idx], ultima.anterior);
     setEntrada('tras');
     setBandeja(false);
+    setVeioDe(idx);
     setIdx(ultima.idx);
     setUltima(null);
   }
@@ -776,11 +846,12 @@ export function Avaliar({ id, alunoId }) {
   function irPara(i) {
     setEntrada(i < idx ? 'tras' : 'frente');
     setBandeja(false);
+    setVeioDe(idx);
     setIdx(Math.max(0, Math.min(itens.length, i)));
   }
 
   function abrirOpcoes(origem) {
-    if (noResumo) return;
+    if (noResumo || passo) return;
     if (largo) {
       if (origem !== 'toque') (focoNota.current || document.querySelector('.av-painel .opcao'))?.focus();
     } else {
@@ -813,16 +884,21 @@ export function Avaliar({ id, alunoId }) {
     else if (proximo) trocarAluno(proximo.id);
     else ir(rota('avaliacoes', id));
   }
-  acoes.current = { marcar, irPara, abrirOpcoes, vizinho, seguir, desfazer, item, idx, noResumo, largo, folhaAberta: (bandeja || listaAberta) && !largo };
+  acoes.current = { marcar, avancar, irPara, abrirOpcoes, vizinho, seguir, desfazer, item, idx, noResumo, largo, folhaAberta: (bandeja || listaAberta) && !largo };
 
   const podeDesfazer = ultima && ultima.aluno === aluno.id ? { texto: ultima.texto, acao: desfazer } : null;
-  const pos = item ? rapido(item.criterio, true) : null;
-  const neg = item ? rapido(item.criterio, false) : null;
+  const pos = item && !passo ? rapido(item.criterio, true) : null;
+  const neg = item && !passo ? rapido(item.criterio, false) : null;
+  // Critérios contam "3 de 8"; passos de roteiro não entram na conta.
+  const totalCriterios = itens.filter((it) => !ehRoteiro(it.criterio)).length;
+  const posicao = itens.slice(0, idx + 1).filter((it) => !ehRoteiro(it.criterio)).length;
+  // Chegou ao critério sem passar pelo roteiro dele: os passos aparecem resumidos no cartão.
+  const passos = item && !passo && veioDe !== idx - 1 ? passosAntes(itens, idx) : [];
   const variasRubricas = avaliacao.rubricas.length > 1;
   const hrefNotas = `#${rota('avaliacoes', id)}`;
-  const rotuloOpcoes = !item ? '' : !temIntermediarios(item.criterio) ? 'Comentar' : item.criterio.escala.tipo === 'niveis' ? 'Níveis' : 'Nota';
+  const rotuloOpcoes = !item || passo ? '' : !temIntermediarios(item.criterio) ? 'Comentar' : item.criterio.escala.tipo === 'niveis' ? 'Níveis' : 'Nota';
 
-  const opcoes = item && html`
+  const opcoes = item && !passo && html`
     <${Opcoes} key=${`${aluno.id}:${chaveItem}`} item=${item} resposta=${resposta} comentario=${comentario} comTeclas=${largo}
       focoNota=${focoNota} focoComentario=${focoComentario}
       aoMarcar=${(m) => marcar(m, 'cima')} aoComentar=${comentar} aoLimpar=${limpar} aoPular=${() => irPara(idx + 1)} />
@@ -845,7 +921,7 @@ export function Avaliar({ id, alunoId }) {
         </div>
         <nav class="trilha" aria-label="Critérios">
           ${itens.map((it, i) => html`
-            <button type="button" class="trecho" data-tom=${tom(it.criterio, respostaDe(correcao, it))}
+            <button type="button" class="trecho" data-tom=${tom(it.criterio, respostaDe(correcao, it))} data-tipo=${ehRoteiro(it.criterio) ? 'passo' : null}
               aria-current=${i === idx ? 'step' : null} aria-label=${`${it.criterio.nome}${respostaDe(correcao, it) ? `: ${rotulo(it.criterio, respostaDe(correcao, it))}` : ''}`}
               onClick=${() => irPara(i)}></button>
           `)}
@@ -863,9 +939,11 @@ export function Avaliar({ id, alunoId }) {
           : html`
             <div class="pilha">
               ${idx < itens.length - 1 && html`<div class="ficha-debaixo" aria-hidden="true"></div>`}
-              <${Ficha} key=${`${aluno.id}:${idx}`} item=${item} resposta=${resposta} posicao=${idx + 1} total=${itens.length}
-                mostrarRubrica=${variasRubricas} entrada=${entrada} comentario=${comentario} controle=${controle} desfazer=${podeDesfazer}
-                aoPositivo=${() => marcar(pos.marcacao, 'direita')} aoNegativo=${() => marcar(neg.marcacao, 'esquerda')}
+              <${Ficha} key=${`${aluno.id}:${idx}`} item=${item} resposta=${resposta}
+                posicao=${passo ? (posicao < totalCriterios ? `antes do critério ${posicao + 1}` : '') : `${posicao} de ${totalCriterios}`}
+                mostrarRubrica=${variasRubricas} entrada=${entrada} comentario=${comentario} controle=${controle} desfazer=${podeDesfazer} passos=${passos}
+                aoPositivo=${() => (passo ? avancar('direita') : marcar(pos.marcacao, 'direita'))}
+                aoNegativo=${() => (passo ? avancar('esquerda') : marcar(neg.marcacao, 'esquerda'))}
                 aoCima=${abrirOpcoes} aoBaixo=${() => irPara(idx - 1)} />
             </div>
           `}
@@ -873,7 +951,9 @@ export function Avaliar({ id, alunoId }) {
 
       ${largo && html`
         <aside class="av-painel">
-          ${item ? html`<h2 class="av-painel-titulo">${item.criterio.nome}</h2>${opcoes}` : html`<p class="suave">Escolha um critério do resumo para revisar.</p>`}
+          ${passo
+            ? html`<h2 class="av-painel-titulo">Passo de roteiro</h2><p class="suave">Não vale nota. <kbd>→</kbd> ou <kbd>Enter</kbd> para seguir.</p>`
+            : item ? html`<h2 class="av-painel-titulo">${item.criterio.nome}</h2>${opcoes}` : html`<p class="suave">Escolha um critério do resumo para revisar.</p>`}
           <dl class="teclas">
             <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>mínimo e máximo</dd>
             <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>escolher o nível</dd>
@@ -888,7 +968,15 @@ export function Avaliar({ id, alunoId }) {
         </aside>
       `}
 
-      ${!noResumo && html`
+      ${passo && html`
+        <footer class="av-botoes um">
+          <button type="button" class="av-botao seguir" onClick=${() => avancar('direita')}>
+            <span class="av-botao-texto">Seguir ›</span>
+          </button>
+        </footer>
+      `}
+
+      ${!noResumo && !passo && html`
         <footer class="av-botoes">
           <button type="button" class="av-botao nao" onClick=${() => marcar(neg.marcacao, 'esquerda')}>
             <span class="av-botao-sinal" aria-hidden="true">✗</span>
@@ -920,7 +1008,7 @@ export function Avaliar({ id, alunoId }) {
       ${bandeja && item && !largo && html`
         <${Folha} titulo=${item.criterio.nome} espera=${bandeja === 'toque' ? 350 : 0} aoFechar=${() => setBandeja(false)}
           subtitulo=${(item.criterio.descricao || item.criterio.escala.tipo === 'ponto_unico') && html`
-            ${item.criterio.descricao && html`<p>${item.criterio.descricao}</p>`}
+            ${item.criterio.descricao && html`<${Markdown} texto=${item.criterio.descricao} />`}
             ${item.criterio.escala.tipo === 'ponto_unico' && html`<p><strong>Esperado:</strong> ${item.criterio.escala.esperado}</p>`}
           `}>${opcoes}<//>
       `}

@@ -163,6 +163,32 @@ impl Dados {
         Ok(r)
     }
 
+    /// A rubrica como TOML enxuto (sem os ids que saem dos nomes).
+    pub fn rubrica_toml(&self, id: &str) -> Res<String> {
+        Ok(self.ler_rubrica(id)?.toml_enxuto())
+    }
+
+    /// Grava a rubrica a partir de um TOML inteiro, criando o arquivo se não
+    /// existe. Itens sem id herdam o do item de mesmo nome na versão gravada.
+    pub fn salvar_rubrica_toml(&self, id: &str, texto: &str) -> Res<Rubrica> {
+        checar_id(id)?;
+        let mut r: Rubrica = toml::from_str(texto).map_err(|e| {
+            let onde = e.span().map(|s| {
+                let antes = &texto[..s.start.min(texto.len())];
+                let linha = antes.matches('\n').count() + 1;
+                let coluna = antes.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                format!("linha {linha}, coluna {coluna}: ")
+            });
+            Erro::Invalido(format!("{}{}", onde.unwrap_or_default(), e.message().trim()))
+        })?;
+        match self.ler_rubrica(id) {
+            Ok(anterior) => r.herdar_ids(&anterior),
+            Err(Erro::NaoEncontrado(_) | Erro::Invalido(_)) => {}
+            Err(e) => return Err(e),
+        }
+        self.salvar_rubrica(Some(id), r)
+    }
+
     pub fn apagar_rubrica(&self, id: &str) -> Res<()> {
         let _g = self.trava.lock().unwrap();
         let caminho = self.caminho("rubricas", id, "toml")?;
@@ -439,6 +465,38 @@ pontos = 0.0
 rotulo = "Boa"
 pontos = 1.0
 "#;
+
+    #[test]
+    fn rubrica_como_texto_toml() {
+        let raiz = pasta("texto");
+        let d = Dados::abrir(&raiz).unwrap();
+        // "Clareza" foi renomeado no editor web: o id antigo não sai mais do nome
+        fs::write(raiz.join("rubricas/codigo.toml"), RUBRICA.replace("nome = \"Clareza\"", "id = \"legibilidade\"\nnome = \"Clareza\"")).unwrap();
+        d.salvar_rubrica(Some("codigo"), d.ler_rubrica("codigo").unwrap()).unwrap();
+
+        let texto = d.rubrica_toml("codigo").unwrap();
+        assert!(texto.contains("id = \"legibilidade\""), "{texto}");
+        assert_eq!(texto.matches("id =").count(), 1, "só o id que não sai do nome: {texto}");
+
+        // quem reescreve o arquivo sem ids não muda a identidade dos itens
+        let reescrito = texto.replace("id = \"legibilidade\"\n", "").replace("rotulo = \"Boa\"", "rotulo = \"Boa\"\ndescritor = \"Nomes claros.\"")
+            + "\n[[criterios]]\ntipo = \"roteiro\"\nnome = \"Rode os testes\"\n";
+        let r = d.salvar_rubrica_toml("codigo", &reescrito).unwrap();
+        assert_eq!(r.criterios.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["compila", "legibilidade", "rode-os-testes"]);
+        assert_eq!(d.ler_rubrica("codigo").unwrap(), r);
+
+        // rubrica nova pelo mesmo caminho
+        d.salvar_rubrica_toml("nova", RUBRICA).unwrap();
+        assert_eq!(d.ler_rubrica("nova").unwrap().titulo, "Código");
+
+        // erro de sintaxe diz onde
+        let Err(Erro::Invalido(m)) = d.salvar_rubrica_toml("codigo", "titulo = \"x\"\n[[criterios]\n") else { panic!() };
+        assert!(m.contains("linha 2"), "{m}");
+        // erro de validação também é recusado e não toca no arquivo
+        assert!(matches!(d.salvar_rubrica_toml("codigo", "titulo = \"x\"\n"), Err(Erro::Invalido(_))));
+        assert_eq!(d.ler_rubrica("codigo").unwrap(), r);
+        fs::remove_dir_all(&raiz).unwrap();
+    }
 
     #[test]
     fn fluxo_completo_na_pasta() {

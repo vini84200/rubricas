@@ -1,8 +1,8 @@
 // Rubricas: lista e editor. Cada rubrica é um arquivo rubricas/<id>.toml.
 import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
-import { TIPOS, maximo, maximoRubrica } from '../nota.js';
-import { ir, rota, num, campo, lerNum, chave, plural, cls, pts, guarda } from '../util.js';
+import { TIPOS, maximo, maximoRubrica, ehRoteiro, contarCriterios, resumoItens } from '../nota.js';
+import { ir, rota, num, campo, lerNum, chave, cls, pts, guarda } from '../util.js';
 import { useDados, Estado, Titulo, Vazio } from './comum.js';
 
 export function ListaRubricas() {
@@ -25,7 +25,7 @@ export function ListaRubricas() {
           <li>
             <a class="linha" href=${`#${rota('rubricas', r.id)}`}>
               <span class="linha-titulo">${r.titulo}</span>
-              <span class="linha-meta">${plural(r.criterios.length, 'critério', 'critérios')}, ${pts(maximoRubrica(r))}</span>
+              <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}</span>
             </a>
           </li>
         `)}
@@ -58,11 +58,16 @@ function criterioNovo() {
   return { _k: chave(), id: '', nome: '', descricao: '', peso: '1', escala: { tipo: 'niveis', niveis: niveisDoModelo(4, 3) } };
 }
 
+function passoNovo() {
+  return { _k: chave(), tipo: 'roteiro', id: '', nome: '', descricao: '' };
+}
+
 function paraRascunho(r) {
   return {
     titulo: r.titulo,
     descricao: r.descricao || '',
     criterios: r.criterios.map((c) => {
+      if (ehRoteiro(c)) return { _k: chave(), tipo: 'roteiro', id: c.id, nome: c.nome, descricao: c.descricao || '' };
       const e = c.escala;
       let escala;
       if (e.tipo === 'niveis') {
@@ -74,7 +79,7 @@ function paraRascunho(r) {
       } else {
         escala = { tipo: 'ponto_unico', esperado: e.esperado, max: campo(e.max) };
       }
-      return { _k: chave(), id: c.id, nome: c.nome, descricao: c.descricao || '', peso: campo(c.peso), escala };
+      return { _k: chave(), id: c.id, nome: c.nome, descricao: c.descricao || '', peso: campo(c.peso ?? 1), escala };
     }),
   };
 }
@@ -84,6 +89,7 @@ function doRascunho(r) {
     titulo: r.titulo.trim(),
     descricao: r.descricao.trim(),
     criterios: r.criterios.map((c) => {
+      if (ehRoteiro(c)) return { tipo: 'roteiro', id: c.id, nome: c.nome.trim(), descricao: c.descricao.trim() };
       const e = c.escala;
       let escala;
       if (e.tipo === 'niveis') {
@@ -104,6 +110,7 @@ function doRascunho(r) {
 /** Primeiro número que não dá para ler, para avisar antes de mandar ao servidor. */
 function numeroInvalido(rubrica) {
   for (const c of rubrica.criterios) {
+    if (ehRoteiro(c)) continue;
     const nome = c.nome || 'sem nome';
     if (!Number.isFinite(c.peso)) return `Critério “${nome}”: o peso precisa ser um número`;
     const e = c.escala;
@@ -114,6 +121,7 @@ function numeroInvalido(rubrica) {
 }
 
 function maximoRascunho(c) {
+  if (ehRoteiro(c)) return 0;
   try {
     const m = maximo({ escala: doRascunho({ titulo: '', descricao: '', criterios: [c] }).criterios[0].escala });
     return Number.isFinite(m) ? m : 0;
@@ -176,17 +184,23 @@ function EditorNiveis({ escala, aoMudar, max }) {
   `;
 }
 
-function EditorCriterio({ c, i, total, aberto, alternar, aoMudar, aoMover, aoRemover, aoDuplicar }) {
+function EditorCriterio({ c, i, ordem, total, aberto, alternar, aoMudar, aoMover, aoRemover, aoDuplicar, podeRemover }) {
   const max = maximoRascunho(c);
   const e = c.escala;
   const mudarEscala = (campo, valor) => aoMudar({ ...c, escala: { ...e, [campo]: valor } });
   return html`
     <section class=${cls('criterio', aberto && 'aberto')}>
+      <div class="criterio-linha">
       <button type="button" class="criterio-cabeca" aria-expanded=${aberto} onClick=${alternar}>
-        <span class="criterio-ordem">${i + 1}</span>
+        <span class="criterio-ordem">${ordem}</span>
         <span class="criterio-nome">${c.nome || 'Critério sem nome'}</span>
         <span class="criterio-resumo">${TIPOS[e.tipo]}, ${pts(max)}</span>
       </button>
+        <span class="criterio-setas">
+          <button type="button" class="icone" title="Subir" aria-label=${`Subir “${c.nome || 'sem nome'}”`} disabled=${i === 0} onClick=${() => aoMover(-1)}>↑</button>
+          <button type="button" class="icone" title="Descer" aria-label=${`Descer “${c.nome || 'sem nome'}”`} disabled=${i === total - 1} onClick=${() => aoMover(1)}>↓</button>
+        </span>
+      </div>
       ${aberto && html`
         <div class="criterio-corpo">
           <label class="campo">
@@ -233,10 +247,43 @@ function EditorCriterio({ c, i, total, aberto, alternar, aoMudar, aoMover, aoRem
             </label>
           </details>
           <div class="criterio-acoes">
-            <button type="button" class="botao pequeno" disabled=${i === 0} onClick=${() => aoMover(-1)}>Subir</button>
-            <button type="button" class="botao pequeno" disabled=${i === total - 1} onClick=${() => aoMover(1)}>Descer</button>
             <button type="button" class="botao pequeno" onClick=${aoDuplicar}>Duplicar</button>
-            <button type="button" class="botao pequeno perigo" disabled=${total <= 1} onClick=${aoRemover}>Remover</button>
+            <button type="button" class="botao pequeno perigo" disabled=${!podeRemover} onClick=${aoRemover}>Remover</button>
+          </div>
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function EditorPasso({ c, i, total, aberto, alternar, aoMudar, aoMover, aoRemover }) {
+  return html`
+    <section class=${cls('criterio', 'passo', aberto && 'aberto')}>
+      <div class="criterio-linha">
+      <button type="button" class="criterio-cabeca" aria-expanded=${aberto} onClick=${alternar}>
+        <span class="criterio-ordem" aria-label="Passo de roteiro">▸</span>
+        <span class="criterio-nome">${c.nome || 'Passo sem nome'}</span>
+        <span class="criterio-resumo">roteiro, não vale nota</span>
+      </button>
+        <span class="criterio-setas">
+          <button type="button" class="icone" title="Subir" aria-label=${`Subir “${c.nome || 'sem nome'}”`} disabled=${i === 0} onClick=${() => aoMover(-1)}>↑</button>
+          <button type="button" class="icone" title="Descer" aria-label=${`Descer “${c.nome || 'sem nome'}”`} disabled=${i === total - 1} onClick=${() => aoMover(1)}>↓</button>
+        </span>
+      </div>
+      ${aberto && html`
+        <div class="criterio-corpo">
+          <label class="campo">
+            <span>Passo</span>
+            <input required value=${c.nome} placeholder="Rode com entrada vazia" onInput=${(ev) => aoMudar({ ...c, nome: ev.target.value })} />
+          </label>
+          <label class="campo">
+            <span>Instruções</span>
+            <textarea rows="4" value=${c.descricao} placeholder=${'Execute `python main.py` e aperte Enter.\nDeve pedir a entrada de novo.'}
+              onInput=${(ev) => aoMudar({ ...c, descricao: ev.target.value })}></textarea>
+            <small class="suave">Aceita <code>\`código\`</code>, blocos <code>\`\`\`</code> com botão de copiar, listas com <code>-</code>, <strong>**negrito**</strong> e <em>*itálico*</em>.</small>
+          </label>
+          <div class="criterio-acoes">
+            <button type="button" class="botao pequeno perigo" onClick=${aoRemover}>Remover</button>
           </div>
         </div>
       `}
@@ -304,8 +351,7 @@ export function EditorRubrica({ id }) {
     setAbertos(s);
   }
 
-  function adicionar() {
-    const c = criterioNovo();
+  function adicionar(c = criterioNovo()) {
     mudarCriterios([...r.criterios, c]);
     setAbertos(new Set([...abertos, c._k]));
   }
@@ -316,7 +362,7 @@ export function EditorRubrica({ id }) {
     copia._k = chave();
     copia.id = '';
     copia.nome = origem.nome ? `${origem.nome} (cópia)` : '';
-    if (copia.escala.niveis) copia.escala.niveis.forEach((n) => { n._k = chave(); });
+    if (copia.escala?.niveis) copia.escala.niveis.forEach((n) => { n._k = chave(); });
     const lista = [...r.criterios];
     lista.splice(i + 1, 0, copia);
     mudarCriterios(lista);
@@ -379,6 +425,7 @@ export function EditorRubrica({ id }) {
   }
   if (!r) return null;
 
+  const soCriterios = contarCriterios(r);
   const total = r.criterios.reduce((s, c) => s + maximoRascunho(c) * (Number.isFinite(lerNum(c.peso)) ? lerNum(c.peso) : 0), 0);
 
   return html`
@@ -397,22 +444,29 @@ export function EditorRubrica({ id }) {
         <textarea rows="2" value=${r.descricao} onInput=${(e) => mudar({ ...r, descricao: e.target.value })}></textarea>
       </label>
 
-      <h2>Critérios</h2>
+      <h2>Critérios e roteiro</h2>
+      <p class="suave">Cada passo de roteiro aparece na avaliação logo antes do critério que vem depois dele.</p>
       <div class="criterios">
-        ${r.criterios.map((c, i) => html`
-          <${EditorCriterio} key=${c._k} c=${c} i=${i} total=${r.criterios.length}
-            aberto=${abertos.has(c._k)} alternar=${() => alternar(c._k)}
-            aoMudar=${(novo) => mudarCriterios(r.criterios.map((x) => (x._k === c._k ? novo : x)))}
-            aoMover=${(d) => mudarCriterios(mover(r.criterios, i, d))}
-            aoRemover=${() => mudarCriterios(r.criterios.filter((x) => x._k !== c._k))}
-            aoDuplicar=${() => duplicar(i)} />
-        `)}
+        ${r.criterios.map((c, i) => {
+          const props = {
+            c, i, total: r.criterios.length, aberto: abertos.has(c._k), alternar: () => alternar(c._k),
+            aoMudar: (novo) => mudarCriterios(r.criterios.map((x) => (x._k === c._k ? novo : x))),
+            aoMover: (d) => mudarCriterios(mover(r.criterios, i, d)),
+            aoRemover: () => mudarCriterios(r.criterios.filter((x) => x._k !== c._k)),
+          };
+          return ehRoteiro(c)
+            ? html`<${EditorPasso} key=${c._k} ...${props} />`
+            : html`<${EditorCriterio} key=${c._k} ...${props} ordem=${r.criterios.slice(0, i + 1).filter((x) => !ehRoteiro(x)).length} podeRemover=${soCriterios > 1} aoDuplicar=${() => duplicar(i)} />`;
+        })}
       </div>
-      <button type="button" class="botao" onClick=${adicionar}>Adicionar critério</button>
+      <div class="acoes-lista">
+        <button type="button" class="botao" onClick=${() => adicionar()}>Adicionar critério</button>
+        <button type="button" class="botao" onClick=${() => adicionar(passoNovo())}>Adicionar passo de roteiro</button>
+      </div>
 
       <div class="barra-salvar">
         <span class="barra-info">
-          ${plural(r.criterios.length, 'critério', 'critérios')}, ${pts(total)}
+          ${resumoItens(r)}, ${pts(total)}
           ${sujo && html`<span class="pendente"> — alterações não salvas</span>`}
           ${salvo && !sujo && html`<span class="ok"> — salvo</span>`}
         </span>

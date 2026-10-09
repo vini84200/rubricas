@@ -13,6 +13,9 @@ fn dez() -> f64 {
 fn vazio(s: &String) -> bool {
     s.is_empty()
 }
+fn e_um(v: &f64) -> bool {
+    *v == 1.0
+}
 
 // ---------- Rubrica: o que o usuário constrói ----------
 
@@ -28,16 +31,36 @@ pub struct Rubrica {
     pub criterios: Vec<Criterio>,
 }
 
+/// Um item da rubrica: um critério avaliado ou um passo de roteiro, que só
+/// orienta quem avalia e fica fora da nota.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Criterio {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "TipoItem::e_criterio")]
+    pub tipo: TipoItem,
+    #[serde(default, skip_serializing_if = "vazio")]
     pub id: String,
     pub nome: String,
     #[serde(default, skip_serializing_if = "vazio")]
     pub descricao: String,
-    #[serde(default = "um")]
+    #[serde(default = "um", skip_serializing_if = "e_um")]
     pub peso: f64,
-    pub escala: Escala,
+    /// Obrigatória em critérios; ausente em passos de roteiro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escala: Option<Escala>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TipoItem {
+    #[default]
+    Criterio,
+    Roteiro,
+}
+
+impl TipoItem {
+    fn e_criterio(&self) -> bool {
+        *self == TipoItem::Criterio
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,7 +82,7 @@ pub enum Escala {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Nivel {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "vazio")]
     pub id: String,
     pub rotulo: String,
     #[serde(default, skip_serializing_if = "vazio")]
@@ -205,7 +228,7 @@ impl Rubrica {
                 c.id = id_livre(&slug(&c.nome), |x| usados.contains(x));
             }
             usados.insert(c.id.clone());
-            if let Escala::Niveis { niveis } = &mut c.escala {
+            if let Some(Escala::Niveis { niveis }) = &mut c.escala {
                 let mut usados_n = HashSet::new();
                 for n in niveis {
                     if n.id.trim().is_empty() || usados_n.contains(&n.id) {
@@ -221,23 +244,32 @@ impl Rubrica {
         if self.titulo.trim().is_empty() {
             return Err("A rubrica precisa de um título".into());
         }
-        if self.criterios.is_empty() {
+        if !self.criterios.iter().any(|c| !c.roteiro()) {
             return Err("A rubrica precisa de pelo menos um critério".into());
         }
         let mut ids = HashSet::new();
         for c in &self.criterios {
-            let onde = format!("Critério “{}”", c.nome);
+            let onde = format!("{} “{}”", if c.roteiro() { "Passo de roteiro" } else { "Critério" }, c.nome);
             if c.nome.trim().is_empty() {
-                return Err("Todo critério precisa de um nome".into());
+                return Err("Todo critério e passo de roteiro precisa de um nome".into());
             }
             if c.id.is_empty() || !ids.insert(&c.id) {
                 return Err(format!("{onde}: id vazio ou repetido"));
+            }
+            if c.roteiro() {
+                if c.escala.is_some() || c.peso != 1.0 {
+                    return Err(format!("{onde}: passo de roteiro não tem escala nem peso"));
+                }
+                continue;
             }
             finito(&format!("{onde}: o peso"), c.peso)?;
             if c.peso < 0.0 {
                 return Err(format!("{onde}: o peso não pode ser negativo"));
             }
-            match &c.escala {
+            let Some(escala) = &c.escala else {
+                return Err(format!("{onde}: falta a escala"));
+            };
+            match escala {
                 Escala::Binaria { pontos } => {
                     finito(&format!("{onde}: os pontos"), *pontos)?;
                     if *pontos <= 0.0 {
@@ -280,25 +312,96 @@ impl Rubrica {
         Ok(())
     }
 
+    /// Itens e níveis sem id recebem o id do item de mesmo nome em `anterior`.
+    /// Assim, reescrever o arquivo inteiro sem ids não muda identidades — e as
+    /// correções feitas continuam valendo. Chame antes de `normalizar`.
+    pub fn herdar_ids(&mut self, anterior: &Rubrica) {
+        let mesmo = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+        let mut usados: HashSet<String> = self.criterios.iter().map(|c| c.id.clone()).filter(|id| !id.is_empty()).collect();
+        for c in &mut self.criterios {
+            if c.id.trim().is_empty()
+                && let Some(a) = anterior.criterios.iter().find(|a| mesmo(&a.nome, &c.nome) && !usados.contains(&a.id))
+            {
+                c.id = a.id.clone();
+                usados.insert(c.id.clone());
+            }
+            let antigos = match anterior.criterio(&c.id).and_then(|a| a.escala.as_ref()) {
+                Some(Escala::Niveis { niveis }) => niveis,
+                _ => continue,
+            };
+            if let Some(Escala::Niveis { niveis }) = &mut c.escala {
+                let mut usados_n: HashSet<String> = niveis.iter().map(|n| n.id.clone()).filter(|id| !id.is_empty()).collect();
+                for n in niveis.iter_mut().filter(|n| n.id.trim().is_empty()) {
+                    if let Some(a) = antigos.iter().find(|a| mesmo(&a.rotulo, &n.rotulo) && !usados_n.contains(&a.id)) {
+                        n.id = a.id.clone();
+                        usados_n.insert(n.id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// TOML sem os ids que `normalizar` recriaria a partir dos nomes: menos texto
+    /// para ler e reescrever, mesma rubrica de volta.
+    pub fn toml_enxuto(&self) -> String {
+        let mut completa = self.clone();
+        completa.id.clear();
+        let mut enxuta = completa.clone();
+        for c in &mut enxuta.criterios {
+            if c.id == slug(&c.nome) {
+                c.id.clear();
+            }
+            if let Some(Escala::Niveis { niveis }) = &mut c.escala {
+                for n in niveis.iter_mut().filter(|n| n.id == slug(&n.rotulo)) {
+                    n.id.clear();
+                }
+            }
+        }
+        let texto = toml::to_string_pretty(&enxuta).unwrap_or_default();
+        // Nomes repetidos podem fazer a releitura gerar outros ids; aí vai completo.
+        let volta = toml::from_str::<Rubrica>(&texto).map(|mut r| {
+            r.normalizar();
+            r
+        });
+        match volta {
+            Ok(r) if r == completa => texto,
+            _ => toml::to_string_pretty(&completa).unwrap_or_default(),
+        }
+    }
+
+    /// (critérios avaliados, passos de roteiro)
+    pub fn contagem(&self) -> (usize, usize) {
+        let passos = self.criterios.iter().filter(|c| c.roteiro()).count();
+        (self.criterios.len() - passos, passos)
+    }
+
     pub fn criterio(&self, id: &str) -> Option<&Criterio> {
         self.criterios.iter().find(|c| c.id == id)
     }
 }
 
 impl Criterio {
-    /// Maior pontuação possível, antes do peso.
+    pub fn roteiro(&self) -> bool {
+        self.tipo == TipoItem::Roteiro
+    }
+
+    /// Maior pontuação possível, antes do peso. Zero para passos de roteiro.
     pub fn maximo(&self) -> f64 {
         match &self.escala {
-            Escala::Binaria { pontos } => *pontos,
-            Escala::Niveis { niveis } => niveis.iter().map(|n| n.pontos).fold(0.0, f64::max),
-            Escala::Livre { max, .. } | Escala::PontoUnico { max, .. } => *max,
+            None => 0.0,
+            Some(Escala::Binaria { pontos }) => *pontos,
+            Some(Escala::Niveis { niveis }) => niveis.iter().map(|n| n.pontos).fold(0.0, f64::max),
+            Some(Escala::Livre { max, .. } | Escala::PontoUnico { max, .. }) => *max,
         }
     }
 
     /// Pontos de uma marcação, antes do peso. Erro se ela não combina com a escala.
     pub fn pontos(&self, m: &Marcacao) -> Result<f64, String> {
         let erro = |msg: &str| Err(format!("Critério “{}”: {msg}", self.nome));
-        match (&self.escala, m) {
+        let Some(escala) = self.escala.as_ref().filter(|_| !self.roteiro()) else {
+            return erro("é um passo de roteiro, não recebe marcação");
+        };
+        match (escala, m) {
             (Escala::Binaria { pontos }, Marcacao::Binaria { atende }) => Ok(if *atende { *pontos } else { 0.0 }),
             (Escala::Niveis { niveis }, Marcacao::Nivel { nivel }) => match niveis.iter().find(|n| &n.id == nivel) {
                 Some(n) => Ok(n.pontos),
@@ -348,7 +451,7 @@ impl Avaliacao {
     }
 
     pub fn total_criterios(&self) -> usize {
-        self.rubricas.iter().map(|r| r.rubrica.criterios.len()).sum()
+        self.rubricas.iter().map(|r| r.rubrica.criterios.iter().filter(|c| !c.roteiro()).count()).sum()
     }
 }
 
@@ -383,7 +486,7 @@ pub fn calcular(av: &Avaliacao, correcao: Option<&Correcao>) -> Resultado {
     for ra in &av.rubricas {
         let respostas = correcao.and_then(|c| c.respostas.get(&ra.origem));
         let (mut pontos, mut maximo) = (0.0, 0.0);
-        for c in &ra.rubrica.criterios {
+        for c in ra.rubrica.criterios.iter().filter(|c| !c.roteiro()) {
             total += 1;
             maximo += c.peso * c.maximo();
             let p = respostas.and_then(|r| r.get(&c.id)).and_then(|r| c.pontos(&r.marcacao).ok());
@@ -565,7 +668,7 @@ mod testes {
     fn normalizar_gera_ids_a_partir_dos_nomes() {
         let r = rubrica();
         assert_eq!(r.criterios[1].id, "modularizacao");
-        let Escala::Niveis { niveis } = &r.criterios[1].escala else { panic!() };
+        let Some(Escala::Niveis { niveis }) = &r.criterios[1].escala else { panic!() };
         assert_eq!(niveis[2].id, "excelente");
         r.validar().unwrap();
     }
@@ -611,6 +714,63 @@ mod testes {
         c.respostas.entry("fala".into()).or_default().insert("compila".into(), resp(Marcacao::Binaria { atende: true }));
         // rubrica 1 zerada (peso 1), rubrica 2 completa (peso 3) → 10 × 3/4
         assert_eq!(calcular(&av, Some(&c)).nota, 7.5);
+    }
+
+    const PRATICA: &str = r#"
+        titulo = "Prática"
+        [[criterios]]
+        tipo = "roteiro"
+        nome = "Rode com entrada vazia"
+        descricao = "Aperte `Enter` sem digitar nada."
+        [[criterios]]
+        nome = "Trata entrada vazia"
+        escala = { tipo = "binaria", pontos = 2.0 }
+    "#;
+
+    #[test]
+    fn passos_de_roteiro_nao_contam_na_nota() {
+        let mut r: Rubrica = toml::from_str(PRATICA).unwrap();
+        r.normalizar();
+        r.validar().unwrap();
+        assert!(r.criterios[0].roteiro() && !r.criterios[1].roteiro());
+        let av = Avaliacao {
+            id: "p".into(),
+            titulo: "P".into(),
+            turma: "d".into(),
+            nota_maxima: 10.0,
+            rubricas: vec![RubricaAplicada { origem: "p".into(), peso: 1.0, rubrica: r }],
+        };
+        assert_eq!(av.total_criterios(), 1);
+        let mut c = Correcao::default();
+        c.respostas.entry("p".into()).or_default().insert("trata-entrada-vazia".into(), resp(Marcacao::Binaria { atende: true }));
+        let fim = calcular(&av, Some(&c));
+        assert_eq!((fim.nota, fim.respondidos, fim.total), (10.0, 1, 1));
+        assert!(fim.concluida());
+    }
+
+    #[test]
+    fn passo_de_roteiro_em_toml_fica_enxuto() {
+        let mut r: Rubrica = toml::from_str(PRATICA).unwrap();
+        r.normalizar();
+        let texto = toml::to_string_pretty(&r).unwrap();
+        assert!(texto.contains("tipo = \"roteiro\""), "{texto}");
+        assert!(!texto.contains("peso"), "{texto}");
+        assert_eq!(toml::from_str::<Rubrica>(&texto).unwrap(), r);
+    }
+
+    #[test]
+    fn roteiro_nao_tem_escala_e_criterio_precisa_de_uma() {
+        let ler = |t: &str| {
+            let mut r: Rubrica = toml::from_str(t).unwrap();
+            r.normalizar();
+            r.validar()
+        };
+        let com_escala = PRATICA.replace("descricao = \"Aperte `Enter` sem digitar nada.\"", "escala = { tipo = \"binaria\", pontos = 1.0 }");
+        assert!(ler(&com_escala).unwrap_err().contains("Rode com entrada vazia"));
+        let sem_escala = PRATICA.replace("escala = { tipo = \"binaria\", pontos = 2.0 }", "");
+        assert!(ler(&sem_escala).unwrap_err().contains("Trata entrada vazia"));
+        let so_roteiro = PRATICA.split("[[criterios]]").take(2).collect::<Vec<_>>().join("[[criterios]]");
+        assert!(ler(&so_roteiro).is_err());
     }
 
     #[test]

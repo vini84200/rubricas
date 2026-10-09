@@ -30,6 +30,20 @@ enum Comando {
         #[arg(long)]
         web: Option<PathBuf>,
     },
+    /// Cria (ou troca) o token de API de um usuário, para scripts e para o Claude
+    Token {
+        nome: String,
+        #[arg(long, default_value = "dados")]
+        dados: PathBuf,
+        /// Remove o token em vez de criar um
+        #[arg(long)]
+        remover: bool,
+    },
+    /// Instala a skill do Claude Code em ~/.claude/skills/rubricas
+    Skill {
+        #[command(subcommand)]
+        acao: AcaoSkill,
+    },
     /// Cria um usuário ou troca a senha de um existente
     Usuario {
         nome: String,
@@ -39,6 +53,35 @@ enum Comando {
         #[arg(long)]
         remover: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum AcaoSkill {
+    /// Copia a skill para ~/.claude/skills/rubricas/SKILL.md
+    Instalar,
+}
+
+const SKILL: &str = include_str!("../claude/skills/rubricas/SKILL.md");
+
+fn instalar_skill() -> Result<String, String> {
+    let casa = std::env::var_os("HOME").ok_or("HOME não definido")?;
+    let destino = PathBuf::from(casa).join(".claude/skills/rubricas/SKILL.md");
+    dados::gravar(&destino, SKILL.as_bytes()).map_err(|e| format!("{}: {e}", destino.display()))?;
+    Ok(format!(
+        "Skill instalada em {}.\nDefina RUBRICAS_URL (ex.: https://rubrica.vini84200.cc) e RUBRICAS_TOKEN (rubricas token <nome>).",
+        destino.display()
+    ))
+}
+
+fn token(nome: &str, dados: &std::path::Path, remover: bool) -> Result<String, String> {
+    if remover {
+        return match auth::remover_token(dados, nome)? {
+            true => Ok(format!("Token de {nome} removido.")),
+            false => Err(format!("{nome} não tem token.")),
+        };
+    }
+    let t = auth::criar_token(dados, nome)?;
+    Ok(format!("{t}\n\nToken de {nome} criado (o anterior, se havia, deixou de valer). Ele não será mostrado de novo."))
 }
 
 fn pedir_senha() -> Result<String, String> {
@@ -89,6 +132,8 @@ async fn main() -> ExitCode {
     let resultado = match Cli::parse().comando {
         Comando::Servir { dados, endereco, web } => servir(dados, endereco, web).await,
         Comando::Usuario { nome, dados, remover } => usuario(&nome, &dados, remover).map(|msg| println!("{msg}")),
+        Comando::Token { nome, dados, remover } => token(&nome, &dados, remover).map(|msg| println!("{msg}")),
+        Comando::Skill { acao: AcaoSkill::Instalar } => instalar_skill().map(|msg| println!("{msg}")),
     };
     match resultado {
         Ok(()) => ExitCode::SUCCESS,

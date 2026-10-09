@@ -1,7 +1,7 @@
 // Avaliações: uma ou mais rubricas atreladas a uma turma, e as notas que saem delas.
 import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api, carregarPacote } from '../api.js';
-import { calcular, maximoRubrica } from '../nota.js';
+import { calcular, maximoRubrica, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
 import { useDados, Estado, Titulo, Vazio, Progresso } from './comum.js';
 
@@ -139,7 +139,7 @@ export function FormAvaliacao({ id }) {
                   <input type="checkbox" checked=${marcada} onChange=${() => alternar(r.id)} />
                   <span>
                     <span class="linha-titulo">${r.titulo}</span>
-                    <span class="linha-meta">${plural(r.criterios.length, 'critério', 'critérios')}, ${pts(maximoRubrica(r))}${r._soCopia ? ' (só existe a cópia desta avaliação)' : ''}</span>
+                    <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}${r._soCopia ? ' (só existe a cópia desta avaliação)' : ''}</span>
                   </span>
                 </label>
                 ${marcada && ordem.length > 1 && html`

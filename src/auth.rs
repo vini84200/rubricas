@@ -1,4 +1,5 @@
-//! Usuários locais (senha com Argon2id em `usuarios.toml`) e sessões por cookie.
+//! Usuários locais (senha com Argon2id em `usuarios.toml`), sessões por cookie e
+//! tokens de API (para scripts e para o Claude: `Authorization: Bearer …`).
 
 use crate::dados::gravar;
 use argon2::{
@@ -28,6 +29,9 @@ struct ArquivoUsuarios {
 struct Usuario {
     nome: String,
     hash: String,
+    /// SHA-256 do token de API; o token em si só é mostrado ao ser criado.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +72,13 @@ fn resumo(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
 }
 
+/// 32 bytes aleatórios em hexadecimal.
+fn aleatorio() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("sem fonte de aleatoriedade");
+    hex(&bytes)
+}
+
 fn gerar_hash(senha: &str) -> Result<String, String> {
     Argon2::default().hash_password(senha.as_bytes()).map(|h| h.to_string()).map_err(|e| e.to_string())
 }
@@ -82,6 +93,12 @@ fn ler_usuarios(caminho: &Path) -> io::Result<ArquivoUsuarios> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ArquivoUsuarios::default()),
         Err(e) => Err(e),
     }
+}
+
+fn escrever_usuarios(caminho: &Path, arq: &ArquivoUsuarios) -> Result<(), String> {
+    gravar(caminho, toml::to_string_pretty(arq).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
+    restringir(caminho);
+    Ok(())
 }
 
 pub fn nome_valido(nome: &str) -> bool {
@@ -102,11 +119,14 @@ pub fn definir_senha(raiz: &Path, nome: &str, senha: &str) -> Result<bool, Strin
     let existente = arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome));
     let novo = existente.is_none();
     match existente {
-        Some(u) => u.hash = hash,
-        None => arq.usuarios.push(Usuario { nome: nome.to_string(), hash }),
+        // Senha nova derruba também o token de API.
+        Some(u) => {
+            u.hash = hash;
+            u.token.clear();
+        }
+        None => arq.usuarios.push(Usuario { nome: nome.to_string(), hash, token: String::new() }),
     }
-    gravar(&caminho, toml::to_string_pretty(&arq).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
-    restringir(&caminho);
+    escrever_usuarios(&caminho, &arq)?;
     Ok(novo)
 }
 
@@ -118,8 +138,30 @@ pub fn remover_usuario(raiz: &Path, nome: &str) -> Result<bool, String> {
     if arq.usuarios.len() == antes {
         return Ok(false);
     }
-    gravar(&caminho, toml::to_string_pretty(&arq).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
-    restringir(&caminho);
+    escrever_usuarios(&caminho, &arq)?;
+    Ok(true)
+}
+
+/// Cria o token de API do usuário, substituindo o anterior. Devolve o token, que
+/// não fica gravado em lugar nenhum.
+pub fn criar_token(raiz: &Path, nome: &str) -> Result<String, String> {
+    let caminho = raiz.join("usuarios.toml");
+    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
+    let u = arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome)).ok_or(format!("Não existe usuário {nome}."))?;
+    let token = aleatorio();
+    u.token = resumo(&token);
+    escrever_usuarios(&caminho, &arq)?;
+    Ok(token)
+}
+
+pub fn remover_token(raiz: &Path, nome: &str) -> Result<bool, String> {
+    let caminho = raiz.join("usuarios.toml");
+    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
+    match arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome) && !u.token.is_empty()) {
+        Some(u) => u.token.clear(),
+        None => return Ok(false),
+    }
+    escrever_usuarios(&caminho, &arq)?;
     Ok(true)
 }
 
@@ -192,9 +234,7 @@ impl Auth {
         falhas.remove(&chave);
         drop(falhas);
 
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).expect("sem fonte de aleatoriedade");
-        let token = hex(&bytes);
+        let token = aleatorio();
         let nome = conta.unwrap().nome.clone();
         let marca = resumo(&conta.unwrap().hash);
         let mut sessoes = self.sessoes.lock().unwrap();
@@ -215,6 +255,16 @@ impl Auth {
             .map(|a| a.usuarios.iter().any(|u| u.nome == s.usuario && resumo(&u.hash) == s.marca))
             .unwrap_or(false);
         vale.then(|| s.usuario.clone())
+    }
+
+    /// Dono de um token de API. Lido do disco a cada pedido, então criar ou
+    /// remover o token pelo terminal vale na hora.
+    pub fn usuario_por_token(&self, token: &str) -> Option<String> {
+        if token.is_empty() {
+            return None;
+        }
+        let r = resumo(token);
+        ler_usuarios(&self.usuarios).ok()?.usuarios.into_iter().find(|u| u.token == r).map(|u| u.nome)
     }
 
     pub fn sair(&self, token: &str) {
@@ -273,6 +323,40 @@ mod testes {
         assert_eq!(outro.usuario(&token), None);
         assert_eq!(definir_senha(&raiz, "vini", "terceira-senha-longa"), Ok(true));
         assert_eq!(outro.usuario(&token), None);
+        fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
+    fn tokens_de_api() {
+        let raiz = std::env::temp_dir().join(format!("rubricas-token-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&raiz);
+        fs::create_dir_all(&raiz).unwrap();
+        let auth = Auth::abrir(&raiz);
+
+        assert!(criar_token(&raiz, "ninguem").is_err());
+        definir_senha(&raiz, "vini", "senha-longa").unwrap();
+        let token = criar_token(&raiz, "VINI").unwrap();
+        assert_eq!(auth.usuario_por_token(&token).as_deref(), Some("vini"));
+        assert_eq!(auth.usuario_por_token("inventado"), None);
+        assert_eq!(auth.usuario_por_token(""), None);
+        assert!(!fs::read_to_string(raiz.join("usuarios.toml")).unwrap().contains(&token));
+
+        // um token novo substitui o anterior
+        let novo = criar_token(&raiz, "vini").unwrap();
+        assert_eq!(auth.usuario_por_token(&token), None);
+        assert_eq!(auth.usuario_por_token(&novo).as_deref(), Some("vini"));
+
+        assert_eq!(remover_token(&raiz, "vini"), Ok(true));
+        assert_eq!(remover_token(&raiz, "vini"), Ok(false));
+        assert_eq!(auth.usuario_por_token(&novo), None);
+
+        // trocar a senha ou remover o usuário também derruba o token
+        let t = criar_token(&raiz, "vini").unwrap();
+        definir_senha(&raiz, "vini", "outra-senha-longa").unwrap();
+        assert_eq!(auth.usuario_por_token(&t), None);
+        let t = criar_token(&raiz, "vini").unwrap();
+        remover_usuario(&raiz, "vini").unwrap();
+        assert_eq!(auth.usuario_por_token(&t), None);
         fs::remove_dir_all(&raiz).unwrap();
     }
 }

@@ -1,5 +1,5 @@
 // Pontuação. Espelha src/modelo.rs — mude os dois juntos.
-import { num } from './util.js';
+import { num, plural } from './util.js';
 
 export const TIPOS = {
   binaria: 'Sim ou não',
@@ -10,9 +10,20 @@ export const TIPOS = {
 
 export const DESEMPENHOS = { abaixo: 'Abaixo', atende: 'Atende', acima: 'Acima' };
 
-/** Maior pontuação possível do critério, antes do peso. */
+/** Passo de roteiro: orienta quem avalia, não recebe marcação nem conta na nota. */
+export function ehRoteiro(criterio) {
+  return criterio.tipo === 'roteiro';
+}
+
+/** O servidor omite o peso quando é 1. */
+export function pesoDe(criterio) {
+  return criterio.peso ?? 1;
+}
+
+/** Maior pontuação possível do critério, antes do peso. Zero para passos de roteiro. */
 export function maximo(criterio) {
   const e = criterio.escala;
+  if (!e) return 0;
   if (e.tipo === 'binaria') return e.pontos;
   if (e.tipo === 'niveis') return Math.max(0, ...e.niveis.map((n) => n.pontos));
   return e.max;
@@ -20,7 +31,7 @@ export function maximo(criterio) {
 
 /** Pontos de uma resposta, antes do peso; null se não combina com a escala. */
 export function pontos(criterio, resposta) {
-  if (!resposta) return null;
+  if (!resposta || ehRoteiro(criterio) || !criterio.escala) return null;
   const e = criterio.escala;
   if (e.tipo === 'binaria' && resposta.tipo === 'binaria') return resposta.atende ? e.pontos : 0;
   if (e.tipo === 'niveis' && resposta.tipo === 'nivel') {
@@ -46,12 +57,13 @@ export function calcular(avaliacao, correcao) {
     let pts = 0;
     let max = 0;
     for (const c of ra.rubrica.criterios) {
+      if (ehRoteiro(c)) continue;
       total += 1;
-      max += c.peso * maximo(c);
+      max += pesoDe(c) * maximo(c);
       const p = pontos(c, respostas[c.id]);
       if (p !== null) {
         respondidos += 1;
-        pts += c.peso * p;
+        pts += pesoDe(c) * p;
       }
     }
     if (max > 0 && ra.peso > 0) {
@@ -64,7 +76,7 @@ export function calcular(avaliacao, correcao) {
   return { rubricas, nota, respondidos, total, concluida: total > 0 && respondidos === total };
 }
 
-/** Critérios de todas as rubricas, na ordem em que serão avaliados. */
+/** Critérios e passos de roteiro de todas as rubricas, na ordem em que aparecem. */
 export function itens(avaliacao) {
   const lista = [];
   for (const ra of avaliacao.rubricas) {
@@ -125,5 +137,16 @@ export function passoDe(escala) {
 }
 
 export function maximoRubrica(rubrica) {
-  return rubrica.criterios.reduce((s, c) => s + (c.peso || 0) * (maximo(c) || 0), 0);
+  return rubrica.criterios.reduce((s, c) => s + pesoDe(c) * (maximo(c) || 0), 0);
+}
+
+export function contarCriterios(rubrica) {
+  return rubrica.criterios.filter((c) => !ehRoteiro(c)).length;
+}
+
+/** "4 critérios" ou "4 critérios, 3 passos de roteiro". */
+export function resumoItens(rubrica) {
+  const n = contarCriterios(rubrica);
+  const passos = rubrica.criterios.length - n;
+  return `${plural(n, 'critério', 'critérios')}${passos ? `, ${plural(passos, 'passo de roteiro', 'passos de roteiro')}` : ''}`;
 }
