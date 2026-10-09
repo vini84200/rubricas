@@ -1,8 +1,14 @@
 mod api;
 mod auth;
+mod conferir;
 mod dados;
+mod ead;
 mod estatico;
+mod executor;
+mod fila;
 mod modelo;
+mod pipeline;
+mod submissoes;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -38,6 +44,18 @@ enum Comando {
         /// Remove o token em vez de criar um
         #[arg(long)]
         remover: bool,
+    },
+    /// Roda as checagens pendentes (pipelines) em contêineres podman e envia os resultados
+    Executor {
+        /// Endereço do servidor, por exemplo https://rubrica.vini84200.cc
+        #[arg(long, env = "RUBRICAS_URL")]
+        servidor: String,
+        /// Token de API (rubricas token <nome>, no servidor)
+        #[arg(long, env = "RUBRICAS_TOKEN", hide_env_values = true)]
+        token: String,
+        /// Continua rodando e espera novas submissões em vez de terminar com a fila vazia
+        #[arg(long)]
+        continuo: bool,
     },
     /// Instala a skill do Claude Code em ~/.claude/skills/rubricas
     Skill {
@@ -115,7 +133,12 @@ async fn servir(dados: PathBuf, endereco: String, web: Option<PathBuf>) -> Resul
     if auth.total_usuarios() == 0 {
         eprintln!("Nenhum usuário cadastrado. Crie um com:\n  rubricas usuario <nome> --dados {}\n", dados.display());
     }
-    let estado = api::Estado { dados: Arc::new(pasta), auth: Arc::new(auth), web: Arc::new(estatico::Web::novo(web)) };
+    let estado = api::Estado {
+        dados: Arc::new(pasta),
+        auth: Arc::new(auth),
+        web: Arc::new(estatico::Web::novo(web)),
+        avisos: Arc::new(ead::Avisos::novo()),
+    };
     let escuta = tokio::net::TcpListener::bind(&endereco).await.map_err(|e| format!("{endereco}: {e}"))?;
     println!("Dados em {}", dados.display());
     println!("Servindo em http://{}", escuta.local_addr().map_err(|e| e.to_string())?);
@@ -133,6 +156,10 @@ async fn main() -> ExitCode {
         Comando::Servir { dados, endereco, web } => servir(dados, endereco, web).await,
         Comando::Usuario { nome, dados, remover } => usuario(&nome, &dados, remover).map(|msg| println!("{msg}")),
         Comando::Token { nome, dados, remover } => token(&nome, &dados, remover).map(|msg| println!("{msg}")),
+        Comando::Executor { servidor, token, continuo } => {
+            let op = executor::Opcoes { servidor, token, continuo };
+            tokio::task::spawn_blocking(move || executor::rodar(op)).await.unwrap_or_else(|e| Err(e.to_string()))
+        }
         Comando::Skill { acao: AcaoSkill::Instalar } => instalar_skill().map(|msg| println!("{msg}")),
     };
     match resultado {

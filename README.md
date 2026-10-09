@@ -22,6 +22,7 @@ O binário é único: a aplicação web vai embutida nele.
 | `rubricas usuario NOME --remover` | Remove o usuário; as sessões dele deixam de valer na hora. |
 | `rubricas token NOME [--remover]` | Cria o token de API do usuário (substitui o anterior) ou o remove. Veja [Claude e scripts](#claude-e-scripts). |
 | `rubricas skill instalar` | Copia a skill do Claude Code para `~/.claude/skills/rubricas/`. |
+| `rubricas executor --servidor URL [--continuo]` | Roda as checagens pendentes em contêineres podman. Veja [EAD](#ead-submissões-do-moodle-e-checagens). |
 
 ## A pasta de dados
 
@@ -31,6 +32,10 @@ dados/
   turmas/<nome>.csv               lista de alunos
   avaliacoes/<id>.json            título, turma e uma cópia das rubricas usadas
   correcoes/<avaliacao>/<aluno>.json
+  submissoes/<avaliacao>/<aluno>/ arquivos enviados pelo aluno (do ZIP do Moodle)
+  apelidos/<turma>.json           nome no Moodle → aluno, das associações feitas à mão
+  pipelines/<avaliacao>/          pipeline.toml e anexos (testes.py, esqueleto.py, referencias/)
+  relatorios/<avaliacao>/         resultado das checagens por aluno e do JPlag
   usuarios.toml                   usuários, hashes Argon2id das senhas e SHA-256 dos tokens
   .sessoes.json                   sessões abertas (só o hash de cada token)
 ```
@@ -150,6 +155,47 @@ critério, então dois avaliadores no mesmo aluno não apagam as marcações um 
 critério, vale a última). A fila é separada por usuário. Se a rubrica mudou enquanto havia
 marcações na fila, as que ainda cabem são gravadas e as outras aparecem num aviso na tela.
 
+## EAD: submissões do Moodle e checagens
+
+**Submissões.** Na tela da avaliação, "Enviar submissões do Moodle (ZIP)" recebe o arquivo de
+"Baixar todas as submissões" da tarefa. Cada pasta `Nome Sobrenome_12345_assignsubmission_file_/`
+é associada ao aluno da turma de mesmo nome (sem diferença de acentos ou maiúsculas). Num reenvio,
+quem está no ZIP tem a submissão substituída e quem não está fica com a que tinha; um reenvio igual
+não conta como mudança. Se a submissão muda depois de o aluno ter marcações, o cartão mostra "A
+submissão mudou depois da correção", sem apagar nada, até a correção ser mexida de novo. Nomes que
+não casam ficam "sem dono" até serem associados na tela; a associação vale para os próximos ZIPs da
+turma.
+
+**Código.** Em tela larga (a partir de 1280 px) o código do aluno fica ao lado do cartão, com
+números de linha e destaque de Python (Prism, em `web/vendor/prism.js`); em telas menores, o botão
+"Código" abre o mesmo painel. A tela **Acompanhar** (`#/acompanhar`), aberta no monitor, mostra o
+código e as checagens do aluno que o mesmo usuário abriu em outro aparelho e troca sozinha (SSE,
+com batimento a cada 30 s para o proxy não cortar a conexão).
+
+**Checagens.** O pipeline da avaliação fica em `pipelines/<avaliacao>/pipeline.toml` e é escrito
+pela API em texto (a skill do Claude ensina o formato); a tela "Checagens e plágio" só o mostra.
+Tipos: `casos` (stdin → stdout), `pytest`, `estilo` (ruff), `comando`, e `plagio` (JPlag) na raiz
+do arquivo. Uma checagem pode apontar um critério; o resultado vira uma **sugestão** no cartão
+("Sugestão: Atende (8/8 casos)"), que `G` ou um toque aceitam. Código do aluno que não roda conta
+como reprovado e o relatório mostra o fim do stderr; falha do executor (imagem, podman) aparece
+como "erro de execução", não reprova e o aluno continua pendente.
+
+**Executor.** O servidor nunca executa código de aluno. Quem executa é
+
+```sh
+RUBRICAS_TOKEN=… rubricas executor --servidor https://rubrica.exemplo.org            # esvazia a fila e termina
+RUBRICAS_TOKEN=… rubricas executor --servidor https://rubrica.exemplo.org --continuo # fica ouvindo
+```
+
+numa máquina com podman (o notebook ou a própria VPS). Cada checagem roda em `podman run
+--network=none`, com 256 MB, 1 CPU e 10 s (por caso, nos `casos`; configuráveis no pipeline), numa imagem
+derivada do `python:3.12-slim` com pytest e ruff, construída na primeira vez. O plágio roda o
+[JPlag](https://github.com/jplag/JPlag) 6.3.0 (GPL-3.0) em outro contêiner (Java 25), como
+processo separado: o servidor recebe só os pares e o `.jplag` para o visualizador oficial. A tela
+da avaliação mostra quantas submissões aguardam o executor e quando ele foi visto. Com
+`--continuo`, ele acorda quando um ZIP chega ou o pipeline é gravado pela API; um `pipeline.toml`
+editado direto na pasta é notado em até 10 minutos.
+
 ## Claude e scripts
 
 Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
@@ -163,6 +209,10 @@ Para gastar poucos tokens, as rubricas também são lidas e gravadas em texto:
 | `GET /api/rubricas.txt` | uma linha por rubrica: `id \| título \| N critérios \| M passos` |
 | `GET /api/rubricas/{id}.toml` | o arquivo, sem os `id` que saem dos nomes |
 | `PUT /api/rubricas/{id}.toml` | valida, grava (ou cria) e responde numa linha; erro com linha e coluna |
+| `GET /api/avaliacoes.txt` | uma linha por avaliação: `id \| título \| turma \| rubricas \| com/sem pipeline` |
+| `GET /api/pipelines.txt` | uma linha por pipeline: `id \| checagens \| anexos \| pendentes` |
+| `GET/PUT /api/pipelines/{avaliacao}/pipeline.toml` | o pipeline; o `PUT` valida contra a avaliação e avisa anexos que faltam |
+| `GET/PUT/DELETE /api/pipelines/{avaliacao}/{arquivo}` | anexos do pipeline |
 
 No `PUT`, critérios e níveis sem `id` herdam o id do item de mesmo nome na versão gravada: reescrever
 o arquivo inteiro não muda identidades. A skill em `claude/skills/rubricas/SKILL.md` ensina isso ao
@@ -201,18 +251,21 @@ docker compose run --rm rubricas token vini --dados /dados
 ## Desenvolver
 
 ```sh
-cargo test                                             # modelo, pasta de dados, autenticação
+cargo test                                             # modelo, pasta de dados, autenticação, ZIP, pipeline, fila
 cargo run -- servir --dados dados --web web            # front-end do disco, sem recompilar
 ```
 
 O front-end não tem etapa de build: módulos ES em `web/js`, com `htm` + Preact num arquivo só em
-`web/vendor/preact-htm.js` (cópia de `htm@3.1.1`, `preact/standalone.module.js`) e a fonte
+`web/vendor/preact-htm.js` (cópia de `htm@3.1.1`, `preact/standalone.module.js`), o Prism em
+`web/vendor/prism.js` (`prismjs@1.30.0`, core e Python, embrulhados como módulo ES) e a fonte
 Atkinson Hyperlegible em `web/fontes` (de `@fontsource/atkinson-hyperlegible@5.3.0`).
 
 ## O que não faz
 
 - Avaliar em dupla ou grupo: a correção é por aluno.
-- Importar ou exportar direto do Moodle: a saída é CSV (um normal e um para o Excel em português).
+- Conversar com o Moodle: as submissões entram pelo ZIP baixado à mão e as notas saem em CSV (um
+  normal e um para o Excel em português).
+- Comentários por linha no código: o comentário continua sendo por critério.
 - Edição simultânea da mesma rubrica: a última gravação vence, sem aviso.
 - Histórico de alterações das correções: o arquivo guarda só o estado atual, quem alterou por
   último e quando.

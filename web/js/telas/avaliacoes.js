@@ -4,6 +4,7 @@ import { api, carregarPacote } from '../api.js';
 import { calcular, maximoRubrica, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
 import { useDados, Estado, Titulo, Vazio, Progresso } from './comum.js';
+import { textoPlagio } from '../codigo.js';
 
 export function ListaAvaliacoes() {
   const { dados, ...estado } = useDados('/avaliacoes');
@@ -186,7 +187,7 @@ export function Resultados({ id }) {
   if (erro) return html`<div class="tela"><${Titulo} titulo="Avaliação" voltar=${{ href: '#/avaliacoes', texto: 'Avaliações' }} /><${Estado} erro=${erro} recarregar=${carregar} /></div>`;
   if (!pacote) return html`<${Estado} carregando=${true} />`;
 
-  const { avaliacao: a, turma, correcoes, desatualizadas } = pacote;
+  const { avaliacao: a, turma, correcoes, desatualizadas, ead } = pacote;
   const linhas = turma.alunos.map((aluno) => ({ aluno, r: calcular(a, correcoes[aluno.id]) }));
   const concluidos = linhas.filter((l) => l.r.concluida).length;
   const iniciados = linhas.filter((l) => !l.r.concluida && l.r.respondidos > 0).length;
@@ -239,6 +240,8 @@ export function Resultados({ id }) {
       <${Progresso} concluidos=${concluidos} iniciados=${iniciados} total=${turma.alunos.length} />
     </div>
 
+    <${Entregas} id=${id} ead=${ead} alunos=${turma.alunos} aoMudar=${carregar} />
+
     <div class="acoes acoes-notas">
       <a class="botao pequeno" href=${csv} download>Baixar notas (CSV)</a>
       <a class="botao pequeno" href=${`${csv}?br=1`} download>CSV para Excel em português</a>
@@ -251,6 +254,7 @@ export function Resultados({ id }) {
         <thead>
           <tr>
             <th>Aluno</th>
+            ${ead && html`<th>Entrega</th>`}
             ${varias && a.rubricas.map((r) => html`<th class="numerico">${r.rubrica.titulo}</th>`)}
             <th class="numerico">Nota</th>
           </tr>
@@ -262,6 +266,7 @@ export function Resultados({ id }) {
                 <a href=${`#${rota('avaliar', id, aluno.id)}`} onClick=${(e) => e.stopPropagation()}>${aluno.nome}</a>
                 <span class="linha-meta">${aluno.id}</span>
               </td>
+              ${ead && html`<td><${Entrega} ead=${ead} aluno=${aluno.id} alunos=${turma.alunos} /></td>`}
               ${varias && r.rubricas.map((p) => html`<td class="numerico">${r.respondidos ? `${num(p.pontos)} / ${num(p.maximo)}` : ''}</td>`)}
               <td class="numerico">
                 ${r.concluida
@@ -276,5 +281,119 @@ export function Resultados({ id }) {
       </table>
     </div>
     </div>
+  `;
+}
+
+/** Situação da entrega de um aluno, numa célula da tabela de notas. */
+function Entrega({ ead, aluno, alunos }) {
+  const sub = ead.submissoes[aluno];
+  if (!sub) return html`<span class="suave">—</span>`;
+  const rel = ead.relatorios[aluno];
+  const ok = rel?.atual ? rel.checagens.filter((c) => c.situacao === 'passou').length : null;
+  return html`
+    <span class="entrega">
+      <span title="Entregou">✓</span>
+      ${ok !== null && html`<span class="entrega-checagens" title="Checagens que passaram">${ok}/${rel.checagens.length}</span>`}
+      ${sub.mudou && html`<span class="selo meio" title="A submissão mudou depois da correção">mudou</span>`}
+      ${ead.plagio[aluno] && html`<span class="selo nao" title=${textoPlagio(ead.plagio[aluno], alunos)}>${Math.round(ead.plagio[aluno].similaridade * 100)}%</span>`}
+    </span>
+  `;
+}
+
+function quando(segundos) {
+  const min = Math.round((Date.now() / 1000 - segundos) / 60);
+  if (min < 2) return 'agora há pouco';
+  if (min < 60) return `há ${min} min`;
+  if (min < 48 * 60) return `há ${Math.round(min / 60)} h`;
+  return `há ${Math.round(min / 1440)} dias`;
+}
+
+/** Envio do ZIP do Moodle, quem ficou sem dono e a fila do executor. */
+function Entregas({ id, ead, alunos, aoMudar }) {
+  const [enviando, setEnviando] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const base = `/avaliacoes/${encodeURIComponent(id)}`;
+
+  async function enviar(e) {
+    const arquivo = e.target.files?.[0];
+    e.target.value = '';
+    if (!arquivo) return;
+    setEnviando(true);
+    setMsg(null);
+    try {
+      const r = await api('POST', `${base}/submissoes`, arquivo);
+      const partes = [`${plural(r.recebidas, 'submissão nova ou alterada', 'submissões novas ou alteradas')}`];
+      if (r.iguais) partes.push(`${plural(r.iguais, 'igual à anterior', 'iguais às anteriores')}`);
+      if (r.sem_dono.length) partes.push(`${plural(r.sem_dono.length, 'nome sem dono', 'nomes sem dono')}`);
+      if (r.ignorados.length) partes.push(`${plural(r.ignorados.length, 'arquivo fora do padrão ignorado', 'arquivos fora do padrão ignorados')}`);
+      setMsg({ ok: true, texto: `${partes.join(', ')}.` });
+      aoMudar();
+    } catch (err) {
+      setMsg({ ok: false, texto: err.message });
+    }
+    setEnviando(false);
+  }
+
+  async function associar(chave, aluno) {
+    if (!aluno) return;
+    try {
+      await api('POST', `${base}/submissoes/sem-dono/${encodeURIComponent(chave)}`, { aluno });
+      aoMudar();
+    } catch (err) {
+      setMsg({ ok: false, texto: err.message });
+    }
+  }
+
+  const botao = html`
+    <label class=${cls('botao', 'pequeno', enviando && 'ocupado')}>
+      <input type="file" accept=".zip,application/zip" class="escondido" disabled=${enviando} onChange=${enviar} />
+      ${enviando ? 'Enviando…' : ead ? 'Enviar novo ZIP' : 'Enviar submissões do Moodle (ZIP)'}
+    </label>
+  `;
+  if (!ead) {
+    return html`
+      <div class="entregas vazia">
+        ${botao}
+        ${msg && html`<p class=${msg.ok ? 'ok' : 'erro'} role="status">${msg.texto}</p>`}
+      </div>
+    `;
+  }
+  const entregaram = Object.keys(ead.submissoes).length;
+  const comDono = new Set(Object.keys(ead.submissoes));
+  return html`
+    <section class="entregas" aria-label="Entregas do Moodle">
+      <div class="entregas-topo">
+        <p>
+          <strong>${entregaram} de ${plural(alunos.length, 'aluno entregou', 'alunos entregaram')}</strong>
+          ${ead.pipeline && html`<br /><span class=${ead.aguardando ? 'pendente' : 'suave'}>
+            ${ead.aguardando ? `${plural(ead.aguardando, 'submissão aguardando', 'submissões aguardando')} o executor` : ead.plagio_pendente ? 'Plágio aguardando o executor' : 'Checagens em dia'}
+            ${(ead.aguardando > 0 || ead.plagio_pendente) && (ead.executor_visto_em ? ` (visto ${quando(ead.executor_visto_em)})` : ' (nenhum executor conectado desde que o servidor subiu)')}
+          </span>`}
+          ${ead.erro_pipeline && html`<br /><span class="erro">${ead.erro_pipeline}</span>`}
+        </p>
+        <div class="acoes">
+          ${botao}
+          <a class="botao pequeno" href=${`#${rota('avaliacoes', id, 'checagens')}`}>Checagens e plágio</a>
+          <a class="botao pequeno" href="#/acompanhar" title="Abra no monitor: ele segue o aluno que você abrir no celular">Acompanhar no monitor</a>
+        </div>
+      </div>
+      ${msg && html`<p class=${msg.ok ? 'ok' : 'erro'} role="status">${msg.texto}</p>`}
+      ${ead.sem_dono.length > 0 && html`
+        <div class="sem-dono">
+          <p><strong>Sem dono:</strong> estes nomes do Moodle não casaram com ninguém da turma. Escolha o aluno; a associação vale para os próximos ZIPs.</p>
+          <ul>
+            ${ead.sem_dono.map((s) => html`
+              <li>
+                <span>${s.nome} <small class="suave">(${plural(s.arquivos, 'arquivo', 'arquivos')})</small></span>
+                <select aria-label=${`Aluno para ${s.nome}`} value="" onChange=${(e) => associar(s.chave, e.target.value)}>
+                  <option value="">Escolha o aluno…</option>
+                  ${alunos.map((a) => html`<option value=${a.id}>${a.nome}${comDono.has(a.id) ? ' (já entregou)' : ''}</option>`)}
+                </select>
+              </li>
+            `)}
+          </ul>
+        </div>
+      `}
+    </section>
   `;
 }

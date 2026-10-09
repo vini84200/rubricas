@@ -12,13 +12,15 @@ export class ErroApi extends Error {
   }
 }
 
+/** Um `Blob` (arquivo escolhido) vai como está; o resto, como JSON. */
 export async function api(metodo, caminho, corpo) {
+  const bruto = corpo instanceof Blob;
   let resposta;
   try {
     resposta = await fetch(`api${caminho}`, {
       method: metodo,
-      headers: corpo === undefined ? {} : { 'content-type': 'application/json' },
-      body: corpo === undefined ? undefined : JSON.stringify(corpo),
+      headers: corpo === undefined || bruto ? {} : { 'content-type': 'application/json' },
+      body: corpo === undefined ? undefined : bruto ? corpo : JSON.stringify(corpo),
       credentials: 'same-origin',
     });
   } catch {

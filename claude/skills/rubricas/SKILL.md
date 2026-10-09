@@ -1,6 +1,6 @@
 ---
 name: rubricas
-description: Cria, lê e altera rubricas de avaliação no servidor Rubricas (rubrica.vini84200.cc) pela API em TOML. Use quando o usuário pedir para criar, montar, ajustar ou revisar uma rubrica, um critério ou um roteiro de correção.
+description: Cria, lê e altera rubricas e pipelines de checagem automática no servidor Rubricas (rubrica.vini84200.cc) pela API em TOML. Use quando o usuário pedir para criar, montar, ajustar ou revisar uma rubrica, um critério, um roteiro de correção, ou as checagens automáticas (casos de teste, pytest, estilo, plágio) de uma avaliação de EAD.
 ---
 
 # Rubricas
@@ -58,3 +58,52 @@ escala = { tipo = "ponto_unico", esperado = "Estado em structs; salva em arquivo
 - **Identidade:** critérios e níveis sem `id` são ligados aos já gravados pelo nome. Para **renomear** sem perder as correções feitas, mantenha o id antigo acrescentando `id = "nome-antigo-em-slug"` (minúsculas, sem acento, com hífens) ao item renomeado.
 - **Linhas `id =`:** só aparecem quando o id não sai do nome. Preserve as que vierem no arquivo.
 - **Critério obrigatório:** a rubrica precisa de pelo menos um critério com escala. Uma escala `niveis` tem pelo menos dois níveis.
+
+## Pipelines (checagens automáticas de EAD)
+
+Uma avaliação pode ter um pipeline: checagens que o executor roda no código de cada aluno e que viram **sugestões** de marcação no cartão (quem decide é o professor). O pipeline pertence à avaliação e usa os ids dos critérios das rubricas dela.
+
+```sh
+curl -sfH "$A" "$RUBRICAS_URL/api/avaliacoes.txt"                      # id | título | turma | rubricas | com/sem pipeline
+curl -sfH "$A" "$RUBRICAS_URL/api/pipelines.txt"                        # id | checagens | anexos | pendentes
+curl -sfH "$A" "$RUBRICAS_URL/api/pipelines/AV/pipeline.toml"           # o pipeline
+curl -sH "$A" -X PUT --data-binary @pipeline.toml "$RUBRICAS_URL/api/pipelines/AV/pipeline.toml"
+curl -sH "$A" -X PUT --data-binary @testes.py "$RUBRICAS_URL/api/pipelines/AV/testes.py"   # anexos, também em subpastas
+curl -sH "$A" -X DELETE "$RUBRICAS_URL/api/pipelines/AV/referencias/velho.py"
+```
+
+Leia a rubrica da avaliação antes (`rubricas/ORIGEM.toml`) para usar os ids certos: o id de um critério é o nome em minúsculas, sem acento, com hífens, ou o `id =` explícito. O `PUT` valida contra a avaliação e avisa os anexos que faltam.
+
+```toml
+arquivo = "main.py"         # o arquivo do aluno é copiado com este nome (os testes importam `main`)
+tempo = 10                  # segundos por execução; memoria = "256m", imagem = "python:3.12-slim"
+plagio = { base = "esqueleto.py", referencias = "referencias/", limiar = 0.6 }   # JPlag; tudo opcional
+
+[[checagens]]
+tipo = "casos"              # stdin → stdout; ignora espaços no fim das linhas
+nome = "Exemplos do enunciado"
+criterio = "soma-correta"
+sugestao = [{ minimo = 1.0, nivel = "Atende" }, { minimo = 0.5, nivel = "Parcial" }]   # fração de acertos → marcação
+[[checagens.casos]]
+entrada = "2\n3\n"
+saida = "5\n"
+
+[[checagens]]
+tipo = "pytest"
+testes = "testes.py"        # anexo; importa o arquivo do aluno
+criterio = "funcoes"
+
+[[checagens]]
+tipo = "estilo"             # ruff check; regras = ["E", "F"], ignorar = ["E501"], formato = true
+criterio = "legibilidade"
+
+[[checagens]]
+tipo = "comando"            # passa se termina com código 0; $PROGRAMA é o arquivo do aluno
+nome = "Compila"
+comando = "python3 -m py_compile $PROGRAMA"
+```
+
+- **Regras de sugestão:** `nivel` (id ou rótulo) para escala `niveis`, `atende = true/false` para `binaria`, `nota = 1.5` para `livre` e `ponto_unico`. Sem regras: binária só atende com tudo certo; níveis só nos extremos; nota proporcional aos acertos.
+- **Casos:** cubra os exemplos do enunciado e as bordas que a especificação cita (entrada vazia, negativo, limite). `ignorar_maiusculas = true` e `argumentos = ["x"]` são opcionais.
+- **Plágio:** `base` é o código dado a todos (não conta como cópia); `referencias` é uma pasta de anexos com soluções conhecidas.
+- **Executor:** o servidor nunca roda código. Quem roda é `rubricas executor --servidor URL` (podman), no notebook ou noutra máquina.

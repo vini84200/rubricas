@@ -6,6 +6,7 @@ import { ListaAvaliacoes, FormAvaliacao, Resultados } from './telas/avaliacoes.j
 import { ListaRubricas, EditorRubrica } from './telas/rubricas.js';
 import { ListaTurmas, NovaTurma, DetalheTurma } from './telas/turmas.js';
 import { Avaliar } from './telas/avaliar.js';
+import { TelaChecagens, Acompanhar } from './telas/ead.js';
 
 function lerRota() {
   const partes = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map((p) => {
@@ -31,6 +32,7 @@ function Tela({ partes }) {
   }
   if (secao === 'avaliacoes' && a === 'nova') return html`<${FormAvaliacao} id=${null} />`;
   if (secao === 'avaliacoes' && a && b === 'editar') return html`<${FormAvaliacao} key=${a} id=${a} />`;
+  if (secao === 'avaliacoes' && a && b === 'checagens') return html`<${TelaChecagens} key=${a} id=${a} />`;
   if (secao === 'avaliacoes' && a) return html`<${Resultados} key=${a} id=${a} />`;
   return html`<${ListaAvaliacoes} />`;
 }
@@ -208,6 +210,9 @@ function App() {
       <button type="button" class="botao pequeno" onClick=${() => fila.dispensarErro()}>Entendi</button>
     </div>
   `;
+  if (partes[0] === 'acompanhar') {
+    return html`<div class="raiz"><${Acompanhar} />${alerta}</div>`;
+  }
   if (partes[0] === 'avaliar' && partes[1]) {
     return html`
       <div class="raiz">

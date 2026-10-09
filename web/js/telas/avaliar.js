@@ -6,17 +6,19 @@
 //   ↑ cima     = opções      ↑  (níveis intermediários, nota, comentário)
 //   ↓ baixo    = voltar      ↓  ou Backspace
 //                            1–9 escolhe o nível, S pula, C comenta, Z desfaz,
-//                            Enter próximo aluno, [ e ] trocam de aluno
+//                            Enter próximo aluno, [ e ] trocam de aluno,
+//                            G aceita a sugestão das checagens automáticas
 //
 // Passos de roteiro ganham um cartão próprio, sem marcação: deslizar para os lados,
 // →, ←, Enter ou espaço seguem para o próximo item.
 import { html, useState, useEffect, useRef, useMemo } from '../../vendor/preact-htm.js';
-import { carregarPacote, fila, guardarCorrecoes, aplicarLote } from '../api.js';
+import { api, carregarPacote, fila, guardarCorrecoes, aplicarLote } from '../api.js';
 import {
   calcular, itens as listarItens, marcacaoRapida, niveisOrdenados, rotulo, tom, pontos, maximo,
   temIntermediarios, passoDe, DESEMPENHOS, ehRoteiro, pesoDe,
 } from '../nota.js';
 import { Markdown } from '../markdown.js';
+import { PainelCodigo, avisosEad } from '../codigo.js';
 import { ir, rota, num, campo, lerNum, cls, vibrar, semAcento, plural } from '../util.js';
 import { Estado } from './comum.js';
 
@@ -60,6 +62,10 @@ function passosAntes(itens, i) {
   return itens.slice(j, i).map((it) => it.criterio);
 }
 
+function mesmaMarcacao(a, b) {
+  return !!a && !!b && ['tipo', 'nivel', 'atende', 'nota', 'desempenho'].every((k) => a[k] === b[k]);
+}
+
 /** Rótulo e pontos do que o deslize lateral marca. */
 function rapido(criterio, positivo) {
   const m = marcacaoRapida(criterio, positivo);
@@ -72,7 +78,7 @@ function rapido(criterio, positivo) {
 
 const SEGUIR = { texto: 'Seguir' };
 
-function Ficha({ item, resposta, posicao, mostrarRubrica, entrada, comentario, desfazer, passos, aoPositivo, aoNegativo, aoCima, aoBaixo, controle }) {
+function Ficha({ item, resposta, posicao, mostrarRubrica, entrada, comentario, desfazer, passos, sugestao, aoPositivo, aoNegativo, aoCima, aoBaixo, controle }) {
   const ref = useRef(null);
   const gesto = useRef(null);
   const toque = useRef(false);
@@ -245,6 +251,12 @@ function Ficha({ item, resposta, posicao, mostrarRubrica, entrada, comentario, d
         </ul>
       `}
       <h2 class="ficha-nome">${c.nome}</h2>
+      ${sugestao && html`
+        <button type="button" class="ficha-sugestao" data-tom=${sugestao.tom} onClick=${sugestao.aceitar}>
+          <span>Sugestão: <strong>${sugestao.texto}</strong> <span class="ficha-sugestao-motivo">(${sugestao.motivo})</span></span>
+          <span class="ficha-sugestao-acao">${sugestao.tecla ? html`<kbd>G</kbd>` : 'Aceitar'}</span>
+        </button>
+      `}
       <div class="ficha-texto">
         ${c.descricao && html`<${Markdown} texto=${c.descricao} />`}
         ${c.escala.tipo === 'ponto_unico' && html`<p><strong>Esperado:</strong> ${c.escala.esperado}</p>`}
@@ -582,6 +594,9 @@ export function Avaliar({ id, alunoId }) {
   const [ultima, setUltima] = useState(null); // última marcação, para desfazer
   const [sinc, setSinc] = useState(fila.estado());
   const largo = useMedia('(min-width: 960px)');
+  // Com submissões, a tela bem larga mostra o código no lugar da lista de alunos.
+  const muitoLargo = useMedia('(min-width: 1280px)');
+  const [codigoAberto, setCodigoAberto] = useState(false);
   const controle = useRef(null);
   const focoNota = useRef(null);
   const focoComentario = useRef(null);
@@ -650,6 +665,20 @@ export function Avaliar({ id, alunoId }) {
     return r;
   }, [avaliacao, correcoes]);
   const aluno = alunos.find((a) => a.id === alunoId) || null;
+  const ead = pacote?.ead || null;
+  const comCodigo = muitoLargo && !!ead;
+  // A lista de alunos fica fixa na lateral só quando o código não ocupa esse lugar.
+  const listaFixa = largo && !comCodigo;
+
+  // A tela "Acompanhar", aberta em outro aparelho, segue o aluno aberto aqui.
+  useEffect(() => {
+    if (!aluno) return undefined;
+    const avisar = () => api('PUT', '/foco', { avaliacao: id, aluno: aluno.id }).catch(() => {});
+    avisar();
+    const aoVoltar = () => document.visibilityState === 'visible' && avisar();
+    document.addEventListener('visibilitychange', aoVoltar);
+    return () => document.removeEventListener('visibilitychange', aoVoltar);
+  }, [id, aluno?.id]);
 
   // Sem aluno no endereço: começa por quem ainda falta.
   useEffect(() => {
@@ -668,6 +697,7 @@ export function Avaliar({ id, alunoId }) {
     setEntrada('frente');
     setBandeja(false);
     setListaAberta(false);
+    setCodigoAberto(false);
     setUltima(null);
   }, [carregado, alunoId]);
 
@@ -703,6 +733,7 @@ export function Avaliar({ id, alunoId }) {
         if (campoAtivo) campoAtivo.blur();
         setBandeja(false);
         setListaAberta(false);
+        setCodigoAberto(false);
         return;
       }
       if (campoAtivo || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -727,6 +758,7 @@ export function Avaliar({ id, alunoId }) {
       else if (k === 'ArrowDown' || k === 'Backspace') a.irPara(a.idx - 1);
       else if (k === 's') a.irPara(a.idx + 1);
       else if (k === 'z') a.desfazer();
+      else if (k === 'g' && a.sugestao) a.sugestao.aceitar();
       else if (k === 'c') {
         if (!a.largo) setBandeja(true);
         setTimeout(() => focoComentario.current?.focus(), 60);
@@ -884,9 +916,24 @@ export function Avaliar({ id, alunoId }) {
     else if (proximo) trocarAluno(proximo.id);
     else ir(rota('avaliacoes', id));
   }
-  acoes.current = { marcar, avancar, irPara, abrirOpcoes, vizinho, seguir, desfazer, item, idx, noResumo, largo, folhaAberta: (bandeja || listaAberta) && !largo };
 
   const podeDesfazer = ultima && ultima.aluno === aluno.id ? { texto: ultima.texto, acao: desfazer } : null;
+  // Sugestão das checagens automáticas: aparece até o critério ter exatamente essa marcação.
+  const sug = item && !passo && ead?.relatorios[aluno.id]?.sugestoes.find((x) => x.rubrica === item.origem && x.criterio === item.criterio.id);
+  const sugestao = sug && pontos(item.criterio, sug.marcacao) !== null && !mesmaMarcacao(resposta, sug.marcacao)
+    ? {
+      texto: rotulo(item.criterio, sug.marcacao),
+      motivo: sug.motivo,
+      tom: tom(item.criterio, sug.marcacao),
+      tecla: largo,
+      aceitar: () => {
+        const t = tom(item.criterio, sug.marcacao);
+        marcar(sug.marcacao, t === 'sim' ? 'direita' : t === 'nao' ? 'esquerda' : 'cima');
+      },
+    }
+    : null;
+  const avisos = avisosEad(ead, aluno.id, alunos);
+  acoes.current = { marcar, avancar, irPara, abrirOpcoes, vizinho, seguir, desfazer, item, idx, noResumo, largo, sugestao, folhaAberta: ((bandeja || listaAberta) && !largo) || (listaAberta && comCodigo) || codigoAberto };
   const pos = item && !passo ? rapido(item.criterio, true) : null;
   const neg = item && !passo ? rapido(item.criterio, false) : null;
   // Critérios contam "3 de 8"; passos de roteiro não entram na conta.
@@ -906,15 +953,20 @@ export function Avaliar({ id, alunoId }) {
   const listaAlunos = (focar) => html`<${Alunos} alunos=${alunos} resultados=${resultados} atual=${aluno.id} aoEscolher=${trocarAluno} focar=${focar} />`;
 
   return html`
-    <div class=${cls('av', largo && 'largo')}>
+    <div class=${cls('av', largo && 'largo', comCodigo && 'com-codigo')}>
       <header class="av-topo">
         <a class="av-sair" href=${hrefNotas} aria-label="Voltar às notas">‹</a>
         <button type="button" class="av-vizinho" aria-label="Aluno anterior" onClick=${() => vizinho(-1)}>◂</button>
-        <button type="button" class="av-aluno" onClick=${() => !largo && setListaAberta(true)} aria-haspopup=${largo ? null : 'dialog'}>
+        <button type="button" class="av-aluno" onClick=${() => !listaFixa && setListaAberta(true)} aria-haspopup=${listaFixa ? null : 'dialog'}>
           <span class="av-aluno-nome">${aluno.nome}</span>
-          <span class="av-aluno-meta">${posAluno + 1} de ${alunos.length}${largo ? '' : ' ▾'}</span>
+          <span class="av-aluno-meta">${posAluno + 1} de ${alunos.length}${listaFixa ? '' : ' ▾'}</span>
         </button>
         <button type="button" class="av-vizinho" aria-label="Próximo aluno" onClick=${() => vizinho(1)}>▸</button>
+        ${ead && !comCodigo
+          ? html`<button type="button" class="av-codigo" onClick=${() => setCodigoAberto(true)} aria-haspopup="dialog">
+              <span aria-hidden="true">${'</>'}</span><span>Código</span>
+            </button>`
+          : html`<span></span>`}
         <div class="av-nota" title="Nota até aqui">
           <strong>${num(resultado.nota)}</strong>
           <${Sincronia} estado=${sinc} />
@@ -929,10 +981,20 @@ export function Avaliar({ id, alunoId }) {
         </nav>
       </header>
 
-      ${largo && html`<aside class="av-lateral">${listaAlunos(false)}</aside>`}
+      ${listaFixa && html`<aside class="av-lateral">${listaAlunos(false)}</aside>`}
+      ${comCodigo && html`
+        <aside class="av-codigo-lateral" aria-label="Código do aluno">
+          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} />
+        </aside>
+      `}
 
       <main class="av-palco">
         ${pacote.offline && html`<p class="av-aviso">Sem conexão: usando a cópia guardada neste aparelho.</p>`}
+        ${avisos.length > 0 && html`
+          <ul class="av-avisos" aria-label="Avisos sobre a submissão">
+            ${avisos.map((a) => html`<li data-tipo=${a.tipo}>${a.texto}</li>`)}
+          </ul>
+        `}
         ${noResumo
           ? html`<${Resumo} key=${`${aluno.id}:resumo`} aluno=${aluno} avaliacao=${avaliacao} itens=${itens} correcao=${correcao} resultado=${resultado}
               desfazer=${podeDesfazer} aoIrPara=${irPara} aoComentarGeral=${comentarGeral} />`
@@ -941,7 +1003,7 @@ export function Avaliar({ id, alunoId }) {
               ${idx < itens.length - 1 && html`<div class="ficha-debaixo" aria-hidden="true"></div>`}
               <${Ficha} key=${`${aluno.id}:${idx}`} item=${item} resposta=${resposta}
                 posicao=${passo ? (posicao < totalCriterios ? `antes do critério ${posicao + 1}` : '') : `${posicao} de ${totalCriterios}`}
-                mostrarRubrica=${variasRubricas} entrada=${entrada} comentario=${comentario} controle=${controle} desfazer=${podeDesfazer} passos=${passos}
+                mostrarRubrica=${variasRubricas} entrada=${entrada} comentario=${comentario} controle=${controle} desfazer=${podeDesfazer} passos=${passos} sugestao=${sugestao}
                 aoPositivo=${() => (passo ? avancar('direita') : marcar(pos.marcacao, 'direita'))}
                 aoNegativo=${() => (passo ? avancar('esquerda') : marcar(neg.marcacao, 'esquerda'))}
                 aoCima=${abrirOpcoes} aoBaixo=${() => irPara(idx - 1)} />
@@ -962,6 +1024,7 @@ export function Avaliar({ id, alunoId }) {
             <dt><kbd>S</kbd></dt><dd>pular sem marcar</dd>
             <dt><kbd>C</kbd></dt><dd>comentar</dd>
             <dt><kbd>Z</kbd></dt><dd>desfazer a última marcação</dd>
+            ${ead?.pipeline && html`<dt><kbd>G</kbd></dt><dd>aceitar a sugestão</dd>`}
             <dt><kbd>Enter</kbd></dt><dd>próximo aluno, no resumo</dd>
             <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>trocar de aluno</dd>
           </dl>
@@ -1012,7 +1075,12 @@ export function Avaliar({ id, alunoId }) {
             ${item.criterio.escala.tipo === 'ponto_unico' && html`<p><strong>Esperado:</strong> ${item.criterio.escala.esperado}</p>`}
           `}>${opcoes}<//>
       `}
-      ${listaAberta && !largo && html`
+      ${codigoAberto && ead && html`
+        <${Folha} titulo=${aluno.nome} alta aoFechar=${() => setCodigoAberto(false)}>
+          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} />
+        <//>
+      `}
+      ${listaAberta && !listaFixa && html`
         <${Folha} titulo=${avaliacao.titulo} subtitulo=${`${plural(alunos.filter((a) => resultados[a.id].concluida).length, 'avaliado', 'avaliados')} de ${alunos.length}`} alta espera=${350} aoFechar=${() => setListaAberta(false)}>
           ${listaAlunos(false)}
         <//>

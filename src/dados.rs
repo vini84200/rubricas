@@ -48,7 +48,7 @@ pub fn gravar(caminho: &Path, conteudo: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, caminho)
 }
 
-fn checar_id(id: &str) -> Res<()> {
+pub(crate) fn checar_id(id: &str) -> Res<()> {
     if id_valido(id) {
         Ok(())
     } else {
@@ -59,7 +59,7 @@ fn checar_id(id: &str) -> Res<()> {
 }
 
 /// Lê um arquivo de texto. `None` se não existe; `Invalido` se não é UTF-8.
-fn ler_opcional(caminho: &Path) -> Res<Option<String>> {
+pub(crate) fn ler_opcional(caminho: &Path) -> Res<Option<String>> {
     match fs::read(caminho) {
         Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
             let nome = caminho.file_name().unwrap_or_default().to_string_lossy();
@@ -68,6 +68,17 @@ fn ler_opcional(caminho: &Path) -> Res<Option<String>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Erro de leitura de TOML com linha e coluna, para quem escreveu o arquivo achar.
+pub(crate) fn erro_toml(texto: &str, e: &toml::de::Error) -> String {
+    let onde = e.span().map(|s| {
+        let antes = &texto[..s.start.min(texto.len())];
+        let linha = antes.matches('\n').count() + 1;
+        let coluna = antes.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        format!("linha {linha}, coluna {coluna}: ")
+    });
+    format!("{}{}", onde.unwrap_or_default(), e.message().trim())
 }
 
 /// Uma marcação que não pôde ser aplicada (critério removido, nível inexistente…).
@@ -89,6 +100,11 @@ impl Dados {
 
     pub fn raiz(&self) -> &Path {
         &self.raiz
+    }
+
+    /// Uma escrita por vez na pasta inteira.
+    pub(crate) fn travar(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.trava.lock().unwrap()
     }
 
     fn caminho(&self, sub: &str, id: &str, ext: &str) -> Res<PathBuf> {
@@ -172,15 +188,7 @@ impl Dados {
     /// existe. Itens sem id herdam o do item de mesmo nome na versão gravada.
     pub fn salvar_rubrica_toml(&self, id: &str, texto: &str) -> Res<Rubrica> {
         checar_id(id)?;
-        let mut r: Rubrica = toml::from_str(texto).map_err(|e| {
-            let onde = e.span().map(|s| {
-                let antes = &texto[..s.start.min(texto.len())];
-                let linha = antes.matches('\n').count() + 1;
-                let coluna = antes.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-                format!("linha {linha}, coluna {coluna}: ")
-            });
-            Erro::Invalido(format!("{}{}", onde.unwrap_or_default(), e.message().trim()))
-        })?;
+        let mut r: Rubrica = toml::from_str(texto).map_err(|e| Erro::Invalido(erro_toml(texto, &e)))?;
         match self.ler_rubrica(id) {
             Ok(anterior) => r.herdar_ids(&anterior),
             Err(Erro::NaoEncontrado(_) | Erro::Invalido(_)) => {}
@@ -332,10 +340,13 @@ impl Dados {
             }
             outro => outro?,
         }
-        match fs::remove_dir_all(self.raiz.join("correcoes").join(id)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
+        for sub in ["correcoes", "submissoes", "pipelines", "relatorios"] {
+            match fs::remove_dir_all(self.raiz.join(sub).join(id)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
+        Ok(())
     }
 
     /// Origens cuja rubrica na pasta difere da cópia guardada na avaliação.

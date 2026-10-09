@@ -3,6 +3,7 @@
 
 use crate::auth::{self, Auth, ErroLogin};
 use crate::dados::{self, Dados};
+use crate::ead;
 use crate::estatico::Web;
 use crate::modelo::*;
 use axum::extract::{Path, Query, Request, State};
@@ -20,12 +21,13 @@ pub struct Estado {
     pub dados: Arc<Dados>,
     pub auth: Arc<Auth>,
     pub web: Arc<Web>,
+    pub avisos: Arc<ead::Avisos>,
 }
 
 #[derive(Clone)]
-struct Usuario(String);
+pub(crate) struct Usuario(pub String);
 
-struct Erro(StatusCode, String);
+pub(crate) struct Erro(pub StatusCode, pub String);
 
 impl IntoResponse for Erro {
     fn into_response(self) -> Response {
@@ -47,7 +49,7 @@ impl From<dados::Erro> for Erro {
     }
 }
 
-type Res<T> = Result<T, Erro>;
+pub(crate) type Res<T> = Result<T, Erro>;
 
 pub fn rotas(estado: Estado) -> Router {
     let protegidas = Router::new()
@@ -61,6 +63,7 @@ pub fn rotas(estado: Estado) -> Router {
         .route("/avaliacoes/{id}", get(pacote).put(salvar_avaliacao).delete(apagar_avaliacao))
         .route("/avaliacoes/{id}/correcoes/{aluno}", patch(alterar_correcao))
         .route("/avaliacoes/{id}/notas.csv", get(exportar))
+        .merge(ead::rotas())
         .route_layer(middleware::from_fn_with_state(estado.clone(), exigir_sessao));
     let api = Router::new()
         .route("/entrar", post(entrar))
@@ -202,7 +205,7 @@ async fn listar_rubricas_texto(State(e): State<Estado>) -> Res<Response> {
     Ok(texto_puro(texto))
 }
 
-fn texto_puro(texto: String) -> Response {
+pub(crate) fn texto_puro(texto: String) -> Response {
     let mut r = texto.into_response();
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
     r
@@ -340,7 +343,8 @@ async fn pacote(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Val
     let turma = e.dados.ler_turma(&avaliacao.turma)?;
     let correcoes = e.dados.ler_correcoes(&id)?;
     let desatualizadas = e.dados.rubricas_desatualizadas(&avaliacao);
-    Ok(Json(json!({ "avaliacao": avaliacao, "turma": turma, "correcoes": correcoes, "desatualizadas": desatualizadas })))
+    let ead = ead::resumo(&e, &id)?;
+    Ok(Json(json!({ "avaliacao": avaliacao, "turma": turma, "correcoes": correcoes, "desatualizadas": desatualizadas, "ead": ead })))
 }
 
 fn gravar_avaliacao(e: &Estado, id: Option<&str>, d: DadosAvaliacao) -> Res<Json<Avaliacao>> {
@@ -353,6 +357,8 @@ async fn criar_avaliacao(State(e): State<Estado>, Json(d): Json<DadosAvaliacao>)
 }
 
 async fn salvar_avaliacao(State(e): State<Estado>, Path(id): Path<String>, Json(d): Json<DadosAvaliacao>) -> Res<Json<Avaliacao>> {
+    // Rubricas atualizadas podem mudar as sugestões do pipeline.
+    e.avisos.fila_mudou();
     gravar_avaliacao(&e, Some(&id), d)
 }
 
