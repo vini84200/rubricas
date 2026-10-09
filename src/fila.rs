@@ -13,6 +13,7 @@
 //! relatório tem erro de execução.
 
 use crate::dados::{Dados, Erro, Res, checar_id, gravar, ler_opcional};
+use crate::executor::MOTOR;
 use crate::pipeline::{self, Pipeline, Relatorio, Situacao};
 use crate::submissoes::{Arquivos, InfoArquivo, listar, resumo};
 use std::collections::BTreeMap;
@@ -55,6 +56,12 @@ fn versao(partes: &[&str]) -> String {
         h.update([0]);
     }
     h.finalize().iter().take(12).map(|b| format!("{b:02x}")).collect()
+}
+
+/// O trabalho de checar um aluno: pipeline, código e a regra de julgar do executor.
+/// O plágio não depende dela e não entra aqui.
+fn versao_checagens(pipeline: &str, codigo: &str) -> String {
+    versao(&[MOTOR, pipeline, codigo])
 }
 
 fn ler_json<T: serde::de::DeserializeOwned>(caminho: &Path) -> Res<Option<T>> {
@@ -182,7 +189,7 @@ impl Dados {
         let rel = self.pasta_relatorios(avaliacao)?;
         let mut fila = Vec::new();
         for (aluno, s) in &subs.alunos {
-            let v = versao(&[&vp, &s.hash_checagem]);
+            let v = versao_checagens(&vp, &s.hash_checagem);
             let feito = ler_json::<Relatorio>(&rel.join(format!("{aluno}.json")))?
                 .is_some_and(|r| r.versao == v && !r.checagens.iter().any(|c| c.situacao == Situacao::Erro));
             if !feito {
@@ -209,12 +216,18 @@ impl Dados {
             return Ok(None);
         }
         let Some(s) = self.submissoes(avaliacao)?.alunos.remove(aluno) else { return Ok(None) };
-        Ok(Some(versao(&[&self.versao_pipeline(avaliacao)?, &s.hash_checagem])))
+        Ok(Some(versao_checagens(&self.versao_pipeline(avaliacao)?, &s.hash_checagem)))
     }
 
     /// Grava o relatório do executor e calcula as sugestões, se ele é da versão atual.
     pub fn salvar_relatorio(&self, avaliacao: &str, aluno: &str, mut relatorio: Relatorio, agora: u64) -> Res<Relatorio> {
         checar_id(aluno)?;
+        if relatorio.motor != MOTOR {
+            return Err(Erro::Conflito(format!(
+                "O executor julga pela regra {:?} e o servidor, pela {MOTOR:?}: atualize o rubricas executor",
+                relatorio.motor
+            )));
+        }
         let p = self.ler_pipeline(avaliacao)?.ok_or_else(|| Erro::NaoEncontrado(format!("A avaliação “{avaliacao}” não tem pipeline")))?;
         relatorio.sugestoes.clear();
         if self.versao_trabalho(avaliacao, aluno)?.as_deref() == Some(relatorio.versao.as_str()) {
@@ -276,7 +289,7 @@ impl Dados {
         let mut todos = BTreeMap::new();
         for (aluno, s) in self.submissoes(avaliacao)?.alunos {
             if let Some(mut r) = ler_json::<Relatorio>(&pasta.join(format!("{aluno}.json")))? {
-                let atual = vp.as_ref().is_some_and(|vp| versao(&[vp, &s.hash_checagem]) == r.versao);
+                let atual = vp.as_ref().is_some_and(|vp| versao_checagens(vp, &s.hash_checagem) == r.versao);
                 if atual && let Some((p, av)) = &atuais {
                     r.sugestoes = p.sugestoes(av, &r.checagens);
                 }
@@ -345,7 +358,7 @@ saida = "1"
             .unwrap();
         let passaram = u32::from(situacao == Situacao::Passou);
         let r = ResultadoChecagem { nome: "casos".into(), tipo: TipoChecagem::Casos, situacao, passaram, total: 1, resumo: String::new(), casos: vec![], saida: String::new() };
-        Relatorio { versao, gerado_em: 0, checagens: vec![r], sugestoes: vec![] }
+        Relatorio { versao, motor: crate::executor::MOTOR.into(), gerado_em: 0, checagens: vec![r], sugestoes: vec![] }
     }
 
     #[test]
@@ -380,6 +393,13 @@ saida = "1"
         let (r, atual) = d.relatorio("ead", "1").unwrap().unwrap();
         assert!(atual);
         assert_eq!(r.sugestoes[0].marcacao, crate::modelo::Marcacao::Nota { nota: 2.0 });
+
+        // um executor com a regra de julgar antiga é recusado, e o aluno segue na fila
+        let mut velho = relatorio(&d, "2", Situacao::Passou);
+        velho.motor = "1".into();
+        let Err(Erro::Conflito(m)) = d.salvar_relatorio("ead", "2", velho, 20) else { panic!("aceitou o motor antigo") };
+        assert!(m.contains("atualize"), "{m}");
+        assert_eq!(pendentes(&d), ["2", "plágio"]);
 
         // erro de execução não conta como feito
         d.salvar_relatorio("ead", "2", relatorio(&d, "2", Situacao::Erro), 20).unwrap();

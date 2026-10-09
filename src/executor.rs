@@ -15,18 +15,46 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
+/// Versão de como o executor julga. Mudou a regra (por exemplo, o script dos
+/// casos abaixo)? Mude esta versão: as checagens de todos os alunos voltam para
+/// a fila uma vez, e o servidor recusa relatórios de executores com a regra antiga.
+pub const MOTOR: &str = "2";
+
 /// Roda os casos dentro do contêiner, cada um com seu limite de tempo, e
-/// imprime o que cada execução produziu.
+/// imprime o que cada execução produziu. Sem `considerar_prompts`, o programa
+/// roda com um `input()` que lê a linha sem imprimir o prompt: cada aluno
+/// escreve o seu ("Digite os votos: "), e isso não pode reprovar a saída.
 const EXECUTA_CASOS: &str = r#"
 import json, subprocess, sys
-programa, tempo = sys.argv[1], float(sys.argv[2])
-casos = json.load(open('/meta/casos.json', encoding='utf-8'))
+programa, tempo, arquivo_casos, pasta = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+considerar_prompts = sys.argv[5] == '1'
+casos = json.load(open(arquivo_casos, encoding='utf-8'))
+SEM_PROMPTS = (
+    "import builtins, os, runpy, sys, traceback\n"
+    "def _so_do_aluno(t, v, tb):\n"
+    "    q = traceback.extract_tb(tb)\n"
+    "    while q and (q[0].filename == '<string>' or 'runpy' in q[0].filename):\n"
+    "        q.pop(0)\n"
+    "    if q and q[-1].filename == '<string>' and q[-1].name == '<lambda>':\n"
+    "        q.pop()\n"
+    "    # o código do -c fica no cache de linhas: num exec() do aluno, sairia a linha errada\n"
+    "    q = [traceback.FrameSummary(f.filename, f.lineno, f.name, line='') if f.filename == '<string>' else f for f in q]\n"
+    "    cabeca = ['Traceback (most recent call last):\\n', *traceback.format_list(q)] if q else []\n"
+    "    sys.stderr.write(''.join(cabeca + traceback.format_exception_only(t, v)))\n"
+    "sys.excepthook = _so_do_aluno\n"
+    "_ler = builtins.input\n"
+    "builtins.input = lambda *_: _ler()\n"
+    "sys.argv = [os.path.abspath(sys.argv[1]), *sys.argv[2:]]\n"
+    "sys.path[0] = os.path.dirname(sys.argv[0])\n"
+    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+)
 fim = lambda b: (b or b'').decode('utf-8', 'replace')[-20000:]
 saida = []
 for c in casos:
+    comando = [sys.executable, programa] if considerar_prompts else [sys.executable, '-c', SEM_PROMPTS, programa]
     try:
-        p = subprocess.run([sys.executable, programa, *c['argumentos']], input=c['entrada'].encode(),
-                           capture_output=True, timeout=tempo, cwd='/trabalho')
+        p = subprocess.run([*comando, *c['argumentos']], input=c['entrada'].encode(),
+                           capture_output=True, timeout=tempo, cwd=pasta)
         saida.append({'saida': fim(p.stdout), 'erro': fim(p.stderr),
                       'codigo': p.returncode if p.returncode >= 0 else None, 'tempo_esgotado': False})
     except subprocess.TimeoutExpired as e:
@@ -203,12 +231,19 @@ fn chave(t: &Tarefa) -> String {
     }
 }
 
+/// Um nome que não se repete neste processo, nem entre processos.
+fn unico() -> String {
+    static CONTADOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CONTADOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{n}", std::process::id(), crate::auth::agora_ms())
+}
+
 /// Pasta temporária que se apaga sozinha.
 struct Temporaria(PathBuf);
 
 impl Temporaria {
     fn nova(nome: &str) -> Result<Self, String> {
-        let p = std::env::temp_dir().join(format!("rubricas-{nome}-{}-{}", std::process::id(), crate::auth::agora_ms()));
+        let p = std::env::temp_dir().join(format!("rubricas-{nome}-{}", unico()));
         fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(Temporaria(p))
     }
@@ -281,7 +316,7 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
         Err(e) => {
             // Sem imagem não há como rodar: o relatório diz isso, e o aluno continua pendente.
             let resultados = p.checagens.iter().map(|ch| erro_execucao(ch, e.clone())).collect();
-            let relatorio = Relatorio { versao: versao.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
+            let relatorio = Relatorio { versao: versao.into(), motor: MOTOR.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
             cliente.put_json(&rota(&["executor", "relatorios", avaliacao, aluno]), &relatorio)?;
             return Err(e);
         }
@@ -313,7 +348,7 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
         println!("  {}: {}", r.nome, if r.situacao == Situacao::Erro { format!("erro de execução: {}", r.resumo) } else { r.resumo.clone() });
         resultados.push(r);
     }
-    let relatorio = Relatorio { versao: versao.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
+    let relatorio = Relatorio { versao: versao.into(), motor: MOTOR.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
     cliente.put_json(&rota(&["executor", "relatorios", avaliacao, aluno]), &relatorio)
 }
 
@@ -364,17 +399,14 @@ fn rodar_checagem(ch: &Checagem, p: &Pipeline, programa: &str, amb: &Ambiente) -
                 return erro_execucao(ch, e);
             }
             let limite_casos = Duration::from_secs_f64(tempo * ch.casos.len() as f64 + 30.0);
-            let cmd = ["python3", "/meta/casos.py", programa, &tempo.to_string()];
+            let prompts = if ch.considerar_prompts { "1" } else { "0" };
+            let cmd = ["python3", "/meta/casos.py", programa, &tempo.to_string(), "/meta/casos.json", "/trabalho", prompts];
             let saida = match conteiner(amb, &cmd, limite_casos, &[]) {
                 Ok(s) => s,
                 Err(e) => return erro_execucao(ch, e),
             };
-            let execucoes = saida.saida.rsplit_once("@@rubricas@@").and_then(|(_, j)| serde_json::from_str::<Vec<ExecucaoJson>>(j.trim()).ok());
-            match execucoes {
-                Some(ex) => {
-                    let ex: Vec<Execucao> = ex.into_iter().map(Into::into).collect();
-                    conferir::julgar_casos(&ch.nome, &ch.casos, &ex, ch.ignorar_maiusculas)
-                }
+            match ler_execucoes(&saida.saida) {
+                Some(ex) => conferir::julgar_casos(&ch.nome, &ch.casos, &ex, ch.ignorar_maiusculas),
                 // O contêiner inteiro estourou (memória, tempo total): todos os casos falham.
                 None if saida.tempo_esgotado || saida.codigo == Some(137) => {
                     let motivo = if saida.tempo_esgotado { "tempo esgotado" } else { "memória esgotada" };
@@ -485,6 +517,13 @@ struct ExecucaoJson {
     erro: String,
     codigo: Option<i32>,
     tempo_esgotado: bool,
+}
+
+/// O que o script dos casos imprimiu depois da marca, se ele chegou ao fim.
+fn ler_execucoes(saida: &str) -> Option<Vec<Execucao>> {
+    let (_, json) = saida.rsplit_once("@@rubricas@@")?;
+    let lidas: Vec<ExecucaoJson> = serde_json::from_str(json.trim()).ok()?;
+    Some(lidas.into_iter().map(Into::into).collect())
 }
 
 impl From<ExecucaoJson> for Execucao {
@@ -604,7 +643,7 @@ struct Saida {
 /// Roda um comando num contêiner sem rede, com memória, CPU e tempo limitados.
 /// `Err` é falha do próprio executor (podman, imagem), nunca do código do aluno.
 fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)]) -> Result<Saida, String> {
-    let nome = format!("rubricas-{}-{}", std::process::id(), crate::auth::agora_ms());
+    let nome = format!("rubricas-{}", unico());
     let vol = |p: &Path, destino: &str, modo: &str| format!("{}:{destino}:{modo}", p.display());
     let mut args: Vec<String> = [
         "run", "--rm", "--name", &nome, "--network=none", "--pids-limit=256", "--cap-drop=ALL",
@@ -659,4 +698,75 @@ fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)
         return Err(format!("podman: {}", erro.trim()));
     }
     Ok(Saida { saida, erro, codigo: status.code(), tempo_esgotado })
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    /// Roda o script dos casos com o python3 da máquina, sem contêiner. `arquivos`
+    /// é o código do aluno (o programa é `main.py`); cada caso, (entrada, argumentos).
+    fn rodar(arquivos: &[(&str, &str)], casos: &[(&str, &[&str])], considerar_prompts: bool) -> Vec<Execucao> {
+        let tmp = Temporaria::nova("teste-casos").unwrap();
+        for (nome, conteudo) in arquivos {
+            gravar(&tmp.0.join(nome), conteudo.as_bytes()).unwrap();
+        }
+        gravar(&tmp.0.join("casos.py"), EXECUTA_CASOS.as_bytes()).unwrap();
+        let casos: Vec<Value> = casos.iter().map(|(e, a)| json!({ "entrada": e, "argumentos": a })).collect();
+        gravar(&tmp.0.join("casos.json"), serde_json::to_string(&casos).unwrap().as_bytes()).unwrap();
+        let pasta = tmp.0.to_string_lossy().into_owned();
+        let prompts = if considerar_prompts { "1" } else { "0" };
+        let saida = Command::new("python3")
+            .args([&format!("{pasta}/casos.py"), "main.py", "5", &format!("{pasta}/casos.json"), &pasta, prompts])
+            .output()
+            .expect("python3 na máquina");
+        let mut ex = ler_execucoes(&String::from_utf8_lossy(&saida.stdout)).expect("o script imprimiu os resultados");
+        // Cada rodada tem sua pasta; no contêiner ela é sempre /trabalho.
+        for e in &mut ex {
+            e.erro = e.erro.replace(&pasta, "/trabalho");
+        }
+        ex
+    }
+
+    const ELEICAO: &str = "nome = input('Qual o seu nome? ')\nvotos = int(input('Quantos votos? '))\nprint(f'{nome} teve {votos} votos')\n";
+
+    #[test]
+    fn prompts_do_input_nao_entram_na_saida_dos_casos() {
+        let ex = rodar(&[("main.py", ELEICAO)], &[("Ana\n10\n", &[]), ("Ana\n", &[])], false);
+        assert_eq!(ex[0].saida, "Ana teve 10 votos\n");
+        assert_eq!(ex[0].codigo, Some(0));
+        // faltou entrada: o input() continua dando EOFError, como o original
+        assert_eq!(ex[1].codigo, Some(1));
+        assert!(ex[1].erro.contains("EOFError"), "{}", ex[1].erro);
+        assert!(!ex[1].saida.contains("Quantos votos?"));
+
+        // com considerar_prompts, a saída é a de sempre
+        let ex = rodar(&[("main.py", ELEICAO)], &[("Ana\n10\n", &[])], true);
+        assert_eq!(ex[0].saida, "Qual o seu nome? Quantos votos? Ana teve 10 votos\n");
+    }
+
+    #[test]
+    fn sem_prompts_o_erro_mostrado_e_o_mesmo_da_execucao_direta() {
+        // a execução direta (considerar_prompts) é a referência
+        let programas = [
+            ("sintaxe", "x = (\n"),
+            ("exec do aluno", "exec('1/0')\n"),
+            ("falta entrada", ELEICAO),
+        ];
+        for (nome, programa) in programas {
+            let sem = rodar(&[("main.py", programa)], &[("Ana\n", &[])], false);
+            let direto = rodar(&[("main.py", programa)], &[("Ana\n", &[])], true);
+            assert_eq!(sem[0].erro, direto[0].erro, "{nome}");
+            assert_eq!(sem[0].codigo, direto[0].codigo, "{nome}");
+        }
+    }
+
+    #[test]
+    fn sem_prompts_o_programa_roda_como_principal_e_importa_vizinhos() {
+        let main_py = "import sys\nimport util\nif __name__ == '__main__':\n    print(util.dobro(int(input('x? '))), sys.argv[1:])\n    sys.exit(3)\n";
+        let util_py = "def dobro(x):\n    return 2 * x\n";
+        let ex = rodar(&[("main.py", main_py), ("util.py", util_py)], &[("21\n", &["-v"])], false);
+        assert_eq!(ex[0].saida, "42 ['-v']\n");
+        assert_eq!(ex[0].codigo, Some(3), "sys.exit vale como antes");
+    }
 }

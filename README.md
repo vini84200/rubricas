@@ -183,7 +183,8 @@ aluno, a edição feita sobre o antigo é descartada e a tela avisa.
 
 **Checagens.** O pipeline da avaliação fica em `pipelines/<avaliacao>/pipeline.toml` e é escrito
 pela API em texto (a skill do Claude ensina o formato); a tela "Checagens e plágio" só o mostra.
-Tipos: `casos` (stdin → stdout), `pytest`, `estilo` (ruff), `comando`, e `plagio` (JPlag) na raiz
+Tipos: `casos` (stdin → stdout; os prompts do `input()` não entram na saída comparada, porque
+cada aluno escreve o seu, a não ser com `considerar_prompts = true`), `pytest`, `estilo` (ruff), `comando`, e `plagio` (JPlag) na raiz
 do arquivo. Uma checagem pode apontar um critério; o resultado vira uma **sugestão** no cartão
 ("Sugestão: Atende (8/8 casos)"), que `G` ou um toque aceitam. Código do aluno que não roda conta
 como reprovado e o relatório mostra o fim do stderr; falha do executor (imagem, podman) aparece
@@ -196,7 +197,8 @@ RUBRICAS_TOKEN=… rubricas executor --servidor https://rubrica.exemplo.org     
 RUBRICAS_TOKEN=… rubricas executor --servidor https://rubrica.exemplo.org --continuo # fica ouvindo
 ```
 
-numa máquina com podman (o notebook ou a própria VPS). Cada checagem roda em `podman run
+numa máquina com podman (o notebook ou a própria VPS). Quando muda a forma de julgar (a constante
+`MOTOR` em `src/fila.rs`), todos os trabalhos voltam para a fila uma vez. Cada checagem roda em `podman run
 --network=none`, com 256 MB, 1 CPU e 10 s (por caso, nos `casos`; configuráveis no pipeline), numa imagem
 derivada do `python:3.12-slim` com pytest e ruff, construída na primeira vez. O plágio roda o
 [JPlag](https://github.com/jplag/JPlag) 6.3.0 (GPL-3.0) em outro contêiner (Java 25), como

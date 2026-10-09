@@ -80,7 +80,7 @@ tempo = 10                  # segundos por execução; memoria = "256m", imagem 
 plagio = { base = "esqueleto.py", referencias = "referencias/", limiar = 0.6 }   # JPlag; tudo opcional
 
 [[checagens]]
-tipo = "casos"              # stdin → stdout; ignora espaços no fim das linhas
+tipo = "casos"              # stdin → stdout; ignora espaços no fim das linhas e os prompts do input()
 nome = "Exemplos do enunciado"
 criterio = "soma-correta"
 sugestao = [{ minimo = 1.0, nivel = "Atende" }, { minimo = 0.5, nivel = "Parcial" }]   # fração de acertos → marcação
@@ -104,6 +104,6 @@ comando = "python3 -m py_compile $PROGRAMA"
 ```
 
 - **Regras de sugestão:** `nivel` (id ou rótulo) para escala `niveis`, `atende = true/false` para `binaria`, `nota = 1.5` para `livre` e `ponto_unico`. Sem regras: binária só atende com tudo certo; níveis só nos extremos; nota proporcional aos acertos.
-- **Casos:** cubra os exemplos do enunciado e as bordas que a especificação cita (entrada vazia, negativo, limite). `ignorar_maiusculas = true` e `argumentos = ["x"]` são opcionais.
+- **Casos:** cubra os exemplos do enunciado e as bordas que a especificação cita (entrada vazia, negativo, limite). Os prompts do `input("Digite…")` não entram na saída comparada, porque cada aluno escreve o seu: em `saida`, ponha só o que o programa imprime com `print`. Um prompt feito com `print("Digite:")` antes do `input()` continua na saída: se o enunciado não padroniza isso, prefira comparar com `pytest`. `considerar_prompts = true` (na checagem) os mantém; `ignorar_maiusculas = true` e `argumentos = ["x"]` também são opcionais.
 - **Plágio:** `base` é o código dado a todos (não conta como cópia); `referencias` é uma pasta de anexos com soluções conhecidas.
 - **Executor:** o servidor nunca roda código. Quem roda é `rubricas executor --servidor URL` (podman), no notebook ou noutra máquina.

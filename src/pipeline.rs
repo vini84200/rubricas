@@ -110,6 +110,10 @@ pub struct Checagem {
     pub casos: Vec<Caso>,
     #[serde(default, skip_serializing_if = "falso")]
     pub ignorar_maiusculas: bool,
+    /// casos: compara também os prompts do `input()`. Sem isto, eles não entram
+    /// na saída, porque cada aluno escreve o seu.
+    #[serde(default, skip_serializing_if = "falso")]
+    pub considerar_prompts: bool,
 
     /// pytest: arquivo de testes no pipeline.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -228,6 +232,9 @@ pub struct Sugestao {
 pub struct Relatorio {
     /// Versão do trabalho (pipeline + submissão) a que o relatório responde.
     pub versao: String,
+    /// Versão da regra de julgar do executor que gerou o relatório.
+    #[serde(default)]
+    pub motor: String,
     #[serde(default)]
     pub gerado_em: u64,
     pub checagens: Vec<ResultadoChecagem>,
@@ -362,6 +369,7 @@ pub fn ler(texto: &str, av: &Avaliacao) -> Result<Pipeline, String> {
         let sobra = [
             ("casos", !ch.casos.is_empty(), TipoChecagem::Casos),
             ("ignorar_maiusculas", ch.ignorar_maiusculas, TipoChecagem::Casos),
+            ("considerar_prompts", ch.considerar_prompts, TipoChecagem::Casos),
             ("testes", !ch.testes.is_empty(), TipoChecagem::Pytest),
             ("regras", !ch.regras.is_empty(), TipoChecagem::Estilo),
             ("ignorar", !ch.ignorar.is_empty(), TipoChecagem::Estilo),
@@ -543,6 +551,11 @@ criterio = "testes"
         assert!(erro("testes = \"testes.py\"\n", "").contains("testes"), "pytest sem arquivo de testes");
         assert!(erro("[[checagens.casos]]\nentrada = \"2\\n3\\n\"\nsaida = \"5\\n\"\n", "").contains("Exemplos"), "casos sem casos");
         assert!(erro("arquivo = \"main.py\"", "arquivo = \"../x.py\"").contains("arquivo"));
+        // prompts do input() são ignorados nos casos, a não ser que a checagem peça
+        assert!(!p.checagens[0].considerar_prompts);
+        let com = ler(&PIPELINE.replace("nome = \"Exemplos\"", "nome = \"Exemplos\"\nconsiderar_prompts = true"), &av).unwrap();
+        assert!(com.checagens[0].considerar_prompts);
+        assert!(erro("tipo = \"estilo\"", "tipo = \"estilo\"\nconsiderar_prompts = true").contains("considerar_prompts"));
         assert!(erro("arquivo = \"main.py\"", "plagio = { limiar = 2.0 }").contains("limiar"));
     }
 
