@@ -1,0 +1,14 @@
+# Exemplo. Usuários e tokens são criados dentro do contêiner:
+#   docker compose run --rm rubricas usuario vini --dados /dados
+#   docker compose run --rm rubricas token vini --dados /dados
+services:
+  rubricas:
+    build: .
+    restart: unless-stopped
+    # O dono dos arquivos em ./dados é quem roda o contêiner, não root.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ./dados:/dados
+    ports:
+      # Só local: o proxy HTTPS (Caddy, cloudflared…) é quem fica exposto.
+      - "127.0.0.1:8080:8080"
