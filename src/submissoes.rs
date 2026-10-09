@@ -26,6 +26,8 @@ pub struct Importacao {
     pub sem_dono: Vec<String>,
     /// Entradas do ZIP fora do padrão do Moodle.
     pub ignorados: Vec<String>,
+    /// Alunos com código novo cujas edições do professor foram descartadas.
+    pub edicoes_descartadas: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -43,6 +45,18 @@ pub struct Submissao {
     pub arquivos: Vec<InfoArquivo>,
     /// Já havia marcações e a submissão mudou depois delas.
     pub mudou_depois_da_correcao: bool,
+    /// Resumo do que as checagens veem: o original com as edições por cima.
+    pub hash_checagem: String,
+    pub edicao: Option<Edicao>,
+}
+
+/// Mudanças pontuais do professor sobre o código do aluno (o original fica guardado).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Edicao {
+    pub por: String,
+    pub em: u64,
+    /// Arquivos editados.
+    pub arquivos: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -63,6 +77,7 @@ pub(crate) type Arquivos = BTreeMap<String, Vec<u8>>;
 
 const SEM_DONO: &str = ".sem-dono";
 const INDICE: &str = ".indice.json";
+const EDICOES: &str = ".edicoes";
 const MAX_TOTAL: u64 = 300 << 20;
 const MAX_ARQUIVO: u64 = 20 << 20;
 const MAX_ENTRADAS: usize = 20_000;
@@ -73,6 +88,16 @@ struct Indice {
     alunos: BTreeMap<String, Registro>,
     #[serde(default)]
     sem_dono: BTreeMap<String, Registro>,
+    #[serde(default)]
+    edicoes: BTreeMap<String, RegistroEdicao>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegistroEdicao {
+    por: String,
+    em: u64,
+    /// Resumo do original com as edições por cima.
+    hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,7 +291,12 @@ impl Dados {
             let igual = mapa.get(&chave).is_some_and(|reg| reg.hash == hash) && lugar.is_dir();
             if !igual {
                 substituir_pasta(&lugar, &arquivos)?;
-                mapa.insert(chave, Registro { nome_moodle: nome, hash, alterada_em: agora });
+                mapa.insert(chave.clone(), Registro { nome_moodle: nome, hash, alterada_em: agora });
+                // Edições feitas sobre o código antigo não valem para o novo.
+                if associado && indice.edicoes.remove(&chave).is_some() {
+                    remover_pasta(&pasta.join(EDICOES).join(&chave))?;
+                    r.edicoes_descartadas.push(chave);
+                }
             }
             if associado && igual {
                 r.iguais += 1;
@@ -284,11 +314,19 @@ impl Dados {
         let mut s = Submissoes::default();
         for (aluno, reg) in indice.alunos {
             let marcada = self.ler_correcao(avaliacao, &aluno)?.filter(|c| !c.respostas.is_empty());
+            let edicao = indice.edicoes.get(&aluno).map(|e| Edicao {
+                por: e.por.clone(),
+                em: e.em,
+                arquivos: listar(&pasta.join(EDICOES).join(&aluno)).into_iter().map(|a| a.caminho).collect(),
+            });
+            let hash_checagem = indice.edicoes.get(&aluno).map_or_else(|| reg.hash.clone(), |e| e.hash.clone());
             s.alunos.insert(
                 aluno.clone(),
                 Submissao {
                     arquivos: listar(&pasta.join(&aluno)),
                     mudou_depois_da_correcao: marcada.is_some_and(|c| reg.alterada_em > c.atualizado_em),
+                    hash_checagem,
+                    edicao,
                     nome_moodle: reg.nome_moodle,
                     hash: reg.hash,
                     alterada_em: reg.alterada_em,
@@ -320,6 +358,9 @@ impl Dados {
             .remove(chave)
             .ok_or_else(|| Erro::NaoEncontrado(format!("Não há submissão sem dono “{chave}”")))?;
         trocar_pasta(&pasta.join(SEM_DONO).join(chave), &pasta.join(aluno))?;
+        if indice.edicoes.remove(aluno).is_some() {
+            remover_pasta(&pasta.join(EDICOES).join(aluno))?;
+        }
         let mut apelidos = self.apelidos(&turma.id)?;
         apelidos.insert(slug(&reg.nome_moodle), aluno.to_string());
         let arquivo = self.raiz().join("apelidos").join(format!("{}.json", turma.id));
@@ -330,14 +371,66 @@ impl Dados {
         Ok(())
     }
 
-    pub fn arquivo_submissao(&self, avaliacao: &str, aluno: &str, caminho: &str) -> Res<Vec<u8>> {
+    /// Grava uma mudança do professor num arquivo que o aluno enviou. O original
+    /// fica guardado; gravar o conteúdo original desfaz a edição daquele arquivo.
+    pub fn editar_arquivo(&self, avaliacao: &str, aluno: &str, caminho: &str, conteudo: &[u8], por: &str, agora: u64) -> Res<()> {
+        let original = self.arquivo_original(avaliacao, aluno, caminho)?;
+        if conteudo.len() as u64 > MAX_ARQUIVO {
+            return Err(Erro::Invalido(format!("O arquivo passa de {} MB", MAX_ARQUIVO >> 20)));
+        }
+        let pasta = self.pasta_submissoes(avaliacao)?;
+        let edicoes = pasta.join(EDICOES).join(aluno);
+        let _g = self.travar();
+        let mut indice = self.ler_indice(&pasta)?;
+        if conteudo == original {
+            match fs::remove_file(edicoes.join(caminho)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        } else {
+            gravar(&edicoes.join(caminho), conteudo)?;
+        }
+        let editados = listar(&edicoes);
+        if editados.is_empty() {
+            remover_pasta(&edicoes)?;
+            indice.edicoes.remove(aluno);
+        } else {
+            let mut efetivos = Arquivos::new();
+            for a in listar(&pasta.join(aluno)) {
+                efetivos.insert(a.caminho.clone(), fs::read(pasta.join(aluno).join(&a.caminho))?);
+            }
+            for a in editados {
+                efetivos.insert(a.caminho.clone(), fs::read(edicoes.join(&a.caminho))?);
+            }
+            let reg = RegistroEdicao { por: por.into(), em: agora, hash: resumo(&efetivos) };
+            indice.edicoes.insert(aluno.into(), reg);
+        }
+        gravar(&pasta.join(INDICE), serde_json::to_string_pretty(&indice).unwrap().as_bytes())?;
+        Ok(())
+    }
+
+    fn caminho_enviado(&self, avaliacao: &str, aluno: &str, caminho: &str) -> Res<PathBuf> {
         checar_id(aluno)?;
         if !caminho_seguro(caminho) {
             return Err(Erro::Invalido(format!("Caminho inválido: {caminho:?}")));
         }
-        match fs::read(self.pasta_submissoes(avaliacao)?.join(aluno).join(caminho)) {
+        Ok(self.pasta_submissoes(avaliacao)?.join(aluno).join(caminho))
+    }
+
+    /// O arquivo como o aluno enviou.
+    pub fn arquivo_original(&self, avaliacao: &str, aluno: &str, caminho: &str) -> Res<Vec<u8>> {
+        match fs::read(self.caminho_enviado(avaliacao, aluno, caminho)?) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("{aluno} não enviou {caminho}"))),
             outro => Ok(outro?),
+        }
+    }
+
+    /// O arquivo que as checagens e o visualizador usam: a edição do professor, se há.
+    pub fn arquivo_submissao(&self, avaliacao: &str, aluno: &str, caminho: &str) -> Res<Vec<u8>> {
+        let original = self.caminho_enviado(avaliacao, aluno, caminho)?;
+        match fs::read(self.pasta_submissoes(avaliacao)?.join(EDICOES).join(aluno).join(caminho)) {
+            Ok(editado) if original.is_file() => Ok(editado),
+            _ => self.arquivo_original(avaliacao, aluno, caminho),
         }
     }
 }
@@ -516,6 +609,51 @@ pub(crate) mod testes {
         assert!(!raiz.join("usuarios.toml").exists());
         assert!(matches!(d.importar_submissoes("ead", b"isto nao e zip", 10), Err(Erro::Invalido(_))));
         assert!(matches!(d.arquivo_submissao("ead", "1", "../../usuarios.toml"), Err(Erro::Invalido(_))));
+        std::fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
+    fn edicao_do_professor_fica_por_cima_do_original_ate_um_zip_trazer_codigo_novo() {
+        let (raiz, d) = montar("edicao");
+        d.importar_submissoes(
+            "ead",
+            &zip(&[("Ana Souza_1_assignsubmission_file_/main.py", "print(1\n"), ("Bruno Lima_2_assignsubmission_file_/main.py", "b")]),
+            10,
+        )
+        .unwrap();
+        let antes = d.submissoes("ead").unwrap().alunos["1"].clone();
+
+        d.editar_arquivo("ead", "1", "main.py", b"print(1)\n", "vini", 20).unwrap();
+        assert_eq!(d.arquivo_submissao("ead", "1", "main.py").unwrap(), b"print(1)\n");
+        assert_eq!(d.arquivo_original("ead", "1", "main.py").unwrap(), b"print(1\n");
+        let s = d.submissoes("ead").unwrap().alunos["1"].clone();
+        let e = s.edicao.as_ref().unwrap();
+        assert_eq!((e.por.as_str(), e.em, e.arquivos.as_slice()), ("vini", 20, ["main.py".to_string()].as_slice()));
+        assert_eq!(s.hash, antes.hash, "o original não muda");
+        assert_ne!(s.hash_checagem, antes.hash_checagem, "as checagens veem o código editado");
+        assert_eq!(s.alterada_em, 10, "editar não é o aluno reenviar");
+
+        // só arquivos que o aluno enviou podem ser editados
+        assert!(matches!(d.editar_arquivo("ead", "1", "novo.py", b"x", "vini", 21), Err(Erro::NaoEncontrado(_))));
+        assert!(matches!(d.editar_arquivo("ead", "3", "main.py", b"x", "vini", 21), Err(Erro::NaoEncontrado(_))));
+
+        // reenvio igual mantém a edição; código novo do aluno a descarta, com aviso
+        let r = d.importar_submissoes("ead", &zip(&[("Ana Souza_1_assignsubmission_file_/main.py", "print(1\n")]), 30).unwrap();
+        assert!(r.edicoes_descartadas.is_empty());
+        assert!(d.submissoes("ead").unwrap().alunos["1"].edicao.is_some());
+        let r = d.importar_submissoes("ead", &zip(&[("Ana Souza_1_assignsubmission_file_/main.py", "print(2)\n")]), 40).unwrap();
+        assert_eq!(r.edicoes_descartadas, ["1"]);
+        let s = d.submissoes("ead").unwrap().alunos["1"].clone();
+        assert!(s.edicao.is_none());
+        assert_eq!(s.hash, s.hash_checagem);
+        assert_eq!(d.arquivo_submissao("ead", "1", "main.py").unwrap(), b"print(2)\n");
+
+        // voltar ao conteúdo original desfaz a edição daquele arquivo
+        d.editar_arquivo("ead", "2", "main.py", b"b2", "vini", 50).unwrap();
+        d.editar_arquivo("ead", "2", "main.py", b"b", "vini", 51).unwrap();
+        let s = d.submissoes("ead").unwrap().alunos["2"].clone();
+        assert!(s.edicao.is_none());
+        assert_eq!(s.hash, s.hash_checagem);
         std::fs::remove_dir_all(&raiz).unwrap();
     }
 }

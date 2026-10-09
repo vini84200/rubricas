@@ -984,7 +984,7 @@ export function Avaliar({ id, alunoId }) {
       ${listaFixa && html`<aside class="av-lateral">${listaAlunos(false)}</aside>`}
       ${comCodigo && html`
         <aside class="av-codigo-lateral" aria-label="Código do aluno">
-          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} />
+          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} aoMudar=${carregar} semAvisos />
         </aside>
       `}
 
@@ -992,7 +992,7 @@ export function Avaliar({ id, alunoId }) {
         ${pacote.offline && html`<p class="av-aviso">Sem conexão: usando a cópia guardada neste aparelho.</p>`}
         ${avisos.length > 0 && html`
           <ul class="av-avisos" aria-label="Avisos sobre a submissão">
-            ${avisos.map((a) => html`<li data-tipo=${a.tipo}>${a.texto}</li>`)}
+            ${avisos.map((a) => html`<li data-tipo=${a.tipo} title=${a.dica}>${a.texto}</li>`)}
           </ul>
         `}
         ${noResumo
@@ -1077,7 +1077,7 @@ export function Avaliar({ id, alunoId }) {
       `}
       ${codigoAberto && ead && html`
         <${Folha} titulo=${aluno.nome} alta aoFechar=${() => setCodigoAberto(false)}>
-          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} />
+          <${PainelCodigo} avaliacao=${id} aluno=${aluno.id} ead=${ead} alunos=${alunos} aoMudar=${carregar} />
         <//>
       `}
       ${listaAberta && !listaFixa && html`

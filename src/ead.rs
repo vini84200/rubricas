@@ -3,10 +3,11 @@
 
 use crate::api::{Erro, Estado, Res, Usuario, texto_puro};
 use crate::auth;
+use crate::dados::Dados;
 use crate::fila::{ResultadoPlagio, Tarefa};
 use crate::pipeline::Relatorio;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -66,7 +67,10 @@ pub fn rotas() -> Router<Estado> {
         )
         .route("/avaliacoes/{id}/submissoes/sem-dono/{chave}", post(associar))
         .route("/avaliacoes/{id}/submissoes/{aluno}", get(submissao))
-        .route("/avaliacoes/{id}/submissoes/{aluno}/{*caminho}", get(arquivo_submissao))
+        .route(
+            "/avaliacoes/{id}/submissoes/{aluno}/{*caminho}",
+            get(arquivo_submissao).put(editar_arquivo).delete(desfazer_edicao).layer(DefaultBodyLimit::max(MAX_ANEXO)),
+        )
         .route("/avaliacoes/{id}/plagio", get(plagio))
         .route("/avaliacoes/{id}/plagio.jplag", get(baixar_jplag))
         .route("/pipelines.txt", get(pipelines_texto))
@@ -98,7 +102,12 @@ pub fn resumo(e: &Estado, id: &str) -> Res<Value> {
         .alunos
         .iter()
         .map(|(a, s)| {
-            let v = json!({ "alterada_em": s.alterada_em, "mudou": s.mudou_depois_da_correcao, "arquivos": s.arquivos.len() });
+            let v = json!({
+                "alterada_em": s.alterada_em,
+                "mudou": s.mudou_depois_da_correcao,
+                "arquivos": s.arquivos.len(),
+                "edicao": s.edicao,
+            });
             (a.clone(), v)
         })
         .collect();
@@ -200,19 +209,58 @@ fn como_texto(bytes: &[u8]) -> Option<String> {
 }
 
 /// Código e relatório de um aluno, de uma vez: é o que o visualizador mostra.
+/// Arquivos editados pelo professor trazem também o texto original.
+fn json_submissao(dados: &Dados, id: &str, aluno: &str) -> Res<Json<Value>> {
+    let sub = dados.submissoes(id)?.alunos.remove(aluno);
+    let editados = sub.as_ref().and_then(|s| s.edicao.as_ref()).map(|e| e.arquivos.clone()).unwrap_or_default();
+    let mut arquivos = Vec::new();
+    for a in sub.as_ref().map(|s| s.arquivos.as_slice()).unwrap_or_default() {
+        let texto = como_texto(&dados.arquivo_submissao(id, aluno, &a.caminho)?);
+        let editado = editados.contains(&a.caminho);
+        let original = if editado { como_texto(&dados.arquivo_original(id, aluno, &a.caminho)?) } else { None };
+        arquivos.push(json!({ "caminho": a.caminho, "tamanho": a.tamanho, "texto": texto, "editado": editado, "original": original }));
+    }
+    let relatorio = dados.relatorio(id, aluno)?.map(|(r, atual)| json!({ "atual": atual, "relatorio": r }));
+    Ok(Json(json!({ "submissao": sub, "arquivos": arquivos, "relatorio": relatorio })))
+}
+
 async fn submissao(State(e): State<Estado>, Path((id, aluno)): Path<(String, String)>) -> Res<Json<Value>> {
     let dados = e.dados.clone();
-    bloqueante(move || {
-        let sub = dados.submissoes(&id)?.alunos.remove(&aluno);
-        let mut arquivos = Vec::new();
-        for a in sub.as_ref().map(|s| s.arquivos.as_slice()).unwrap_or_default() {
-            let texto = como_texto(&dados.arquivo_submissao(&id, &aluno, &a.caminho)?);
-            arquivos.push(json!({ "caminho": a.caminho, "tamanho": a.tamanho, "texto": texto }));
-        }
-        let relatorio = dados.relatorio(&id, &aluno)?.map(|(r, atual)| json!({ "atual": atual, "relatorio": r }));
-        Ok(Json(json!({ "submissao": sub, "arquivos": arquivos, "relatorio": relatorio })))
+    bloqueante(move || json_submissao(&dados, &id, &aluno)).await
+}
+
+/// Mudança pontual do professor no código do aluno; as checagens rodam de novo.
+async fn editar_arquivo(
+    State(e): State<Estado>,
+    Extension(u): Extension<Usuario>,
+    Path((id, aluno, caminho)): Path<(String, String, String)>,
+    corpo: Bytes,
+) -> Res<Json<Value>> {
+    let dados = e.dados.clone();
+    let r = bloqueante(move || {
+        dados.editar_arquivo(&id, &aluno, &caminho, &corpo, &u.0, auth::agora())?;
+        json_submissao(&dados, &id, &aluno)
     })
-    .await
+    .await?;
+    e.avisos.fila_mudou();
+    Ok(r)
+}
+
+/// Volta o arquivo ao que o aluno enviou.
+async fn desfazer_edicao(
+    State(e): State<Estado>,
+    Extension(u): Extension<Usuario>,
+    Path((id, aluno, caminho)): Path<(String, String, String)>,
+) -> Res<Json<Value>> {
+    let dados = e.dados.clone();
+    let r = bloqueante(move || {
+        let original = dados.arquivo_original(&id, &aluno, &caminho)?;
+        dados.editar_arquivo(&id, &aluno, &caminho, &original, &u.0, auth::agora())?;
+        json_submissao(&dados, &id, &aluno)
+    })
+    .await?;
+    e.avisos.fila_mudou();
+    Ok(r)
 }
 
 fn baixar(bytes: Vec<u8>, nome: &str) -> Response {
@@ -226,9 +274,24 @@ fn baixar(bytes: Vec<u8>, nome: &str) -> Response {
     r
 }
 
-async fn arquivo_submissao(State(e): State<Estado>, Path((id, aluno, caminho)): Path<(String, String, String)>) -> Res<Response> {
+#[derive(Deserialize)]
+struct QualVersao {
+    /// `original=1`: como o aluno enviou, sem as edições do professor.
+    #[serde(default)]
+    original: Option<String>,
+}
+
+async fn arquivo_submissao(
+    State(e): State<Estado>,
+    Path((id, aluno, caminho)): Path<(String, String, String)>,
+    Query(q): Query<QualVersao>,
+) -> Res<Response> {
     let nome = caminho.rsplit('/').next().unwrap_or("arquivo").to_string();
-    Ok(baixar(e.dados.arquivo_submissao(&id, &aluno, &caminho)?, &nome))
+    let bytes = match q.original.is_some_and(|v| v != "0") {
+        true => e.dados.arquivo_original(&id, &aluno, &caminho)?,
+        false => e.dados.arquivo_submissao(&id, &aluno, &caminho)?,
+    };
+    Ok(baixar(bytes, &nome))
 }
 
 async fn plagio(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {

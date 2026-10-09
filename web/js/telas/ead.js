@@ -1,7 +1,7 @@
 // EAD: o pipeline de checagens e o plágio de uma avaliação (só leitura: o
 // pipeline é escrito pela API em texto, com a skill do Claude), e a tela
 // "Acompanhar", que segue no monitor o aluno aberto em outro aparelho.
-import { html, useState, useEffect } from '../../vendor/preact-htm.js';
+import { html, useState, useEffect, useRef } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { PainelCodigo } from '../codigo.js';
 import { rota, plural, cls } from '../util.js';
@@ -117,6 +117,7 @@ export function Acompanhar() {
   const [conectado, setConectado] = useState(true);
   const [pacote, setPacote] = useState(null);
   const [erro, setErro] = useState('');
+  const recarregar = useRef(() => {});
 
   useEffect(() => {
     const fonte = new EventSource('api/foco/eventos');
@@ -147,6 +148,7 @@ export function Acompanhar() {
       })
       .catch((e) => vivo && setErro(e.message));
     carregar();
+    recarregar.current = carregar;
     const t = setInterval(carregar, 30000);
     return () => {
       vivo = false;
@@ -182,7 +184,7 @@ export function Acompanhar() {
         `}
         ${foco && !aluno && !erro && html`<p class="acompanhar-espera" aria-busy="true">Carregando…</p>`}
         ${aluno && !pacote.ead && html`<p class="acompanhar-espera">Esta avaliação não tem submissões do Moodle.</p>`}
-        ${aluno && pacote.ead && html`<${PainelCodigo} grande avaliacao=${foco.avaliacao} aluno=${aluno.id} ead=${pacote.ead} alunos=${pacote.turma.alunos} />`}
+        ${aluno && pacote.ead && html`<${PainelCodigo} grande avaliacao=${foco.avaliacao} aluno=${aluno.id} ead=${pacote.ead} alunos=${pacote.turma.alunos} aoMudar=${() => recarregar.current()} />`}
       </main>
     </div>
   `;

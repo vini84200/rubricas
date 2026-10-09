@@ -744,13 +744,13 @@ input.nota-valor { width: 110px; min-height: 52px; font-size: 24px; font-weight:
 .codigo-aba.atual { background: #10201a; color: #fff; }
 .codigo-nome { flex: none; padding: 8px 12px 0; font: 13px ui-monospace, 'SFMono-Regular', Menlo, monospace; opacity: .7; }
 .codigo-fonte { display: grid; grid-template-columns: auto minmax(0, 1fr); flex: 1 1 auto; min-height: 0; overflow: auto; }
-.codigo-fonte pre { margin: 0; padding: 10px 12px; font: 14px/1.5 ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; tab-size: 4; }
+.codigo-fonte pre, .editor-corpo .codigo-numeros { margin: 0; padding: 10px 12px; font: 14px/1.5 ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; tab-size: 4; }
 .codigo-numeros { position: sticky; left: 0; z-index: 1; text-align: right; color: rgba(230, 239, 231, .38); background: #10201a; border-right: 1px solid rgba(230, 239, 231, .12); user-select: none; -webkit-user-select: none; }
 .codigo-texto { white-space: pre; }
 .codigo-texto code { font: inherit; background: none; padding: 0; color: inherit; }
 .codigo-binario { padding: 16px; }
 .codigo-binario a { color: var(--giz); }
-.painel-codigo.grande .codigo-fonte pre { font-size: 17px; }
+.painel-codigo.grande .codigo-fonte pre, .painel-codigo.grande .editor-corpo .codigo-numeros { font-size: 17px; }
 
 /* Destaque do Python, nas cores de giz */
 .token.comment { color: #8fa89a; font-style: italic; }
@@ -851,3 +851,38 @@ label.botao.ocupado { opacity: .6; cursor: progress; }
   .painel-codigo.grande { grid-template: "avisos" auto "checagens" auto "codigo" minmax(0, 1fr) "rodape" auto / minmax(0, 1fr); }
   .painel-codigo.grande > .painel-checagens { max-height: 35vh; }
 }
+
+/* Edição do código pelo professor */
+.codigo-barra { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 10px; background: #0b1813; font-size: 14px; }
+.codigo-editado { padding: 1px 8px; border-radius: 999px; background: var(--giz); color: var(--tinta); font-weight: 700; font-size: 13px; }
+.codigo-acao { min-height: 32px; padding: 2px 10px; border: 1.5px solid rgba(230, 239, 231, .35); border-radius: 8px; background: none; color: inherit; font-weight: 700; font-size: 14px; }
+.codigo-acao.principal { margin-left: auto; border-color: var(--giz); color: var(--giz); }
+.codigo-acao:hover { background: rgba(230, 239, 231, .08); }
+.codigo-barra .erro { color: var(--nao-giz); }
+
+.editor { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.folha .editor { min-height: 50dvh; }
+.editor-corpo { display: grid; grid-template-columns: auto minmax(0, 1fr); flex: 1 1 auto; min-height: 220px; }
+.editor-corpo .codigo-numeros { overflow: hidden; }
+.editor-camadas { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.editor-fundo, .editor-area {
+  position: absolute; inset: 0; margin: 0; padding: 10px 12px;
+  font: 14px/1.5 ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace; tab-size: 4; letter-spacing: 0;
+  white-space: pre; overflow-wrap: normal; word-break: normal;
+}
+.editor-fundo { overflow: hidden; pointer-events: none; }
+.editor-area {
+  width: 100%; height: 100%; min-height: 0; border: 0; border-radius: 0; resize: none; overflow: auto;
+  background: transparent; color: transparent; caret-color: #fff; -webkit-text-fill-color: transparent;
+}
+.editor-area:focus { outline: none; }
+.editor-area::selection { background: rgba(244, 211, 94, .32); }
+.editor-camadas:focus-within { box-shadow: inset 0 0 0 2px var(--giz); }
+.editor-barra { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; background: #0b1813; }
+.editor-dica { flex: 1 1 200px; font-size: 13px; opacity: .75; }
+.editor-dica kbd { min-width: 20px; height: 20px; font-size: 12px; }
+.editor-barra .erro { color: var(--nao-giz); flex-basis: 100%; }
+.editor-cancelar { border-color: rgba(230, 239, 231, .5); color: #e6efe7; }
+.painel-codigo.grande .editor-fundo, .painel-codigo.grande .editor-area { font-size: 17px; }
+.folha .editor-barra { position: sticky; bottom: 0; z-index: 2; }
+@media (pointer: coarse) { .editor-dica { display: none; } .editor-barra .botao { flex: 1; } }

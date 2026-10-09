@@ -33,6 +33,7 @@ dados/
   avaliacoes/<id>.json            título, turma e uma cópia das rubricas usadas
   correcoes/<avaliacao>/<aluno>.json
   submissoes/<avaliacao>/<aluno>/ arquivos enviados pelo aluno (do ZIP do Moodle)
+  submissoes/<avaliacao>/.edicoes/<aluno>/  mudanças do professor sobre esses arquivos
   apelidos/<turma>.json           nome no Moodle → aluno, das associações feitas à mão
   pipelines/<avaliacao>/          pipeline.toml e anexos (testes.py, esqueleto.py, referencias/)
   relatorios/<avaliacao>/         resultado das checagens por aluno e do JPlag
@@ -171,6 +172,14 @@ números de linha e destaque de Python (Prism, em `web/vendor/prism.js`); em tel
 "Código" abre o mesmo painel. A tela **Acompanhar** (`#/acompanhar`), aberta no monitor, mostra o
 código e as checagens do aluno que o mesmo usuário abriu em outro aparelho e troca sozinha (SSE,
 com batimento a cada 30 s para o proxy não cortar a conexão).
+
+**Editar o código.** O botão "Editar" no código abre um editor (Tab indenta, Enter mantém o
+recuo, Ctrl+S salva) para mudanças pontuais, como corrigir um erro de sintaxe e ver se o resto
+funciona. Salvar põe o aluno de volta na fila do executor; as checagens passam a usar a versão
+editada e o cartão avisa "Código editado por …". O original fica guardado em
+`submissoes/<avaliacao>/.edicoes/` à parte: "Ver original" mostra o que o aluno enviou e "Desfazer
+edição" volta a ele. O plágio sempre compara os originais. Se um ZIP novo traz código diferente do
+aluno, a edição feita sobre o antigo é descartada e a tela avisa.
 
 **Checagens.** O pipeline da avaliação fica em `pipelines/<avaliacao>/pipeline.toml` e é escrito
 pela API em texto (a skill do Claude ensina o formato); a tela "Checagens e plágio" só o mostra.

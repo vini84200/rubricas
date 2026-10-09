@@ -325,6 +325,7 @@ function Entregas({ id, ead, alunos, aoMudar }) {
       const partes = [`${plural(r.recebidas, 'submissão nova ou alterada', 'submissões novas ou alteradas')}`];
       if (r.iguais) partes.push(`${plural(r.iguais, 'igual à anterior', 'iguais às anteriores')}`);
       if (r.sem_dono.length) partes.push(`${plural(r.sem_dono.length, 'nome sem dono', 'nomes sem dono')}`);
+      if (r.edicoes_descartadas.length) partes.push(`${plural(r.edicoes_descartadas.length, 'edição sua descartada', 'edições suas descartadas')} (o aluno mandou código novo)`);
       if (r.ignorados.length) partes.push(`${plural(r.ignorados.length, 'arquivo fora do padrão ignorado', 'arquivos fora do padrão ignorados')}`);
       setMsg({ ok: true, texto: `${partes.join(', ')}.` });
       aoMudar();

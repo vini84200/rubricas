@@ -182,7 +182,7 @@ impl Dados {
         let rel = self.pasta_relatorios(avaliacao)?;
         let mut fila = Vec::new();
         for (aluno, s) in &subs.alunos {
-            let v = versao(&[&vp, &s.hash]);
+            let v = versao(&[&vp, &s.hash_checagem]);
             let feito = ler_json::<Relatorio>(&rel.join(format!("{aluno}.json")))?
                 .is_some_and(|r| r.versao == v && !r.checagens.iter().any(|c| c.situacao == Situacao::Erro));
             if !feito {
@@ -190,6 +190,7 @@ impl Dados {
             }
         }
         if p.plagio.is_some() && subs.alunos.len() >= 2 {
+            // O plágio compara o que os alunos enviaram, não as edições do professor.
             let partes: Vec<String> = subs.alunos.iter().map(|(a, s)| format!("{a}:{}", s.hash)).collect();
             let mut todas = vec![vp.as_str()];
             todas.extend(partes.iter().map(String::as_str));
@@ -208,7 +209,7 @@ impl Dados {
             return Ok(None);
         }
         let Some(s) = self.submissoes(avaliacao)?.alunos.remove(aluno) else { return Ok(None) };
-        Ok(Some(versao(&[&self.versao_pipeline(avaliacao)?, &s.hash])))
+        Ok(Some(versao(&[&self.versao_pipeline(avaliacao)?, &s.hash_checagem])))
     }
 
     /// Grava o relatório do executor e calcula as sugestões, se ele é da versão atual.
@@ -275,7 +276,7 @@ impl Dados {
         let mut todos = BTreeMap::new();
         for (aluno, s) in self.submissoes(avaliacao)?.alunos {
             if let Some(mut r) = ler_json::<Relatorio>(&pasta.join(format!("{aluno}.json")))? {
-                let atual = vp.as_ref().is_some_and(|vp| versao(&[vp, &s.hash]) == r.versao);
+                let atual = vp.as_ref().is_some_and(|vp| versao(&[vp, &s.hash_checagem]) == r.versao);
                 if atual && let Some((p, av)) = &atuais {
                     r.sugestoes = p.sugestoes(av, &r.checagens);
                 }
@@ -393,6 +394,19 @@ saida = "1"
         d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 40).unwrap();
         d.salvar_relatorio("ead", "2", relatorio(&d, "2", Situacao::Passou), 40).unwrap();
         assert_eq!(pendentes(&d), ["plágio"]);
+        // a edição do professor põe o aluno de volta na fila; o plágio olha o original e não muda
+        let plagio = |d: &Dados| d.fila().unwrap().into_iter().find_map(|t| match t {
+            Tarefa::Plagio { versao, .. } => Some(versao),
+            _ => None,
+        });
+        let antes = plagio(&d);
+        d.editar_arquivo("ead", "1", "main.py", b"a3", "vini", 45).unwrap();
+        assert_eq!(pendentes(&d), ["1", "plágio"]);
+        assert_eq!(plagio(&d), antes);
+        assert!(!d.relatorio("ead", "1").unwrap().unwrap().1);
+        d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 46).unwrap();
+        assert!(d.relatorio("ead", "1").unwrap().unwrap().1, "relatório da versão editada é o atual");
+
         d.salvar_pipeline_toml("ead", &PIPELINE.replace("saida = \"1\"", "saida = \"2\"")).unwrap();
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
         std::fs::remove_dir_all(&raiz).unwrap();

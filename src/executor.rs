@@ -233,10 +233,19 @@ fn baixar_pipeline(cliente: &Cliente, avaliacao: &str, destino: &Path) -> Result
     Ok(p)
 }
 
-fn baixar_submissao(cliente: &Cliente, avaliacao: &str, aluno: &str, arquivos: &[InfoArquivo], destino: &Path) -> Result<Vec<String>, String> {
+/// `original`: como o aluno enviou (plágio); senão, com as edições do professor (checagens).
+fn baixar_submissao(
+    cliente: &Cliente,
+    avaliacao: &str,
+    aluno: &str,
+    arquivos: &[InfoArquivo],
+    destino: &Path,
+    original: bool,
+) -> Result<Vec<String>, String> {
     let mut nomes = Vec::new();
     for a in arquivos {
-        let bytes = cliente.bytes(&rota(&["avaliacoes", avaliacao, "submissoes", aluno, &a.caminho]))?;
+        let caminho = rota(&["avaliacoes", avaliacao, "submissoes", aluno, &a.caminho]);
+        let bytes = cliente.bytes(&if original { format!("{caminho}?original=1") } else { caminho })?;
         gravar(&destino.join(&a.caminho), &bytes)?;
         nomes.push(a.caminho.clone());
     }
@@ -253,7 +262,7 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
     let (anexos, trabalho, meta) = (tmp.0.join("pipeline"), tmp.0.join("trabalho"), tmp.0.join("meta"));
     let p = baixar_pipeline(cliente, avaliacao, &anexos)?;
     let sub: SubmissaoAluno = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes", aluno]))?;
-    let arquivos = baixar_submissao(cliente, avaliacao, aluno, &sub.arquivos, &trabalho)?;
+    let arquivos = baixar_submissao(cliente, avaliacao, aluno, &sub.arquivos, &trabalho, false)?;
     // Os anexos (testes, esqueleto) ficam junto do código do aluno.
     copiar_pasta(&anexos, &trabalho)?;
     let _ = fs::remove_file(trabalho.join("pipeline.toml"));
@@ -500,7 +509,7 @@ fn plagio(cliente: &Cliente, avaliacao: &str, versao: &str) -> Result<(), String
     let cfg = p.plagio.clone().ok_or("o pipeline não pede plágio")?;
     let todas: TodasSubmissoes = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes"]))?;
     for (aluno, s) in &todas.alunos {
-        baixar_submissao(cliente, avaliacao, aluno, &s.arquivos, &trabalho.join("alunos").join(aluno))?;
+        baixar_submissao(cliente, avaliacao, aluno, &s.arquivos, &trabalho.join("alunos").join(aluno), true)?;
     }
     fs::create_dir_all(trabalho.join("saida")).map_err(|e| e.to_string())?;
     let mut cmd: Vec<String> =
