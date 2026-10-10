@@ -539,6 +539,9 @@ mod testes {
             turma: "d".into(),
             nota_maxima: 10.0,
             rubricas: vec![RubricaAplicada { origem: "lista5".into(), peso: 1.0, rubrica: r }],
+            efeitos: vec![],
+            prazo: None,
+            tolerancia: 0,
         }
     }
 

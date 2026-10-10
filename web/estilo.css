@@ -534,6 +534,28 @@ html.avaliando, html.avaliando body { height: 100%; overflow: hidden; overscroll
 .resumo-pontos { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .resumo-marca { grid-column: 2; font-size: 15px; color: var(--tinta-2); }
 .resumo-pontos { grid-row: 1; grid-column: 3; }
+.resumo-nota .resumo-antes { display: block; margin-top: 6px; font-size: 15px; }
+
+/* Efeitos sobre a nota, no resumo: sugestões, aplicados e os que faltam. */
+.efeitos { margin-top: 14px; padding-top: 10px; border-top: 1.5px solid var(--linha); }
+.efeitos-titulo { margin: 0 0 6px; font-size: 15px; color: var(--tinta-2); }
+.efeitos-lista { display: grid; gap: 6px; margin-bottom: 8px; }
+.efeito {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px;
+  padding: 8px 10px; border-radius: var(--raio); border-left: 6px solid var(--linha); background: var(--papel);
+}
+.efeito.sugerido { border-left-color: var(--meio); background: var(--meio-fundo); }
+.efeito.aplicado { border-left-color: var(--tinta-2); }
+.efeito.aplicado[data-problema] { border-left-color: var(--nao); }
+.efeito-texto { flex: 1 1 220px; min-width: 0; }
+.efeito-acoes { display: flex; flex-wrap: wrap; gap: 6px; }
+.efeito-acoes kbd { margin-left: 4px; }
+.efeitos-livres { display: flex; flex-wrap: wrap; gap: 6px; }
+.efeito-form { display: grid; gap: 8px; padding: 10px; border: 1.5px solid var(--linha); border-radius: var(--raio); }
+.efeito-form .acoes { margin: 0; }
+.efeito-titulo { margin: 0; font-weight: 700; }
+.efeitos-celula { display: flex; flex-wrap: wrap; gap: 4px; }
+.efeitos-celula .selo { background: var(--papel); font-weight: 400; white-space: nowrap; }
 
 /* ---------- Opções do critério ---------- */
 
@@ -715,6 +737,8 @@ input.nota-valor { width: 110px; min-height: 52px; font-size: 24px; font-weight:
 .av-avisos li[data-tipo='plagio'], .ead-avisos li[data-tipo='plagio'] { background: var(--nao-giz); color: var(--tinta); }
 .av-avisos li[data-tipo='mudou'], .ead-avisos li[data-tipo='mudou'] { background: var(--giz); color: var(--tinta); }
 .av-avisos li[data-tipo='espera'] { font-weight: 400; }
+.av-avisos li[data-tipo='efeito'] { background: var(--giz); color: var(--tinta); }
+.aviso-ir { padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
 
 .ficha-sugestao {
   flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px;

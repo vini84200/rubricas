@@ -1,6 +1,6 @@
 // Acesso ao servidor e fila de correções por enviar.
 import { CHAVES, guardar, recuperar, apagar } from './armazem.js';
-import { aplicarLote, chaveItem, descontar, separar, tamanho } from './lote.js';
+import { MAPAS, aplicarLote, chaveItem, descontar, separar, tamanho } from './lote.js';
 import { rota } from './util.js';
 
 export class ErroApi extends Error {
@@ -99,6 +99,8 @@ async function enviar() {
       }),
     };
     if (lote.comentario_geral !== undefined) corpo.comentario_geral = lote.comentario_geral;
+    corpo.efeitos = Object.entries(lote.efeitos || {}).map(([efeito, aplicado]) => ({ efeito, aplicado }));
+    corpo.dispensadas = Object.entries(lote.dispensadas || {}).map(([efeito, dispensa]) => ({ efeito, dispensa }));
     let resultado = null;
     let erro = null;
     try {
@@ -158,13 +160,17 @@ export const fila = {
     if (contar()) agendar(300);
   },
 
-  /** Registra alterações de um aluno. `respostas` usa a chave "<origem>\n<criterio>". */
-  adicionar(avaliacao, aluno, { respostas, comentario_geral }) {
+  /** Registra alterações de um aluno. `respostas` usa a chave "<origem>\n<criterio>";
+      `efeitos` e `dispensadas`, o id do tipo de efeito. */
+  adicionar(avaliacao, aluno, alteracoes) {
     if (!dono) return;
     const k = chaveItem(avaliacao, aluno);
     const lote = structuredClone(pendentes[k] || { respostas: {} });
-    Object.assign(lote.respostas, respostas || {});
-    if (comentario_geral !== undefined) lote.comentario_geral = comentario_geral;
+    Object.assign(lote.respostas, alteracoes.respostas || {});
+    if (alteracoes.comentario_geral !== undefined) lote.comentario_geral = alteracoes.comentario_geral;
+    for (const campo of MAPAS) {
+      if (alteracoes[campo]) lote[campo] = { ...lote[campo], ...alteracoes[campo] };
+    }
     pendentes = { ...pendentes, [k]: lote };
     guardar(chaveFila(), pendentes);
     avisar();

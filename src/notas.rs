@@ -36,6 +36,11 @@ pub fn notas_csv(av: &Avaliacao, turma: &Turma, correcoes: &BTreeMap<String, Cor
             cab.push(texto_csv(&format!("{} (total)", ra.rubrica.titulo)));
         }
     }
+    // Com efeitos na avaliação, a nota das rubricas e os efeitos vêm antes da final.
+    let com_efeitos = !av.efeitos.is_empty();
+    if com_efeitos {
+        cab.extend(["nota_sem_efeitos".to_string(), "efeitos".to_string()]);
+    }
     cab.extend(["nota".to_string(), "situacao".to_string(), "comentarios".to_string()]);
     w.write_record(&cab).unwrap();
 
@@ -61,8 +66,15 @@ pub fn notas_csv(av: &Avaliacao, turma: &Turma, correcoes: &BTreeMap<String, Cor
         if let Some(c) = correcao.filter(|c| !c.comentario_geral.trim().is_empty()) {
             comentarios.push(c.comentario_geral.trim().to_string());
         }
-        linha.push(if r.respondidos > 0 { numero(r.nota, br) } else { String::new() });
+        let avaliado = r.respondidos > 0 || r.encerrada;
+        if com_efeitos {
+            linha.push(if r.respondidos > 0 { numero(r.antes, br) } else { String::new() });
+            let textos: Vec<String> = av.efeitos.iter().filter_map(|t| Some(t.texto(correcao?.efeitos.get(&t.id).filter(|_| r.efeitos.contains(&t.id))?))).collect();
+            linha.push(texto_csv(&textos.join(" | ")));
+        }
+        linha.push(if avaliado { numero(r.nota, br) } else { String::new() });
         linha.push(match r.andamento() {
+            Andamento::Concluida if r.encerrada && r.respondidos < r.total => "encerrada por efeito".to_string(),
             Andamento::Concluida => "concluída".to_string(),
             Andamento::Parcial => format!("{} de {}", r.respondidos, r.total),
             Andamento::NaoAvaliado => "não avaliado".to_string(),
@@ -126,10 +138,39 @@ mod testes {
             turma: "d".into(),
             nota_maxima: 10.0,
             rubricas: vec![RubricaAplicada { origem: "p".into(), peso: 1.0, rubrica: r }],
+            efeitos: vec![],
+            prazo: None,
+            tolerancia: 0,
         };
         let turma = Turma { id: "d".into(), alunos: vec![Aluno { id: "1".into(), nome: "Ana".into() }] };
         let csv = notas_csv(&av, &turma, &Default::default(), false);
         assert_eq!(csv.lines().next().unwrap(), "matricula,nome,Trata entrada vazia,nota,situacao,comentarios");
         assert_eq!(csv.lines().nth(1).unwrap(), "1,Ana,,,não avaliado,");
+    }
+
+    #[test]
+    fn csv_com_efeitos_mostra_a_nota_antes_e_os_efeitos() {
+        let mut r: Rubrica = toml::from_str("titulo = \"P\"\n[[criterios]]\nnome = \"Funciona\"\nescala = { tipo = \"binaria\", pontos = 1.0 }\n").unwrap();
+        r.normalizar();
+        let bonus = crate::efeitos::TipoEfeito { id: "bonus".into(), ..toml::from_str("titulo = \"Bônus\"\noperacao = { tipo = \"somar\", pontos = 1 }").unwrap() };
+        let av = Avaliacao {
+            id: "p".into(),
+            titulo: "P".into(),
+            turma: "d".into(),
+            nota_maxima: 10.0,
+            rubricas: vec![RubricaAplicada { origem: "p".into(), peso: 1.0, rubrica: r }],
+            efeitos: vec![bonus],
+            prazo: None,
+            tolerancia: 0,
+        };
+        let turma = Turma { id: "d".into(), alunos: vec![Aluno { id: "1".into(), nome: "Ana".into() }, Aluno { id: "2".into(), nome: "Bia".into() }] };
+        let mut c = Correcao::default();
+        c.respostas.entry("p".into()).or_default().insert("funciona".into(), Resposta { marcacao: Marcacao::Binaria { atende: false }, comentario: String::new() });
+        c.efeitos.insert("bonus".into(), Default::default());
+        let csv = notas_csv(&av, &turma, &BTreeMap::from([("1".to_string(), c)]), true);
+        let linhas: Vec<&str> = csv.lines().collect();
+        assert_eq!(linhas[0], "matricula;nome;Funciona;nota_sem_efeitos;efeitos;nota;situacao;comentarios");
+        assert_eq!(linhas[1], "1;Ana;0;0;Bônus: +1;1;concluída;");
+        assert_eq!(linhas[2], "2;Bia;;;;;não avaliado;");
     }
 }

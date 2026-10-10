@@ -2,7 +2,7 @@
 // nota.js espelha src/modelo.rs: estes casos fixam a conta do lado do navegador.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { calcular, pontos, tom, opcoesDe, marcacaoRapida } from '../web/js/nota.js';
+import { calcular, pontos, tom, opcoesDe, marcacaoRapida, aplicarEfeitos, problemaEfeito, textoEfeito, atraso, minutos, sugestoesEfeitos } from '../web/js/nota.js';
 import { arredondar, num } from '../web/js/util.js';
 
 const niveis = {
@@ -88,4 +88,63 @@ test('arredondar: duas casas, meio para cima, mesmo com o fio do ponto flutuante
   assert.ok(Object.is(arredondar(-0.001), 0));
   assert.equal(num(7.5), '7,5');
   assert.equal(num(NaN), '0');
+});
+
+// Efeitos: os mesmos casos de src/efeitos.rs.
+const atrasoT = { id: 'atraso', titulo: 'Atraso', sugerir: 'atraso', operacao: { tipo: 'por_unidade', pontos: -1, limite: -3 } };
+const plagioT = { id: 'plagio', titulo: 'Plágio', sugerir: 'plagio', encerra: true, feedback: false, operacao: { tipo: 'fixar', nota: 0 } };
+const bonusT = { id: 'bonus', titulo: 'Bônus', operacao: { tipo: 'somar', pontos: 'na_hora' } };
+const metadeT = { id: 'metade', titulo: 'Metade', operacao: { tipo: 'multiplicar', fator: 0.5 } };
+const tiposEf = [bonusT, atrasoT, metadeT, plagioT];
+const digitado = (valor) => ({ valor, justificativa: 'Apresentou em aula' });
+
+test('aplicarEfeitos: ordem fixa, limite, e a nota entre zero e a máxima', () => {
+  assert.deepEqual(aplicarEfeitos(tiposEf, {}, 8, 10), { nota: 8, encerrada: false, ids: [] });
+  const r = aplicarEfeitos(tiposEf, { bonus: digitado(1), atraso: { quantidade: 2 }, metade: {} }, 8, 10);
+  assert.deepEqual([r.nota, r.ids], [3, ['bonus', 'atraso', 'metade']]);
+  assert.equal(aplicarEfeitos(tiposEf, { atraso: { quantidade: 9 } }, 8, 10).nota, 5);
+  assert.equal(aplicarEfeitos(tiposEf, { atraso: { quantidade: 9 } }, 2, 10).nota, 0);
+  assert.equal(aplicarEfeitos(tiposEf, { bonus: digitado(3) }, 9, 10).nota, 10);
+  const z = aplicarEfeitos(tiposEf, { bonus: digitado(3), plagio: {} }, 9, 10);
+  assert.deepEqual([z.nota, z.encerrada], [0, true]);
+  // o que não combina com o tipo fica de fora
+  assert.equal(aplicarEfeitos(tiposEf, { bonus: { valor: 1 }, atraso: {}, sumiu: { quantidade: 1 } }, 7, 10).nota, 7);
+  assert.equal(problemaEfeito(bonusT, { valor: 1 }), 'Escreva a justificativa');
+});
+
+test('calcular: efeito que encerra conclui sem marcar nada', () => {
+  const r = calcular({ ...avaliacao, efeitos: tiposEf }, { respostas: {}, efeitos: { plagio: {} } });
+  assert.deepEqual([r.nota, r.respondidos, r.concluida, r.encerrada], [0, 0, true, true]);
+});
+
+test('textoEfeito: o mesmo texto que vai ao Moodle', () => {
+  assert.equal(textoEfeito(atrasoT, { quantidade: 2 }), 'Atraso (2 dias): −2');
+  assert.equal(textoEfeito(atrasoT, { quantidade: 5 }), 'Atraso (5 dias): −3');
+  assert.equal(textoEfeito(atrasoT, { quantidade: 1 }), 'Atraso (1 dia): −1');
+  assert.equal(textoEfeito(plagioT, {}), 'Plágio: nota 0');
+  assert.equal(textoEfeito(bonusT, digitado(0.5)), 'Bônus: +0,5. Apresentou em aula');
+  assert.equal(textoEfeito(metadeT, {}), 'Metade: −50%');
+});
+
+test('atraso: dia começado conta inteiro, dentro da tolerância não conta', () => {
+  const prazo = '2026-10-06T23:59';
+  assert.equal(atraso(prazo, 10, '2026-10-07T00:05'), 0);
+  assert.equal(atraso(prazo, 10, '2026-10-07T00:15'), 1);
+  assert.equal(atraso(prazo, 0, '2026-10-08T00:15'), 2);
+  assert.equal(atraso(prazo, 0, '2026-10-07T01:59', 'hora'), 2);
+  assert.equal(atraso(prazo, 0, '2026-10-06T10:00'), 0);
+  assert.equal(atraso(null, 0, '2026-10-07T00:15'), 0);
+  assert.equal(minutos('2026-02-29T00:00'), null);
+});
+
+test('sugestoesEfeitos: aparece com o sinal, some aplicada ou dispensada, volta se piorar', () => {
+  const av = { ...avaliacao, efeitos: tiposEf, prazo: '2026-10-06T23:59' };
+  const sinais = { plagio: { com: 'x', similaridade: 0.87 }, envio: '2026-10-08T10:00' };
+  const ids = (c, s = sinais) => sugestoesEfeitos(av, c, s).map((x) => [x.tipo.id, x.sinal, x.aplicado]);
+  assert.deepEqual(ids(null), [['atraso', 2, { quantidade: 2 }], ['plagio', 0.87, {}]]);
+  assert.deepEqual(ids(null, {}), []);
+  assert.deepEqual(ids({ efeitos: { plagio: {} } }), [['atraso', 2, { quantidade: 2 }]]);
+  const dispensada = { dispensadas: { plagio: { sinal: 0.87 }, atraso: { sinal: 2 } } };
+  assert.deepEqual(ids(dispensada), []);
+  assert.deepEqual(ids(dispensada, { ...sinais, plagio: { similaridade: 0.9 } }), [['plagio', 0.9, {}]]);
 });

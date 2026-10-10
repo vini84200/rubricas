@@ -126,23 +126,24 @@ export function Progresso({ concluidos, iniciados = 0, total }) {
   `;
 }
 
-/** Botão que escolhe um arquivo e chama `aoEscolher(arquivo)`; fica ocupado até ela terminar. */
-export function BotaoArquivo({ accept, rotulo, rotuloOcupado, title, aoEscolher }) {
+/** Botão que escolhe um arquivo e chama `aoEscolher(arquivo)`, ou, com `varios`,
+    alguns de uma vez e chama `aoEscolherVarios(arquivos)`; fica ocupado até ela terminar. */
+export function BotaoArquivo({ accept, rotulo, rotuloOcupado, title, aoEscolher, varios, aoEscolherVarios }) {
   const [enviando, setEnviando] = useState(false);
   async function escolher(e) {
-    const arquivo = e.target.files?.[0];
+    const arquivos = [...(e.target.files || [])];
     e.target.value = '';
-    if (!arquivo) return;
+    if (!arquivos.length) return;
     setEnviando(true);
     try {
-      await aoEscolher(arquivo);
+      await (varios ? aoEscolherVarios(arquivos) : aoEscolher(arquivos[0]));
     } finally {
       setEnviando(false);
     }
   }
   return html`
     <label class=${cls('botao', 'pequeno', enviando && 'ocupado')} title=${title}>
-      <input type="file" accept=${accept} class="escondido" disabled=${enviando} onChange=${escolher} />
+      <input type="file" accept=${accept} multiple=${!!varios} class="escondido" disabled=${enviando} onChange=${escolher} />
       ${enviando ? rotuloOcupado : rotulo}
     </label>
   `;

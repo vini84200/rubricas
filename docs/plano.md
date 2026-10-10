@@ -164,3 +164,52 @@ ar) aparece como "erro de execução", não reprova e continua pendente.
 - **Resultado do plágio:** o servidor recebe só os pares e as similaridades. A tela mostra os
   pares mais parecidos e um botão que baixa o `.jplag` para o visualizador oficial. No cartão de
   avaliar, o selo "⚠ 87% parecido com Fulano" aparece só acima do limiar.
+
+---
+
+## Fase 3: efeitos sobre a nota
+
+Decisões fechadas em 2026-10-10. Exemplos: zero por plágio, desconto por atraso, bônus.
+
+### 3.1 Tipos de efeito
+
+- Um efeito age **só sobre a nota final** do aluno na avaliação, depois da conta das rubricas.
+- **Catálogo** em `dados/efeitos/<id>.toml`, lido e gravado pela API em TOML (a skill do Claude
+  ensina o formato). A web só lista e mostra os tipos.
+- A avaliação escolhe os tipos que usa e guarda uma **cópia congelada**, como faz com as rubricas.
+  A tela avisa quando a cópia ficou diferente do catálogo.
+
+```toml
+titulo = "Desconto por atraso"
+operacao = { tipo = "por_unidade", pontos = -1.0, limite = -5.0 }
+sugerir = "atraso"
+feedback = true        # padrão; false = não vai aos Comentários de feedback do Moodle
+encerra = false        # true = conta como corrigido sem marcar os critérios
+```
+
+- **Operações** (conjunto fechado, igual em `modelo.rs` e `nota.js`): `fixar`, `multiplicar`,
+  `somar` (pontos negativos subtraem), `por_unidade` (pontos × quantidade, com limite) e `teto`.
+  O valor pode ser `"na_hora"`: o avaliador digita ao aplicar.
+- **Ordem fixa na conta:** multiplicar → somar e por unidade → teto. `fixar` vence tudo. No fim,
+  a nota fica entre 0 e a máxima.
+
+### 3.2 Sinais e sugestões
+
+- Dois sinais, `plagio` e `atraso`. O tipo declara `sugerir = "..."`. Nunca vale sozinho: é uma
+  sugestão, e o avaliador aplica (`G` no resumo).
+- **Plágio:** um par acima do limiar do JPlag sugere o efeito aos dois alunos.
+- **Atraso:** a avaliação ganha `prazo` (data e hora) e uma `tolerancia` opcional em minutos.
+  Cada 24 h começadas contam como um dia. A data do envio vem da coluna "Última modificação
+  (envio)" da planilha de notas do Moodle. A mesma área do ZIP aceita a planilha (e reconhece qual
+  é pelo conteúdo), e "Preencher planilha" também atualiza as datas.
+- **Dispensar:** grava na correção quem dispensou e quando, e o aviso some. Ele volta só se o sinal
+  piorar (similaridade maior, mais dias de atraso).
+
+### 3.3 Na tela
+
+- Os efeitos ficam no **resumo do aluno**. Uma sugestão aparece como aviso no topo do cartão desde
+  o primeiro critério. Quem não tem efeito não faz nenhum gesto a mais.
+- Aplicar um efeito exige `corrigir`, a mesma ação de marcar os critérios.
+- Uma linha como "Desconto por atraso (2 dias): −2,00", com a justificativa, vai aos Comentários de
+  feedback do Moodle, a não ser que o tipo tenha `feedback = false`.
+- A tela de notas e o CSV mostram a nota final, a coluna "Efeitos" e a nota antes dos efeitos.

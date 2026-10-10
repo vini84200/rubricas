@@ -15,7 +15,10 @@ const seguirPasso = (a) => a.avancar('direita');
 const marcarRapido = (positivo, dir) => (a) => a.marcar(marcacaoRapida(a.item.criterio, positivo), dir);
 
 const MODOS = {
-  resumo: { z: (a) => a.desfazer(), Enter: (a) => a.seguir(), ArrowDown: voltar, Backspace: voltar },
+  resumo: {
+    z: (a) => a.desfazer(), Enter: (a) => a.seguir(), ArrowDown: voltar, Backspace: voltar,
+    g: (a) => (a.sugestaoEfeito ? a.sugestaoEfeito() : false),
+  },
   roteiro: {
     ArrowRight: seguirPasso, d: seguirPasso, Enter: seguirPasso, ' ': seguirPasso, s: seguirPasso,
     ArrowLeft: (a) => a.avancar('esquerda'), a: (a) => a.avancar('esquerda'),

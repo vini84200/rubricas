@@ -1,5 +1,6 @@
 //! Tipos do domínio: rubricas, turmas, avaliações, correções e o cálculo da nota.
 
+use crate::efeitos::{self, Dispensa, EfeitoAplicado, TipoEfeito};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,6 +16,9 @@ fn vazio(s: &String) -> bool {
 }
 fn e_um(v: &f64) -> bool {
     *v == 1.0
+}
+fn zero(v: &u32) -> bool {
+    *v == 0
 }
 
 // ---------- Rubrica: o que o usuário constrói ----------
@@ -115,6 +119,15 @@ pub struct Avaliacao {
     #[serde(default = "dez")]
     pub nota_maxima: f64,
     pub rubricas: Vec<RubricaAplicada>,
+    /// Cópia congelada dos tipos de efeito escolhidos, com o id do catálogo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efeitos: Vec<TipoEfeito>,
+    /// `"AAAA-MM-DDTHH:MM"`, no relógio do Moodle: o que conta como atraso.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prazo: Option<String>,
+    /// Minutos depois do prazo que ainda não contam como atraso.
+    #[serde(default, skip_serializing_if = "zero")]
+    pub tolerancia: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +149,12 @@ pub struct Correcao {
     pub respostas: BTreeMap<String, BTreeMap<String, Resposta>>,
     #[serde(default, skip_serializing_if = "vazio")]
     pub comentario_geral: String,
+    /// id do tipo de efeito → como foi aplicado
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub efeitos: BTreeMap<String, EfeitoAplicado>,
+    /// id do tipo de efeito → sugestão dispensada
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dispensadas: BTreeMap<String, Dispensa>,
     #[serde(default, skip_serializing_if = "vazio")]
     pub avaliador: String,
     #[serde(default)]
@@ -454,7 +473,23 @@ impl Avaliacao {
         if self.rubricas.iter().map(|r| r.peso).sum::<f64>() <= 0.0 {
             return Err("Pelo menos uma rubrica precisa ter peso maior que zero".into());
         }
+        let mut ids = HashSet::new();
+        for t in &self.efeitos {
+            if !ids.insert(&t.id) {
+                return Err(format!("O efeito “{}” aparece duas vezes", t.titulo));
+            }
+            t.validar().map_err(|e| format!("Efeito “{}”: {e}", t.titulo))?;
+        }
+        if let Some(p) = &self.prazo
+            && efeitos::minutos(p).is_none()
+        {
+            return Err(format!("Prazo inválido: {p:?}. Use AAAA-MM-DDTHH:MM"));
+        }
         Ok(())
+    }
+
+    pub fn efeito(&self, id: &str) -> Option<&TipoEfeito> {
+        self.efeitos.iter().find(|t| t.id == id)
     }
 
     pub fn rubrica(&self, origem: &str) -> Option<&RubricaAplicada> {
@@ -476,7 +511,14 @@ pub struct Parcial {
 pub struct Resultado {
     /// Uma entrada por rubrica, na ordem da avaliação; já com os pesos dos critérios.
     pub rubricas: Vec<Parcial>,
+    /// Com os efeitos.
     pub nota: f64,
+    /// Só das rubricas, antes dos efeitos.
+    pub antes: f64,
+    /// Ids dos efeitos que entraram na conta.
+    pub efeitos: Vec<String>,
+    /// Um efeito aplicado encerra a correção, mesmo sem todos os critérios marcados.
+    pub encerrada: bool,
     pub respondidos: usize,
     pub total: usize,
 }
@@ -492,7 +534,7 @@ pub enum Andamento {
 
 impl Resultado {
     pub fn andamento(&self) -> Andamento {
-        if self.total > 0 && self.respondidos == self.total {
+        if self.encerrada || (self.total > 0 && self.respondidos == self.total) {
             Andamento::Concluida
         } else if self.respondidos > 0 {
             Andamento::Parcial
@@ -506,9 +548,9 @@ impl Resultado {
     }
 }
 
-/// nota = nota_maxima × Σ peso_r × (pontos_r ÷ máximo_r) ÷ Σ peso_r.
-/// Critério sem resposta conta zero. Marcações que não combinam com a escala
-/// (sobras de uma rubrica atualizada) são ignoradas.
+/// nota = nota_maxima × Σ peso_r × (pontos_r ÷ máximo_r) ÷ Σ peso_r, e depois os
+/// efeitos (`efeitos::aplicar`). Critério sem resposta conta zero. Marcações que
+/// não combinam com a escala (sobras de uma rubrica atualizada) são ignoradas.
 pub fn calcular(av: &Avaliacao, correcao: Option<&Correcao>) -> Resultado {
     let mut rubricas = Vec::new();
     let (mut respondidos, mut total) = (0, 0);
@@ -531,8 +573,10 @@ pub fn calcular(av: &Avaliacao, correcao: Option<&Correcao>) -> Resultado {
         }
         rubricas.push(Parcial { pontos, maximo });
     }
-    let nota = if soma_pesos > 0.0 { av.nota_maxima * soma / soma_pesos } else { 0.0 };
-    Resultado { rubricas, nota, respondidos, total }
+    let antes = if soma_pesos > 0.0 { av.nota_maxima * soma / soma_pesos } else { 0.0 };
+    let sem_efeitos = BTreeMap::new();
+    let e = efeitos::aplicar(&av.efeitos, correcao.map_or(&sem_efeitos, |c| &c.efeitos), antes, av.nota_maxima);
+    Resultado { rubricas, nota: e.nota, antes, efeitos: e.ids, encerrada: e.encerrada, respondidos, total }
 }
 
 // ---------- Lista de alunos em CSV ----------
@@ -691,6 +735,9 @@ mod testes {
             turma: "d".into(),
             nota_maxima: 10.0,
             rubricas: vec![RubricaAplicada { origem: "codigo".into(), peso: 1.0, rubrica: rubrica() }],
+            efeitos: vec![],
+            prazo: None,
+            tolerancia: 0,
         }
     }
 
@@ -773,6 +820,9 @@ mod testes {
             turma: "d".into(),
             nota_maxima: 10.0,
             rubricas: vec![RubricaAplicada { origem: "p".into(), peso: 1.0, rubrica: r }],
+            efeitos: vec![],
+            prazo: None,
+            tolerancia: 0,
         };
         assert_eq!(av.total_criterios(), 1);
         let mut c = Correcao::default();

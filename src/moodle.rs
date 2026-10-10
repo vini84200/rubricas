@@ -25,6 +25,87 @@ pub struct Preenchida {
     pub convertida_para: Option<f64>,
 }
 
+/// As linhas da planilha (a primeira é o cabeçalho) e o cabeçalho em `slug`.
+struct Planilha {
+    linhas: Vec<Vec<String>>,
+    cab: Vec<String>,
+    col_nome: usize,
+}
+
+impl Planilha {
+    fn ler(texto: &str) -> Result<Planilha, String> {
+        let texto = texto.trim_start_matches('\u{feff}');
+        let mut leitor = csv::ReaderBuilder::new().delimiter(separador(texto)).has_headers(false).flexible(true).from_reader(texto.as_bytes());
+        let mut linhas: Vec<Vec<String>> = Vec::new();
+        for reg in leitor.records() {
+            let reg = reg.map_err(|e| format!("Não foi possível ler a planilha: {e}"))?;
+            linhas.push(reg.iter().map(String::from).collect());
+        }
+        let cab: Vec<String> = linhas.first().map(|l| l.iter().map(|c| slug(c)).collect()).unwrap_or_default();
+        let col_nome = cab.iter().position(|c| c == "nome-completo" || c == "full-name");
+        let col_nome = col_nome.ok_or("Isto não parece a planilha de notas do Moodle: falta a coluna “Nome completo”")?;
+        Ok(Planilha { linhas, cab, col_nome })
+    }
+
+    fn coluna(&self, nomes: &[&str]) -> Option<usize> {
+        self.cab.iter().position(|c| nomes.contains(&c.as_str()))
+    }
+
+    /// Quem é o aluno de uma linha: pelo número de identificação, se a planilha o
+    /// traz, ou pelo nome (com as associações feitas no ZIP).
+    fn dono<'a>(&self, turma: &'a Turma, apelidos: &'a BTreeMap<String, String>) -> impl Fn(&[String]) -> Option<String> + 'a {
+        let col_matricula = self.coluna(&["numero-de-identificacao", "id-number", "matricula"]);
+        let col_nome = self.col_nome;
+        let pelo_nome = dono_pelo_nome(turma, apelidos);
+        move |l: &[String]| {
+            if let Some(id) = col_matricula.and_then(|i| l.get(i)).map(|v| v.trim()).filter(|id| turma.alunos.iter().any(|a| a.id == *id)) {
+                return Some(id.to_string());
+            }
+            pelo_nome(l.get(col_nome)?)
+        }
+    }
+}
+
+/// Datas de envio lidas da planilha de notas.
+#[derive(Debug, Default, Serialize)]
+pub struct Envios {
+    /// aluno → `"AAAA-MM-DDTHH:MM"`, ou `None` para quem está na planilha sem envio.
+    #[serde(skip)]
+    pub datas: BTreeMap<String, Option<String>>,
+    pub com_data: usize,
+    /// Nomes (do Moodle) com uma data que não deu para ler.
+    pub ilegiveis: Vec<String>,
+    /// Nomes (do Moodle) que não casaram com ninguém da turma.
+    pub sem_aluno: Vec<String>,
+}
+
+/// A coluna "Última modificação (envio)" da planilha de notas, por aluno.
+pub fn datas_de_envio(texto: &str, turma: &Turma, apelidos: &BTreeMap<String, String>) -> Result<Envios, String> {
+    let p = Planilha::ler(texto)?;
+    let col = p.coluna(&["ultima-modificacao-envio", "last-modified-submission"]);
+    let col = col.ok_or("A planilha não tem a coluna “Última modificação (envio)”")?;
+    let dono = p.dono(turma, apelidos);
+    let mut r = Envios::default();
+    for l in p.linhas.iter().skip(1) {
+        let nome = l.get(p.col_nome).cloned().unwrap_or_default();
+        let Some(aluno) = dono(l) else {
+            if !nome.trim().is_empty() {
+                r.sem_aluno.push(nome);
+            }
+            continue;
+        };
+        let bruto = l.get(col).map(|v| v.trim()).unwrap_or("");
+        let data = if bruto.is_empty() || bruto == "-" { None } else { crate::efeitos::ler_data_moodle(bruto) };
+        if data.is_none() && !(bruto.is_empty() || bruto == "-") {
+            r.ilegiveis.push(nome);
+            continue;
+        }
+        r.com_data += usize::from(data.is_some());
+        r.datas.insert(aluno, data);
+    }
+    Ok(r)
+}
+
 /// `apelidos`: nome no Moodle (em `slug`) → aluno, das associações feitas à mão no ZIP.
 pub fn preencher_planilha(
     texto: &str,
@@ -34,21 +115,14 @@ pub fn preencher_planilha(
     apelidos: &BTreeMap<String, String>,
 ) -> Result<Preenchida, String> {
     let bom = texto.starts_with('\u{feff}');
-    let texto = texto.trim_start_matches('\u{feff}');
-    let sep = separador(texto);
-    let mut leitor = csv::ReaderBuilder::new().delimiter(sep).has_headers(false).flexible(true).from_reader(texto.as_bytes());
-    let mut linhas: Vec<Vec<String>> = Vec::new();
-    for reg in leitor.records() {
-        let reg = reg.map_err(|e| format!("Não foi possível ler a planilha: {e}"))?;
-        linhas.push(reg.iter().map(String::from).collect());
-    }
-    let cab: Vec<String> = linhas.first().map(|l| l.iter().map(|c| slug(c)).collect()).unwrap_or_default();
-    let coluna = |nomes: &[&str]| cab.iter().position(|c| nomes.contains(&c.as_str()));
-    let col_nome = coluna(&["nome-completo", "full-name"]);
-    let col_nota = coluna(&["nota", "grade"]);
-    let (Some(col_nome), Some(col_nota)) = (col_nome, col_nota) else {
-        return Err("Isto não parece a planilha de notas do Moodle: faltam as colunas “Nome completo” e “Nota”".into());
+    let planilha = Planilha::ler(texto)?;
+    let (cab, col_nome) = (&planilha.cab, planilha.col_nome);
+    let coluna = |nomes: &[&str]| planilha.coluna(nomes);
+    let Some(col_nota) = coluna(&["nota", "grade"]) else {
+        return Err("Isto não parece a planilha de notas do Moodle: falta a coluna “Nota”".into());
     };
+    let dono = planilha.dono(turma, apelidos);
+    let mut linhas = planilha.linhas.clone();
 
     let col_maxima = coluna(&["nota-maxima", "maximum-grade"]);
     // O Moodle lê a nota com o separador decimal do idioma dele (com o ponto, "3,5"
@@ -61,14 +135,6 @@ pub fn preencher_planilha(
 
     let col_alteravel = cab.iter().position(|c| c.contains("pode-ser-alterada") || c.contains("can-be-changed"));
     let col_comentarios = coluna(&["comentarios-de-feedback", "feedback-comments"]);
-    let col_matricula = coluna(&["numero-de-identificacao", "id-number", "matricula"]);
-    let pelo_nome = dono_pelo_nome(turma, apelidos);
-    let dono = |l: &[String]| -> Option<String> {
-        if let Some(id) = col_matricula.and_then(|i| l.get(i)).map(|v| v.trim()).filter(|id| turma.alunos.iter().any(|a| a.id == *id)) {
-            return Some(id.to_string());
-        }
-        pelo_nome(l.get(col_nome)?)
-    };
     let mut p = Preenchida::default();
     let mut na_planilha = Vec::new();
     for l in linhas.iter_mut().skip(1) {
@@ -129,8 +195,8 @@ pub fn preencher_planilha(
     Ok(p)
 }
 
-/// Os comentários de cada critério e o geral, um parágrafo cada: o Moodle guarda
-/// o feedback em HTML.
+/// Os comentários de cada critério, os efeitos aplicados (os que vão ao aluno) e o
+/// geral, um parágrafo cada: o Moodle guarda o feedback em HTML.
 fn comentarios(av: &Avaliacao, correcao: &Correcao) -> String {
     let mut partes = Vec::new();
     for ra in &av.rubricas {
@@ -139,6 +205,11 @@ fn comentarios(av: &Avaliacao, correcao: &Correcao) -> String {
             if let Some(x) = respostas.and_then(|m| m.get(&c.id)).filter(|x| !x.comentario.trim().is_empty()) {
                 partes.push(format!("{}: {}", c.nome, x.comentario.trim()));
             }
+        }
+    }
+    for t in av.efeitos.iter().filter(|t| t.feedback) {
+        if let Some(a) = correcao.efeitos.get(&t.id).filter(|a| t.conferir(a).is_ok()) {
+            partes.push(t.texto(a));
         }
     }
     if !correcao.comentario_geral.trim().is_empty() {
@@ -181,6 +252,9 @@ mod testes {
             turma: "t".into(),
             nota_maxima: 10.0,
             rubricas: vec![RubricaAplicada { origem: "l3".into(), peso: 1.0, rubrica: r }],
+            efeitos: vec![],
+            prazo: None,
+            tolerancia: 0,
         }
     }
 
@@ -301,6 +375,47 @@ mod testes {
         assert_eq!(linha(&p.csv, "Bruno Lima")[4], "9,00");
         assert_eq!(p.bloqueadas, ["Bruno Lima"]);
         assert_eq!(p.preenchidas, 1);
+    }
+
+    #[test]
+    fn efeitos_entram_na_nota_e_no_feedback_e_encerrar_dispensa_os_criterios() {
+        let mut av = avaliacao();
+        let tipo = |id: &str, t: &str| crate::efeitos::TipoEfeito { id: id.into(), ..toml::from_str(t).unwrap() };
+        av.efeitos = vec![
+            tipo("atraso", "titulo = \"Atraso\"\noperacao = { tipo = \"por_unidade\", pontos = -1.0 }"),
+            tipo("plagio", "titulo = \"Plágio\"\nencerra = true\nfeedback = false\noperacao = { tipo = \"fixar\", nota = 0 }"),
+        ];
+        let mut cs = correcoes();
+        let aplicado = |q| crate::efeitos::EfeitoAplicado { quantidade: q, ..Default::default() };
+        cs.get_mut("00123").unwrap().efeitos.insert("atraso".into(), aplicado(Some(2.0)));
+        // Carla não terminou a correção, mas o zero por plágio encerra
+        cs.get_mut("00789").unwrap().efeitos.insert("plagio".into(), aplicado(None));
+        let planilha = format!(
+            "{CABECALHO}\n\
+             \"Participante 101\",\"Ana Souza\",a@x,,,\"10,00\",Sim,,-,\n\
+             \"Participante 103\",\"Carla Dias\",c@x,,,\"10,00\",Sim,,-,\n"
+        );
+        let p = preencher_planilha(&planilha, &av, &turma(), &cs, &BTreeMap::new()).unwrap();
+        assert_eq!(linha(&p.csv, "Ana Souza")[4], "8");
+        assert_eq!(linha(&p.csv, "Ana Souza")[9], "<p>Atraso (2 dias): −2</p>");
+        assert_eq!(linha(&p.csv, "Carla Dias")[4], "0");
+        assert_eq!(linha(&p.csv, "Carla Dias")[9], "", "o plágio não vai ao feedback");
+        assert!(p.incompletas.is_empty());
+    }
+
+    #[test]
+    fn datas_de_envio_da_planilha() {
+        let planilha = format!(
+            "{CABECALHO}\n\
+             \"Participante 101\",\"Ana Souza\",a@x,,,\"10,00\",Sim,\"segunda, 6 out 2026, 10:00\",-,\n\
+             \"Participante 102\",\"Bruno Lima\",b@x,,,\"10,00\",Sim,-,-,\n\
+             \"Participante 103\",\"Carla Dias\",c@x,,,\"10,00\",Sim,ontem,-,\n\
+             \"Participante 105\",\"Zé Ninguém\",z@x,,,\"10,00\",Sim,-,-,\n"
+        );
+        let r = datas_de_envio(&planilha, &turma(), &BTreeMap::new()).unwrap();
+        assert_eq!(r.datas, BTreeMap::from([("00123".into(), Some("2026-10-06T10:00".into())), ("00456".into(), None)]));
+        assert_eq!((r.com_data, r.ilegiveis.as_slice(), r.sem_aluno.as_slice()), (1, &["Carla Dias".to_string()][..], &["Zé Ninguém".to_string()][..]));
+        assert!(datas_de_envio("Identificador,\"Nome completo\",Nota\n", &turma(), &BTreeMap::new()).unwrap_err().contains("envio"));
     }
 
     #[test]

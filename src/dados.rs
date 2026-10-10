@@ -6,10 +6,12 @@
 //!   turmas/<id>.csv                 matricula,nome
 //!   avaliacoes/<id>.json            título, turma e cópia das rubricas usadas
 //!   correcoes/<avaliacao>/<aluno>.json
+//!   efeitos/<id>.toml               tipos de efeito sobre a nota (zero por plágio, atraso…)
 //!   arquivadas.toml                 ids de rubricas, turmas e avaliações fora das listas
 //!   usuarios.toml                   criado por `rubricas usuario <nome>`
 //! ```
 
+use crate::efeitos::{Dispensa, EfeitoAplicado, TipoEfeito};
 use crate::modelo::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -118,6 +120,24 @@ pub struct Recusada {
     pub rubrica: String,
     pub criterio: String,
     pub motivo: String,
+}
+
+/// O que mudar nos efeitos de uma correção: `None` tira o efeito ou a dispensa.
+#[derive(Debug, Default)]
+pub struct AlteracaoEfeitos {
+    pub efeitos: Vec<(String, Option<EfeitoAplicado>)>,
+    pub dispensadas: Vec<(String, Option<Dispensa>)>,
+}
+
+/// Os efeitos que uma avaliação usa, ao criá-la ou alterá-la.
+#[derive(Debug, Default)]
+pub struct EscolhaEfeitos {
+    /// Ids no catálogo (`efeitos/<id>.toml`).
+    pub ids: Vec<String>,
+    pub prazo: Option<String>,
+    pub tolerancia: u32,
+    /// Ids cuja cópia deve ser refeita a partir do catálogo.
+    pub atualizar: Vec<String>,
 }
 
 /// Os itens que se criam, compartilham, arquivam e apagam. Cada um é um
@@ -502,6 +522,7 @@ impl Dados {
 
     /// Cria ou atualiza. Cada rubrica é copiada da pasta na primeira vez; depois a
     /// cópia só é refeita se `atualizar` contiver sua origem.
+    #[allow(clippy::too_many_arguments)] // um parâmetro por campo do formulário
     pub fn salvar_avaliacao(
         &self,
         id: Option<&str>,
@@ -510,6 +531,7 @@ impl Dados {
         nota_maxima: f64,
         rubricas: Vec<(String, f64)>,
         atualizar: &[String],
+        efeitos: &EscolhaEfeitos,
     ) -> Res<Avaliacao> {
         // Tudo sob a trava: a turma e as rubricas lidas não somem antes de gravar.
         let _g = self.travar();
@@ -536,7 +558,26 @@ impl Dados {
             };
             aplicadas.push(RubricaAplicada { origem, peso, rubrica });
         }
-        let mut a = Avaliacao { id: String::new(), titulo, turma, nota_maxima, rubricas: aplicadas };
+        let mut tipos = Vec::new();
+        for id in &efeitos.ids {
+            let copia = anterior.as_ref().filter(|_| !efeitos.atualizar.contains(id)).and_then(|a| a.efeito(id)).cloned();
+            let tipo = match copia {
+                Some(t) => t,
+                None => self.ler_efeito(id).map_err(citado)?,
+            };
+            tipos.push(tipo);
+        }
+        let prazo = efeitos.prazo.clone().filter(|p| !p.trim().is_empty());
+        let mut a = Avaliacao {
+            id: String::new(),
+            titulo,
+            turma,
+            nota_maxima,
+            rubricas: aplicadas,
+            efeitos: tipos,
+            prazo,
+            tolerancia: efeitos.tolerancia,
+        };
         a.validar().map_err(Erro::Invalido)?;
 
         let id = match id {
@@ -557,6 +598,70 @@ impl Dados {
             .filter(|ra| matches!(self.ler_rubrica(&ra.origem), Ok(atual) if atual != ra.rubrica))
             .map(|ra| ra.origem.clone())
             .collect()
+    }
+
+    /// Ids dos tipos de efeito cujo arquivo no catálogo difere da cópia da avaliação.
+    pub fn efeitos_desatualizados(&self, a: &Avaliacao) -> Vec<String> {
+        a.efeitos.iter().filter(|t| matches!(self.ler_efeito(&t.id), Ok(atual) if atual != **t)).map(|t| t.id.clone()).collect()
+    }
+
+    // ----- tipos de efeito -----
+
+    fn caminho_efeito(&self, id: &str) -> Res<PathBuf> {
+        checar_id(id)?;
+        Ok(self.raiz.join("efeitos").join(format!("{id}.toml")))
+    }
+
+    pub fn ler_efeito(&self, id: &str) -> Res<TipoEfeito> {
+        let texto = ler_opcional(&self.caminho_efeito(id)?)?
+            .ok_or_else(|| Erro::NaoEncontrado(format!("Tipo de efeito “{id}” não existe")))?;
+        let mut t: TipoEfeito = toml::from_str(&texto).map_err(|e| Erro::Invalido(format!("efeitos/{id}.toml: {}", erro_toml(&texto, &e))))?;
+        t.id = id.to_string();
+        t.validar().map_err(|e| Erro::Invalido(format!("efeitos/{id}.toml: {e}")))?;
+        Ok(t)
+    }
+
+    /// Tipos legíveis e, à parte, os arquivos com problema.
+    pub fn listar_efeitos(&self) -> Res<(Vec<TipoEfeito>, Vec<String>)> {
+        let (mut bons, mut problemas) = (Vec::new(), Vec::new());
+        for id in self.ids(&self.raiz.join("efeitos"), "toml")? {
+            match self.ler_efeito(&id) {
+                Ok(t) => bons.push(t),
+                Err(Erro::Invalido(m)) => problemas.push(m),
+                Err(Erro::Io(e)) => problemas.push(format!("efeitos/{id}.toml: {e}")),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((bons, problemas))
+    }
+
+    /// O arquivo como está no disco.
+    pub fn efeito_toml(&self, id: &str) -> Res<String> {
+        let mut t = self.ler_efeito(id)?;
+        t.id.clear();
+        toml::to_string_pretty(&t).map_err(|e| Erro::Invalido(e.to_string()))
+    }
+
+    /// Valida e grava (ou cria) o tipo a partir do TOML inteiro.
+    pub fn salvar_efeito_toml(&self, id: &str, texto: &str) -> Res<TipoEfeito> {
+        let caminho = self.caminho_efeito(id)?;
+        let mut t: TipoEfeito = toml::from_str(texto).map_err(|e| Erro::Invalido(erro_toml(texto, &e)))?;
+        t.id.clear();
+        t.validar().map_err(Erro::Invalido)?;
+        let _g = self.travar();
+        let texto = toml::to_string_pretty(&t).map_err(|e| Erro::Invalido(e.to_string()))?;
+        gravar(&caminho, texto.as_bytes())?;
+        t.id = id.to_string();
+        Ok(t)
+    }
+
+    /// Apaga do catálogo. As avaliações que o usam continuam com a cópia delas.
+    pub fn apagar_efeito(&self, id: &str) -> Res<()> {
+        let _g = self.travar();
+        match fs::remove_file(self.caminho_efeito(id)?) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("Tipo de efeito “{id}” não existe"))),
+            outro => Ok(outro?),
+        }
     }
 
     // ----- correções -----
@@ -595,12 +700,14 @@ impl Dados {
     /// gravado, de modo que dois avaliadores no mesmo aluno não se sobrescrevem.
     /// Marcações que não cabem na rubrica são devolvidas como recusadas; as demais
     /// são gravadas mesmo assim.
+    #[allow(clippy::too_many_arguments)] // um parâmetro por parte do pedido
     pub fn alterar_correcao(
         &self,
         avaliacao: &str,
         aluno: &str,
         respostas: Vec<(String, String, Option<Resposta>)>,
         comentario_geral: Option<String>,
+        efeitos: AlteracaoEfeitos,
         avaliador: &str,
         agora: u64,
     ) -> Res<(Correcao, Vec<Recusada>)> {
@@ -621,11 +728,43 @@ impl Dados {
                 None => aceitas.push((origem, criterio, resposta)),
             }
         }
+        // Efeitos recusados vêm com `rubrica` vazia e o id do tipo em `criterio`.
+        let mut recusar = |id: &str, motivo: String| recusadas.push(Recusada { rubrica: String::new(), criterio: id.to_string(), motivo });
+        let mut efeitos_aceitos = Vec::new();
+        for (id, aplicado) in efeitos.efeitos {
+            match (av.efeito(&id), aplicado) {
+                (None, _) => recusar(&id, format!("o efeito “{id}” não existe mais nesta avaliação")),
+                (Some(t), Some(a)) => match t.conferir(&a) {
+                    Ok(()) => efeitos_aceitos.push((id, Some(EfeitoAplicado { por: avaliador.to_string(), em: agora, ..a }))),
+                    Err(m) => recusar(&id, m),
+                },
+                (Some(_), None) => efeitos_aceitos.push((id, None)),
+            }
+        }
+        let mut dispensas_aceitas = Vec::new();
+        for (id, d) in efeitos.dispensadas {
+            match av.efeito(&id) {
+                None => recusar(&id, format!("o efeito “{id}” não existe mais nesta avaliação")),
+                Some(_) => dispensas_aceitas.push((id, d.map(|d| Dispensa { por: avaliador.to_string(), em: agora, ..d }))),
+            }
+        }
 
         let _g = self.travar();
         let mut c = self.ler_correcao(avaliacao, aluno)?.unwrap_or_default();
-        if aceitas.is_empty() && comentario_geral.is_none() {
+        if aceitas.is_empty() && comentario_geral.is_none() && efeitos_aceitos.is_empty() && dispensas_aceitas.is_empty() {
             return Ok((c, recusadas));
+        }
+        for (id, a) in efeitos_aceitos {
+            match a {
+                Some(a) => c.efeitos.insert(id, a),
+                None => c.efeitos.remove(&id),
+            };
+        }
+        for (id, d) in dispensas_aceitas {
+            match d {
+                Some(d) => c.dispensadas.insert(id, d),
+                None => c.dispensadas.remove(&id),
+            };
         }
         for (origem, criterio, resposta) in aceitas {
             match resposta {
@@ -713,12 +852,77 @@ pontos = 1.0
     }
 
     #[test]
+    fn efeitos_do_catalogo_na_avaliacao_e_na_correcao() {
+        let raiz = pasta("efeitos");
+        let d = Dados::abrir(&raiz).unwrap();
+        fs::write(raiz.join("rubricas/codigo.toml"), RUBRICA).unwrap();
+        d.criar_turma("Turma D", "1,Ana\n2,Bruno\n").unwrap();
+        let atraso = "titulo = \"Atraso\"\nsugerir = \"atraso\"\noperacao = { tipo = \"por_unidade\", pontos = -1.0 }\n";
+        d.salvar_efeito_toml("atraso", atraso).unwrap();
+        d.salvar_efeito_toml("plagio", "titulo = \"Plágio\"\nencerra = true\noperacao = { tipo = \"fixar\", nota = 0 }\n").unwrap();
+        let Err(Erro::Invalido(m)) = d.salvar_efeito_toml("ruim", "titulo = \"x\"\noperacao = { tipo = \"girar\" }\n") else { panic!() };
+        assert!(m.contains("linha 2"), "{m}");
+        let volta: TipoEfeito = toml::from_str(&d.efeito_toml("atraso").unwrap()).unwrap();
+        assert_eq!(TipoEfeito { id: "atraso".into(), ..volta }, d.ler_efeito("atraso").unwrap());
+        let (tipos, problemas) = d.listar_efeitos().unwrap();
+        assert_eq!((tipos.len(), problemas.len()), (2, 0));
+
+        let escolha = EscolhaEfeitos { ids: vec!["atraso".into(), "plagio".into()], prazo: Some("2026-10-06T23:59".into()), tolerancia: 10, atualizar: vec![] };
+        let av = d.salvar_avaliacao(None, "EP".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &escolha).unwrap();
+        assert_eq!(av.efeitos.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["atraso", "plagio"]);
+        assert_eq!((av.prazo.as_deref(), av.tolerancia), (Some("2026-10-06T23:59"), 10));
+        let ruim = EscolhaEfeitos { prazo: Some("amanhã".into()), ..Default::default() };
+        assert!(matches!(d.salvar_avaliacao(Some("ep"), "EP".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &ruim), Err(Erro::Invalido(_))));
+
+        // mudar o tipo no catálogo não muda a cópia; atualizar a pedido, sim
+        d.salvar_efeito_toml("atraso", &atraso.replace("-1.0", "-2.0")).unwrap();
+        assert_eq!(d.efeitos_desatualizados(&d.ler_avaliacao("ep").unwrap()), ["atraso"]);
+        let marca = Some(Resposta { marcacao: Marcacao::Binaria { atende: true }, comentario: String::new() });
+        let um_dia = EfeitoAplicado { quantidade: Some(1.0), ..Default::default() };
+        let efeitos = AlteracaoEfeitos {
+            efeitos: vec![("atraso".into(), Some(um_dia.clone())), ("sumiu".into(), Some(um_dia.clone())), ("plagio".into(), None)],
+            dispensadas: vec![("plagio".into(), Some(Dispensa { sinal: 0.8, ..Default::default() }))],
+        };
+        let (c, recusadas) = d.alterar_correcao("ep", "1", vec![("codigo".into(), "compila".into(), marca)], None, efeitos, "vini", 5).unwrap();
+        assert_eq!(recusadas.iter().map(|r| r.criterio.as_str()).collect::<Vec<_>>(), ["sumiu"]);
+        assert_eq!((c.efeitos["atraso"].por.as_str(), c.efeitos["atraso"].em), ("vini", 5));
+        assert_eq!((c.dispensadas["plagio"].sinal, c.dispensadas["plagio"].por.as_str()), (0.8, "vini"));
+        let av = d.ler_avaliacao("ep").unwrap();
+        // 1 de 2 pontos = 5, menos 1 dia de atraso com o desconto da cópia (−1)
+        assert_eq!(calcular(&av, Some(&c)).nota, 4.0);
+        let av = d
+            .salvar_avaliacao(Some("ep"), "EP".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &EscolhaEfeitos { atualizar: vec!["atraso".into()], ..escolha })
+            .unwrap();
+        assert_eq!(calcular(&av, Some(&c)).nota, 3.0);
+
+        // um efeito que não combina com o tipo é recusado; o de encerrar conclui sem marcar nada
+        let sem_quantidade = AlteracaoEfeitos { efeitos: vec![("atraso".into(), Some(EfeitoAplicado::default()))], ..Default::default() };
+        let (_, recusadas) = d.alterar_correcao("ep", "2", vec![], None, sem_quantidade, "vini", 6).unwrap();
+        assert!(recusadas[0].motivo.contains("quantidade"), "{recusadas:?}");
+        let zero = AlteracaoEfeitos { efeitos: vec![("plagio".into(), Some(EfeitoAplicado::default()))], ..Default::default() };
+        let (c, _) = d.alterar_correcao("ep", "2", vec![], None, zero, "vini", 7).unwrap();
+        let r = calcular(&av, Some(&c));
+        assert_eq!((r.nota, r.respondidos, r.concluida()), (0.0, 0, true));
+        // tirar o efeito
+        let tirar = AlteracaoEfeitos { efeitos: vec![("plagio".into(), None)], ..Default::default() };
+        let (c, _) = d.alterar_correcao("ep", "2", vec![], None, tirar, "vini", 8).unwrap();
+        assert!(c.efeitos.is_empty());
+
+        // o catálogo perde o tipo, a avaliação continua com a cópia
+        d.apagar_efeito("plagio").unwrap();
+        assert!(d.ler_avaliacao("ep").unwrap().efeito("plagio").is_some());
+        assert!(matches!(d.apagar_efeito("plagio"), Err(Erro::NaoEncontrado(_))));
+        assert!(matches!(d.ler_efeito("../usuarios"), Err(Erro::Invalido(_))));
+        fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
     fn arquivar_e_desarquivar() {
         let raiz = pasta("arquivar");
         let d = Dados::abrir(&raiz).unwrap();
         fs::write(raiz.join("rubricas/codigo.toml"), RUBRICA).unwrap();
         d.criar_turma("Turma D", "1,Ana\n").unwrap();
-        d.salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
+        d.salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &Default::default()).unwrap();
 
         d.arquivar(Tipo::Rubricas, "codigo", true).unwrap();
         d.arquivar(Tipo::Turmas, "Turma D", true).unwrap();
@@ -790,7 +994,7 @@ pontos = 1.0
         assert_eq!(fs::read_to_string(raiz.join("turmas/Turma D.csv")).unwrap(), "matricula,nome\n1,Ana\n2,Bruno\n");
 
         let av = d
-            .salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[])
+            .salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &Default::default())
             .unwrap();
         assert_eq!(av.id, "tf");
         assert!(matches!(d.apagar(Tipo::Turmas, "Turma D"), Err(Erro::Conflito(_))));
@@ -810,6 +1014,7 @@ pontos = 1.0
                 "1",
                 vec![("codigo".into(), "compila".into(), marca(Marcacao::Binaria { atende: true }))],
                 None,
+                Default::default(),
                 "vini",
                 1,
             )
@@ -823,6 +1028,7 @@ pontos = 1.0
                 "1",
                 vec![("codigo".into(), "clareza".into(), marca(Marcacao::Nivel { nivel: "boa".into() }))],
                 Some("Bom trabalho".into()),
+                Default::default(),
                 "gustavo",
                 2,
             )
@@ -830,7 +1036,7 @@ pontos = 1.0
         assert_eq!(c.respostas["codigo"].len(), 2);
         assert_eq!(calcular(&av, Some(&c)).nota, 10.0);
         // apagar uma marcação
-        let (c, _) = d.alterar_correcao("tf", "1", vec![("codigo".into(), "compila".into(), None)], None, "vini", 3).unwrap();
+        let (c, _) = d.alterar_correcao("tf", "1", vec![("codigo".into(), "compila".into(), None)], None, Default::default(), "vini", 3).unwrap();
         assert_eq!(c.respostas["codigo"].len(), 1);
         assert_eq!(c.comentario_geral, "Bom trabalho");
 
@@ -845,6 +1051,7 @@ pontos = 1.0
                     ("codigo".into(), "clareza".into(), marca(Marcacao::Nivel { nivel: "ruim".into() })),
                 ],
                 None,
+                Default::default(),
                 "vini",
                 4,
             )
@@ -852,12 +1059,12 @@ pontos = 1.0
         assert_eq!(recusadas.iter().map(|r| r.criterio.as_str()).collect::<Vec<_>>(), ["compila", "sumiu"]);
         assert_eq!(c.respostas["codigo"]["clareza"].marcacao, Marcacao::Nivel { nivel: "ruim".into() });
         assert_eq!(d.ler_correcao("tf", "1").unwrap().unwrap(), c);
-        assert!(matches!(d.alterar_correcao("tf", "99", vec![], None, "vini", 4), Err(Erro::NaoEncontrado(_))));
+        assert!(matches!(d.alterar_correcao("tf", "99", vec![], None, Default::default(), "vini", 4), Err(Erro::NaoEncontrado(_))));
         assert!(matches!(d.ler_rubrica("../usuarios"), Err(Erro::Invalido(_))));
 
         // atualizar a cópia a pedido
         let av = d
-            .salvar_avaliacao(Some("tf"), "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &["codigo".into()])
+            .salvar_avaliacao(Some("tf"), "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &["codigo".into()], &Default::default())
             .unwrap();
         assert_eq!(av.rubricas[0].rubrica.criterios.len(), 1);
         assert!(d.rubricas_desatualizadas(&av).is_empty());

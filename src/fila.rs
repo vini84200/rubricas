@@ -443,7 +443,7 @@ saida = "1"
             "titulo = \"Código\"\n[[criterios]]\nnome = \"Funciona\"\nescala = { tipo = \"livre\", max = 2.0 }\n",
         )
         .unwrap();
-        d.salvar_avaliacao(Some("ead"), "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &["codigo".into()]).unwrap();
+        d.salvar_avaliacao(Some("ead"), "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &["codigo".into()], &Default::default()).unwrap();
         assert_eq!(atual(&d, "1"), Some(true));
         assert_eq!(d.panorama("ead").unwrap().sugestoes("1")[0].marcacao, crate::modelo::Marcacao::Nota { nota: 2.0 });
 

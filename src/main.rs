@@ -3,6 +3,7 @@ mod auth;
 mod conferir;
 mod contas;
 mod dados;
+mod efeitos;
 mod ead;
 mod estatico;
 mod executor;

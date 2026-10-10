@@ -8,6 +8,7 @@ import { ListaRubricas, EditorRubrica } from './telas/rubricas.js';
 import { ListaTurmas, NovaTurma, DetalheTurma } from './telas/turmas.js';
 import { Avaliar } from './telas/avaliar.js';
 import { TelaChecagens, Acompanhar } from './telas/ead.js';
+import { TelaEfeitos } from './telas/efeitos.js';
 import { Usuarios, Conta } from './telas/usuarios.js';
 import { sessao } from './sessao.js';
 import { useAcao } from './telas/comum.js';
@@ -27,6 +28,7 @@ function Tela({ partes }) {
   const [secao, a, b] = partes;
   if (secao === 'usuarios') return html`<${Usuarios} />`;
   if (secao === 'conta') return html`<${Conta} />`;
+  if (secao === 'efeitos') return html`<${TelaEfeitos} />`;
   if (secao === 'rubricas') {
     if (!a) return html`<${ListaRubricas} />`;
     return html`<${EditorRubrica} key=${a} id=${a === 'nova' ? null : a} />`;

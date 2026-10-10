@@ -4,6 +4,7 @@ import { rotulo, tom, pontos, maximo, ehRoteiro, pesoDe } from '../../nota.js';
 import { num } from '../../util.js';
 import { FichaOnde } from './ficha.js';
 import { respostaDe } from './navegacao.js';
+import { EfeitosDoAluno } from './efeitos.js';
 
 function LinhaResumo({ item, correcao, aoIr }) {
   const c = item.criterio;
@@ -22,16 +23,22 @@ function LinhaResumo({ item, correcao, aoIr }) {
   `;
 }
 
-export function Resumo({ aluno, avaliacao, itens, correcao, resultado, desfazer, aoIrPara, aoComentarGeral }) {
+/** `efeitos`: as props de `EfeitosDoAluno`, menos avaliação e correção. */
+export function Resumo({ aluno, avaliacao, itens, correcao, resultado, desfazer, aoIrPara, aoComentarGeral, efeitos }) {
   const faltam = resultado.total - resultado.respondidos;
   const varias = avaliacao.rubricas.length > 1;
+  const mudou = resultado.efeitos.length > 0 && Math.abs(resultado.nota - resultado.antes) > 1e-9;
   return html`
     <article class="ficha resumo entra-frente">
       <${FichaOnde} desfazer=${desfazer} posicao=${aluno.nome} />
       <p class="resumo-nota" data-parcial=${!resultado.concluida}>
         <strong>${num(resultado.nota)}</strong><span> de ${num(avaliacao.nota_maxima)}</span>
+        ${mudou && html`<span class="resumo-antes">${num(resultado.antes)} antes dos efeitos</span>`}
       </p>
-      ${faltam > 0 && html`<p class="resumo-faltam">${faltam === 1 ? 'Falta 1 critério' : `Faltam ${faltam} critérios`}: a nota conta zero neles.</p>`}
+      ${faltam > 0 && (resultado.encerrada
+        ? html`<p class="resumo-faltam">Correção encerrada por um efeito: ${faltam === 1 ? 'o critério sem marcação não precisa' : `os ${faltam} critérios sem marcação não precisam`} ser marcados.</p>`
+        : html`<p class="resumo-faltam">${faltam === 1 ? 'Falta 1 critério' : `Faltam ${faltam} critérios`}: a nota conta zero neles.</p>`)}
+      <${EfeitosDoAluno} avaliacao=${avaliacao} correcao=${correcao} ...${efeitos} />
       ${avaliacao.rubricas.map((ra, n) => html`
         ${varias && html`
           <p class="resumo-rubrica">

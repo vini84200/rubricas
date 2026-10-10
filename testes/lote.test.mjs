@@ -37,3 +37,14 @@ test('tamanho conta respostas e o comentário geral', () => {
   assert.equal(tamanho({ respostas: {} }), 0);
   assert.equal(tamanho({ respostas: { [k]: null }, comentario_geral: '' }), 2);
 });
+
+test('lotes levam efeitos e dispensas, que se aplicam, se descontam e contam', () => {
+  const lote = { respostas: {}, efeitos: { atraso: { quantidade: 2 }, bonus: null }, dispensadas: { plagio: { sinal: 0.8 } } };
+  const c = aplicarLote({ respostas: {}, efeitos: { bonus: { valor: 1 } } }, lote);
+  assert.deepEqual(c.efeitos, { atraso: { quantidade: 2 } });
+  assert.deepEqual(c.dispensadas, { plagio: { sinal: 0.8 } });
+  assert.equal(tamanho(lote), 3);
+  assert.equal(descontar(lote, lote), null);
+  const mudou = { ...lote, efeitos: { ...lote.efeitos, atraso: { quantidade: 3 } } };
+  assert.deepEqual(descontar(mudou, lote), { respostas: {}, efeitos: { atraso: { quantidade: 3 } } });
+});

@@ -5,6 +5,7 @@ use crate::api::{Erro, Estado, Exigencia, Res, Rotas, bloqueante, marca_arquivad
 use crate::permissoes::{Acao, Quem, Recurso};
 use crate::auth;
 use crate::dados::{Dados, Tipo};
+use crate::efeitos;
 use crate::fila::{EstadoAluno, EstadoPipeline, ResultadoPlagio, Tarefa};
 use crate::moodle;
 use crate::pipeline::{Pipeline, Relatorio};
@@ -81,6 +82,7 @@ pub fn rotas() -> Rotas {
         .rota("/avaliacoes/{id}/submissoes", metodos().get(ler, listar_submissoes).post(Item(Avaliacoes, Editar), importar).limite(MAX_ZIP))
         .rota("/avaliacoes/{id}/submissoes/sem-dono/{chave}", metodos().post(Item(Avaliacoes, Editar), associar))
         .rota("/avaliacoes/{id}/planilha-moodle", metodos().post(Item(Avaliacoes, Exportar), planilha_moodle))
+        .rota("/avaliacoes/{id}/envios", metodos().post(Item(Avaliacoes, Editar), envios))
         .rota("/avaliacoes/{id}/submissoes/{aluno}", metodos().get(ler, submissao))
         .rota(
             "/avaliacoes/{id}/submissoes/{aluno}/{*caminho}",
@@ -203,17 +205,52 @@ async fn importar(State(e): State<Estado>, Path(id): Path<String>, corpo: Bytes)
     Ok(Json(json!(r)))
 }
 
-/// Recebe a planilha de notas da tarefa do Moodle e a devolve preenchida, com o
-/// resumo do que ficou de fora; a tela baixa o `csv` como arquivo.
-async fn planilha_moodle(State(e): State<Estado>, Path(id): Path<String>, corpo: Bytes) -> Res<Json<Value>> {
+fn texto_da_planilha(corpo: &[u8]) -> Res<String> {
+    como_texto(corpo).ok_or(Erro(StatusCode::UNPROCESSABLE_ENTITY, "Isto não parece a planilha de notas do Moodle".into()))
+}
+
+/// Lê as datas de envio da planilha e grava; devolve o resumo, com quantos
+/// enviaram depois do prazo (mais a tolerância).
+fn registrar_envios(dados: &Dados, id: &str, texto: &str) -> Res<Value> {
+    let av = dados.ler_avaliacao(id)?;
+    let turma = dados.ler_turma(&av.turma)?;
+    let apelidos = dados.apelidos(&turma.id)?;
+    let r = moodle::datas_de_envio(texto, &turma, &apelidos).map_err(|m| Erro(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+    dados.gravar_envios(id, &r.datas)?;
+    let prazo = av.prazo.as_deref().and_then(efeitos::minutos);
+    let atrasados = prazo.map(|p| {
+        let limite = p + i64::from(av.tolerancia);
+        r.datas.values().flatten().filter(|d| efeitos::minutos(d).is_some_and(|m| m > limite)).count()
+    });
+    let mut v = json!(r);
+    v["atrasados"] = json!(atrasados);
+    Ok(v)
+}
+
+/// `POST /avaliacoes/{id}/envios`: a planilha de notas do Moodle, só pelas datas.
+async fn envios(State(e): State<Estado>, Path(id): Path<String>, corpo: Bytes) -> Res<Json<Value>> {
     let dados = e.dados.clone();
+    Ok(Json(bloqueante(move || registrar_envios(&dados, &id, &texto_da_planilha(&corpo)?)).await?))
+}
+
+/// Recebe a planilha de notas da tarefa do Moodle e a devolve preenchida, com o
+/// resumo do que ficou de fora; a tela baixa o `csv` como arquivo. Para quem
+/// pode alterar a avaliação, as datas de envio da planilha também são gravadas.
+async fn planilha_moodle(State(e): State<Estado>, Extension(u): Extension<Quem>, Path(id): Path<String>, corpo: Bytes) -> Res<Json<Value>> {
+    let dados = e.dados.clone();
+    let gravar_datas = e.visao(&u).pode(Recurso::Item(Tipo::Avaliacoes, &id), Acao::Editar);
     let p = bloqueante(move || {
         let av = dados.ler_avaliacao(&id)?;
         let turma = dados.ler_turma(&av.turma)?;
         let correcoes = dados.ler_correcoes(&id)?;
         let apelidos = dados.apelidos(&turma.id)?;
-        let texto = como_texto(&corpo).ok_or(Erro(StatusCode::UNPROCESSABLE_ENTITY, "Isto não parece a planilha de notas do Moodle".into()))?;
-        moodle::preencher_planilha(&texto, &av, &turma, &correcoes, &apelidos).map_err(|m| Erro(StatusCode::UNPROCESSABLE_ENTITY, m))
+        let texto = texto_da_planilha(&corpo)?;
+        let p = moodle::preencher_planilha(&texto, &av, &turma, &correcoes, &apelidos).map_err(|m| Erro(StatusCode::UNPROCESSABLE_ENTITY, m))?;
+        // Uma planilha sem a coluna de envio, ou ilegível, não impede o preenchimento.
+        if gravar_datas && let Err(Erro(_, m)) = registrar_envios(&dados, &id, &texto) {
+            eprintln!("datas de envio de {id} não gravadas: {m}");
+        }
+        Ok(p)
     })
     .await?;
     Ok(Json(json!(p)))

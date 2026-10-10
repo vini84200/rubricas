@@ -7,7 +7,8 @@
 //   ↓ baixo    = voltar      ↓  ou Backspace
 //                            1–9 escolhe o nível, S pula, C comenta, Z desfaz,
 //                            Enter próximo aluno, [ e ] trocam de aluno,
-//                            G aceita a sugestão das checagens automáticas
+//                            G aceita a sugestão das checagens automáticas (no
+//                            resumo, a do efeito: zero por plágio, atraso…)
 //
 // Passos de roteiro ganham um cartão próprio, sem marcação: deslizar para os lados,
 // →, ←, Enter ou espaço seguem para o próximo item.
@@ -17,8 +18,8 @@
 import { html, useState, useEffect, useRef, useMemo } from '../../vendor/preact-htm.js';
 import { api, carregarPacote, fila, guardarCorrecoes } from '../api.js';
 import { aplicarLote } from '../lote.js';
-import { calcular, itens as listarItens, rotulo, tom, pontos, temIntermediarios, ehRoteiro } from '../nota.js';
-import { PainelCodigo, avisosEad, avisosDoCodigo } from '../codigo.js';
+import { calcular, itens as listarItens, rotulo, tom, pontos, temIntermediarios, ehRoteiro, sugestoesEfeitos } from '../nota.js';
+import { PainelCodigo, avisosEad, avisosDoCodigo, textoPlagio } from '../codigo.js';
 import { ir, rota, num, cls, vibrar, plural } from '../util.js';
 import { Estado, Folha, useMedia, useTelaInteira } from './comum.js';
 import { FichaCriterio, FichaPasso, DescricaoCriterio, temDescricao } from './avaliar/ficha.js';
@@ -28,6 +29,13 @@ import { Resumo, Sincronia } from './avaliar/resumo.js';
 import { useTeclado } from './avaliar/teclado.js';
 import { Rodape, Teclas } from './avaliar/botoes.js';
 import { respostaDe, primeiroSemResposta, passosAntes, contarCriterios, mesmaMarcacao } from './avaliar/navegacao.js';
+import { aceitarSugestao } from './avaliar/efeitos.js';
+
+/** "07/10 00:15", de "AAAA-MM-DDTHH:MM". */
+function quandoFoi(data) {
+  const m = /^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})$/.exec(data || '');
+  return m ? `${m[2]}/${m[1]} ${m[3]}` : '?';
+}
 
 // Qual folha está aberta por cima do cartão: null, 'opcoes' (por deslize, tecla ou
 // botão), 'opcoes-toque' (por um toque, que espera um pouco antes de aceitar
@@ -44,6 +52,7 @@ export function Avaliar({ id, alunoId }) {
   const [folha, setFolha] = useState(null);
   const [rascunhos, setRascunhos] = useState({});
   const [ultima, setUltima] = useState(null); // última marcação, para desfazer
+  const [efeitoAberto, setEfeitoAberto] = useState(null); // { id, inicial }: o formulário de efeito no resumo
   const [sinc, setSinc] = useState(fila.estado());
   const largo = useMedia('(min-width: 960px)');
   // Com submissões, a tela bem larga mostra o código no lugar da lista de alunos.
@@ -142,13 +151,15 @@ export function Avaliar({ id, alunoId }) {
   // Ao abrir e ao trocar de aluno: vai ao primeiro critério sem marcação. Recarregar
   // os dados (a rede voltou, o servidor recusou algo) não mexe em onde o usuário está.
   const carregado = !!pacote;
+  // Uma correção encerrada por um efeito (zero por plágio) abre no resumo.
   useEffect(() => {
     if (!pacote || !aluno) return;
-    setIdx(primeiroSemResposta(itens, correcoes[aluno.id]));
+    setIdx(resultados[aluno.id].encerrada ? itens.length : primeiroSemResposta(itens, correcoes[aluno.id]));
     setVeioDe(-1);
     setEntrada('frente');
     setFolha(null);
     setUltima(null);
+    setEfeitoAberto(null);
   }, [carregado, alunoId]);
 
   // Mantém a cópia offline em dia com o que está na tela — logo depois de cada
@@ -284,6 +295,30 @@ export function Avaliar({ id, alunoId }) {
   }
 
   const podeDesfazer = ultima && ultima.aluno === aluno.id ? { texto: ultima.texto, acao: desfazer } : null;
+
+  // Efeitos sobre a nota: as sugestões vêm do plágio e da data do envio.
+  const plagio = ead?.plagio[aluno.id];
+  const envio = pacote.envios?.[aluno.id];
+  const sugestoesEf = sugestoesEfeitos(avaliacao, correcao, { plagio, envio }).map((s) => ({
+    ...s,
+    motivo: s.tipo.sugerir === 'plagio'
+      ? textoPlagio(plagio, alunos)
+      : `enviado ${quandoFoi(envio)}, prazo ${quandoFoi(avaliacao.prazo)}`,
+  }));
+  const efeitos = {
+    sugestoes: sugestoesEf,
+    comTecla: largo,
+    aberto: efeitoAberto,
+    aoAbrir: setEfeitoAberto,
+    aoAplicar: (tipo, aplicado) => {
+      registrar({ efeitos: { [tipo]: aplicado } });
+      setEfeitoAberto(null);
+      vibrar();
+    },
+    aoTirar: (tipo) => registrar({ efeitos: { [tipo]: null } }),
+    aoDispensar: (tipo, sinal) => registrar({ dispensadas: { [tipo]: { sinal } } }),
+  };
+  const sugestaoEfeito = sugestoesEf.length ? () => aceitarSugestao(sugestoesEf[0], efeitos.aoAplicar, setEfeitoAberto) : null;
   // Sugestão das checagens automáticas: aparece até o critério ter exatamente essa marcação.
   const sug = criterio && ead?.relatorios[aluno.id]?.sugestoes.find((x) => x.rubrica === item.origem && x.criterio === criterio.id);
   const sugestao = sug && pontos(criterio, sug.marcacao) !== null && !mesmaMarcacao(resposta, sug.marcacao)
@@ -304,7 +339,7 @@ export function Avaliar({ id, alunoId }) {
   const folhaAlunos = folha === 'alunos' && !listaFixa;
   const folhaCodigo = folha === 'codigo' && !!ead;
   acoes.current = {
-    marcar, avancar, irPara, abrirOpcoes, desfazer, seguir, vizinho, item, idx, noResumo, sugestao,
+    marcar, avancar, irPara, abrirOpcoes, desfazer, seguir, vizinho, item, idx, noResumo, sugestao, sugestaoEfeito,
     comentar: () => {
       if (!largo) setFolha('opcoes');
       setTimeout(() => focoComentario.current?.focus(), 60);
@@ -315,7 +350,10 @@ export function Avaliar({ id, alunoId }) {
   const totalCriterios = contarCriterios(itens);
   const posicao = contarCriterios(itens, idx + 1);
   const hrefNotas = `#${rota('avaliacoes', id)}`;
-  const avisos = avisosEad(ead, aluno.id, alunos);
+  const avisos = [
+    ...avisosEad(ead, aluno.id, alunos),
+    ...sugestoesEf.map((s) => ({ tipo: 'efeito', texto: `Sugestão no resumo: ${s.tipo.titulo}`, dica: s.motivo, acao: noResumo ? null : () => irPara(itens.length) })),
+  ];
 
   const opcoes = criterio && html`
     <${Opcoes} key=${`${aluno.id}:${chaveItem}`} item=${item} resposta=${resposta} comentario=${comentario} comTeclas=${largo}
@@ -375,12 +413,12 @@ export function Avaliar({ id, alunoId }) {
         ${pacote.offline && html`<p class="av-aviso">Sem conexão: usando a cópia guardada neste aparelho.</p>`}
         ${avisos.length > 0 && html`
           <ul class="av-avisos" aria-label="Avisos sobre a submissão">
-            ${avisos.map((a) => html`<li data-tipo=${a.tipo} title=${a.dica}>${a.texto}</li>`)}
+            ${avisos.map((a) => html`<li data-tipo=${a.tipo} title=${a.dica}>${a.acao ? html`<button type="button" class="aviso-ir" onClick=${a.acao}>${a.texto} ›</button>` : a.texto}</li>`)}
           </ul>
         `}
         ${noResumo
           ? html`<${Resumo} key=${`${aluno.id}:resumo`} aluno=${aluno} avaliacao=${avaliacao} itens=${itens} correcao=${correcao} resultado=${resultado}
-              desfazer=${podeDesfazer} aoIrPara=${irPara} aoComentarGeral=${(texto) => registrar({ comentario_geral: texto })} />`
+              desfazer=${podeDesfazer} aoIrPara=${irPara} aoComentarGeral=${(texto) => registrar({ comentario_geral: texto })} efeitos=${efeitos} />`
           : html`
             <div class="pilha">
               ${idx < itens.length - 1 && html`<div class="ficha-debaixo" aria-hidden="true"></div>`}
@@ -394,7 +432,7 @@ export function Avaliar({ id, alunoId }) {
           ${passo
             ? html`<h2 class="av-painel-titulo">Passo de roteiro</h2><p class="suave">Não vale nota. <kbd>→</kbd> ou <kbd>Enter</kbd> para seguir.</p>`
             : criterio ? html`<h2 class="av-painel-titulo">${criterio.nome}</h2>${opcoes}` : html`<p class="suave">Escolha um critério do resumo para revisar.</p>`}
-          <${Teclas} comSugestao=${!!ead?.pipeline} />
+          <${Teclas} comSugestao=${!!ead?.pipeline || !!avaliacao.efeitos?.some((t) => t.sugerir)} />
         </aside>
       `}
 

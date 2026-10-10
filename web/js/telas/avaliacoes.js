@@ -1,7 +1,7 @@
 // Avaliações: uma ou mais rubricas atreladas a uma turma, e as notas que saem delas.
 import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api, carregarPacote } from '../api.js';
-import { calcular, maximoRubrica, resumoItens } from '../nota.js';
+import { calcular, maximoRubrica, resumoItens, textoEfeito, descreverOperacao, atraso } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
 import { useDados, useAcao, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, BotaoArquivo, arquivar, Compartilhar } from './comum.js';
 import { sessao, pode } from '../sessao.js';
@@ -45,11 +45,35 @@ export function ListaAvaliacoes() {
   `;
 }
 
+/** O corpo do PUT de uma avaliação como está, para quem muda só uma parte dela. */
+function corpoDe(a) {
+  return {
+    titulo: a.titulo,
+    turma: a.turma,
+    nota_maxima: a.nota_maxima,
+    rubricas: a.rubricas.map((r) => ({ origem: r.origem, peso: r.peso })),
+    efeitos: (a.efeitos || []).map((t) => t.id),
+    prazo: a.prazo || null,
+    tolerancia: a.tolerancia || 0,
+  };
+}
+
+/** "−1 por dia, até −3 · sugerido pelo atraso · encerra a correção" */
+export function resumoEfeito(t) {
+  const partes = [descreverOperacao(t)];
+  if (t.sugerir === 'plagio') partes.push('sugerido pelo plágio');
+  if (t.sugerir === 'atraso') partes.push('sugerido pelo atraso');
+  if (t.encerra) partes.push('encerra a correção');
+  if (t.feedback === false) partes.push('não vai ao aluno');
+  return partes.join(' · ');
+}
+
 export function FormAvaliacao({ id }) {
   const rubricas = useDados('/rubricas');
   const turmas = useDados('/turmas');
+  const catalogo = useDados('/efeitos');
   const atual = useDados(id ? rota('avaliacoes', id) : null);
-  const [f, setF] = useState(id ? null : { titulo: '', turma: '', nota_maxima: '10', escolhidas: {} });
+  const [f, setF] = useState(id ? null : { titulo: '', turma: '', nota_maxima: '10', escolhidas: {}, efeitos: [], prazo: '', tolerancia: '' });
   const { rodar, ocupado, erro, setErro } = useAcao();
 
   useEffect(() => {
@@ -60,6 +84,9 @@ export function FormAvaliacao({ id }) {
         turma: a.turma,
         nota_maxima: campo(a.nota_maxima),
         escolhidas: Object.fromEntries(a.rubricas.map((r) => [r.origem, campo(r.peso)])),
+        efeitos: (a.efeitos || []).map((t) => t.id),
+        prazo: a.prazo || '',
+        tolerancia: a.tolerancia ? String(a.tolerancia) : '',
       });
     }
   }, [atual.dados]);
@@ -69,8 +96,8 @@ export function FormAvaliacao({ id }) {
     if (f && !f.turma && ativas?.length === 1) setF({ ...f, turma: ativas[0].id });
   }, [turmas.dados, f]);
 
-  const carregando = rubricas.carregando || turmas.carregando || atual.carregando;
-  const erroCarga = rubricas.erro || turmas.erro || atual.erro;
+  const carregando = rubricas.carregando || turmas.carregando || atual.carregando || catalogo.carregando;
+  const erroCarga = rubricas.erro || turmas.erro || atual.erro || catalogo.erro;
   const volta = id ? { href: `#${rota('avaliacoes', id)}`, texto: 'Notas' } : { href: '#/avaliacoes', texto: 'Avaliações' };
   if (carregando || erroCarga || !f) {
     return html`<div class="tela"><${Titulo} titulo=${id ? 'Editar avaliação' : 'Nova avaliação'} voltar=${volta} /><${Estado} carregando=${carregando} erro=${erroCarga} /></div>`;
@@ -86,6 +113,13 @@ export function FormAvaliacao({ id }) {
     if (!opcoes.some((r) => r.id === ra.origem)) opcoes.push({ ...ra.rubrica, id: ra.origem, _soCopia: true });
   }
   const ordem = Object.keys(f.escolhidas);
+  // Tipos do catálogo, mais os que a avaliação já usa e saíram de lá.
+  const tiposEfeito = [...catalogo.dados.efeitos];
+  for (const t of atual.dados?.avaliacao.efeitos || []) {
+    if (!tiposEfeito.some((x) => x.id === t.id)) tiposEfeito.push({ ...t, _soCopia: true });
+  }
+  const comAtraso = tiposEfeito.some((t) => t.sugerir === 'atraso' && f.efeitos.includes(t.id));
+  const alternarEfeito = (tid) => setF({ ...f, efeitos: f.efeitos.includes(tid) ? f.efeitos.filter((x) => x !== tid) : [...f.efeitos, tid] });
 
   function alternar(rid) {
     const escolhidas = { ...f.escolhidas };
@@ -101,9 +135,16 @@ export function FormAvaliacao({ id }) {
       turma: f.turma,
       nota_maxima: lerNum(f.nota_maxima),
       rubricas: ordem.map((origem) => ({ origem, peso: lerNum(f.escolhidas[origem]) })),
+      efeitos: f.efeitos.filter((tid) => tiposEfeito.some((t) => t.id === tid)),
+      prazo: f.prazo || null,
+      tolerancia: f.tolerancia.trim() ? Number(f.tolerancia) : 0,
     };
     if (!Number.isFinite(corpo.nota_maxima) || corpo.rubricas.some((r) => !Number.isFinite(r.peso))) {
       setErro('Preencha a nota máxima e os pesos com números');
+      return;
+    }
+    if (!Number.isInteger(corpo.tolerancia) || corpo.tolerancia < 0) {
+      setErro('A tolerância é um número inteiro de minutos');
       return;
     }
     rodar(async () => {
@@ -164,6 +205,43 @@ export function FormAvaliacao({ id }) {
         ${ordem.length > 1 && html`<small class="suave">A nota final é a média das rubricas ponderada pelos pesos, na escala da nota máxima.</small>`}
         <small class="suave">A avaliação guarda uma cópia de cada rubrica: editar a rubrica depois não muda correções já feitas.</small>
       </fieldset>
+
+      <fieldset class="campo">
+        <legend>Efeitos sobre a nota</legend>
+        ${!tiposEfeito.length && html`<p class="suave">Nenhum tipo de efeito no catálogo. Eles são criados pela API em TOML (a skill do Claude ensina): zero por plágio, desconto por atraso, bônus. <a href="#/efeitos">Ver o catálogo</a></p>`}
+        ${tiposEfeito.length > 0 && html`
+          <ul class="escolhas">
+            ${tiposEfeito.map((t) => {
+              const marcada = f.efeitos.includes(t.id);
+              return html`
+                <li class=${cls('escolha', marcada && 'marcada')}>
+                  <label class="escolha-rotulo">
+                    <input type="checkbox" checked=${marcada} onChange=${() => alternarEfeito(t.id)} />
+                    <span>
+                      <span class="linha-titulo">${t.titulo}</span>
+                      <span class="linha-meta">${resumoEfeito(t)}${t._soCopia ? ' (só existe a cópia desta avaliação)' : ''}</span>
+                    </span>
+                  </label>
+                </li>
+              `;
+            })}
+          </ul>
+          <small class="suave">Quem avalia aplica no resumo do aluno; o plágio e o atraso aparecem como sugestão. <a href="#/efeitos">Ver o catálogo</a></small>
+        `}
+        ${comAtraso && html`
+          <div class="par">
+            <label class="campo">
+              <span>Prazo de entrega</span>
+              <input type="datetime-local" value=${f.prazo} onInput=${(e) => setF({ ...f, prazo: e.target.value })} />
+            </label>
+            <label class="campo curto">
+              <span>Tolerância (min)</span>
+              <input class="numero" inputmode="numeric" placeholder="0" value=${f.tolerancia} onInput=${(e) => setF({ ...f, tolerancia: e.target.value })} />
+            </label>
+          </div>
+          <small class="suave">O atraso sai da data de envio da planilha de notas do Moodle: cada 24 h começadas depois do prazo contam um dia. Envie a planilha junto com o ZIP, na tela da avaliação.</small>
+        `}
+      </fieldset>
       ${erro && html`<p class="erro" role="alert">${erro}</p>`}
       <div class="acoes">
         <button class="botao primario" disabled=${ocupado || !ordem.length || !f.turma}>${id ? 'Salvar' : 'Criar avaliação'}</button>
@@ -195,6 +273,8 @@ export function Resultados({ id }) {
   if (!pacote) return html`<${Estado} carregando=${true} />`;
 
   const { avaliacao: a, turma, correcoes, desatualizadas, ead } = pacote;
+  const efeitosDesatualizados = pacote.efeitos_desatualizados || [];
+  const comEfeitos = (a.efeitos || []).length > 0;
   const linhas = turma.alunos.map((aluno) => ({ aluno, r: calcular(a, correcoes[aluno.id]) }));
   const concluidos = linhas.filter((l) => l.r.concluida).length;
   const iniciados = linhas.filter((l) => !l.r.concluida && l.r.respondidos > 0).length;
@@ -205,15 +285,12 @@ export function Resultados({ id }) {
   const caminho = rota('avaliacoes', id);
 
   function atualizarCopias() {
-    if (!confirm('Atualizar a cópia das rubricas a partir da pasta? Marcações em critérios ou níveis que deixaram de existir são desconsideradas.')) return;
+    const texto = desatualizadas.length
+      ? 'Atualizar a cópia a partir da pasta? Marcações em critérios ou níveis que deixaram de existir são desconsideradas.'
+      : 'Atualizar a cópia dos tipos de efeito a partir do catálogo? As notas com esses efeitos mudam.';
+    if (!confirm(texto)) return;
     rodar(async () => {
-      await api('PUT', caminho, {
-        titulo: a.titulo,
-        turma: a.turma,
-        nota_maxima: a.nota_maxima,
-        rubricas: a.rubricas.map((r) => ({ origem: r.origem, peso: r.peso })),
-        atualizar: desatualizadas,
-      });
+      await api('PUT', caminho, { ...corpoDe(a), atualizar: desatualizadas, atualizar_efeitos: efeitosDesatualizados });
       carregar();
     });
   }
@@ -240,9 +317,11 @@ export function Resultados({ id }) {
     ${pacote.offline && html`<p class="aviso">Sem conexão: mostrando a última cópia guardada neste aparelho.</p>`}
     ${aviso && html`<p class="aviso erro" role="alert">${aviso}</p>`}
     ${pacote.arquivada && pode(pacote, 'arquivar') && html`<${AvisoArquivada} texto="Avaliação arquivada: fica fora da lista e o executor não roda mais as checagens dela. As notas continuam aqui." aoDesarquivar=${alternarArquivada} />`}
-    ${desatualizadas.length > 0 && pode(pacote, 'editar') && html`
+    ${(desatualizadas.length > 0 || efeitosDesatualizados.length > 0) && pode(pacote, 'editar') && html`
       <p class="aviso">
-        ${desatualizadas.length === 1 ? 'Uma rubrica mudou' : 'Rubricas mudaram'} na pasta depois de entrar nesta avaliação. As correções continuam usando a cópia antiga.
+        ${desatualizadas.length > 0 && `${desatualizadas.length === 1 ? 'Uma rubrica mudou' : 'Rubricas mudaram'} na pasta depois de entrar nesta avaliação. `}
+        ${efeitosDesatualizados.length > 0 && `${efeitosDesatualizados.length === 1 ? 'Um tipo de efeito mudou' : 'Tipos de efeito mudaram'} no catálogo. `}
+        As correções continuam usando a cópia antiga.
         <button class="botao pequeno" onClick=${atualizarCopias}>Atualizar cópia</button>
       </p>
     `}
@@ -251,7 +330,7 @@ export function Resultados({ id }) {
       <${Progresso} concluidos=${concluidos} iniciados=${iniciados} total=${turma.alunos.length} />
     </div>
 
-    ${(ead || pode(pacote, 'editar')) && html`<${Entregas} id=${id} ead=${ead} alunos=${turma.alunos} aoMudar=${carregar} editar=${pode(pacote, 'editar')} />`}
+    ${(ead || pode(pacote, 'editar')) && html`<${Entregas} id=${id} pacote=${pacote} aoMudar=${carregar} editar=${pode(pacote, 'editar')} />`}
 
     <div class="acoes acoes-notas">
       ${pode(pacote, 'exportar') && html`
@@ -271,6 +350,7 @@ export function Resultados({ id }) {
             <th>Aluno</th>
             ${ead && html`<th>Entrega</th>`}
             ${varias && a.rubricas.map((r) => html`<th class="numerico">${r.rubrica.titulo}</th>`)}
+            ${comEfeitos && html`<th class="numerico">Antes</th><th>Efeitos</th>`}
             <th class="numerico">Nota</th>
           </tr>
         </thead>
@@ -283,6 +363,14 @@ export function Resultados({ id }) {
               </td>
               ${ead && html`<td><${Entrega} ead=${ead} aluno=${aluno.id} alunos=${turma.alunos} /></td>`}
               ${varias && r.rubricas.map((p) => html`<td class="numerico">${r.respondidos ? `${num(p.pontos)} / ${num(p.maximo)}` : ''}</td>`)}
+              ${comEfeitos && html`
+                <td class="numerico">${r.efeitos.length && r.respondidos ? num(r.antes) : ''}</td>
+                <td class="efeitos-celula">${r.efeitos.map((tid) => {
+                  const t = a.efeitos.find((x) => x.id === tid);
+                  const ap = correcoes[aluno.id].efeitos[tid];
+                  return html`<span class="selo" title=${ap.justificativa || null}>${textoEfeito(t, { ...ap, justificativa: '' })}</span>`;
+                })}</td>
+              `}
               <td class="numerico">
                 ${r.concluida
                   ? html`<strong>${num(r.nota)}</strong>`
@@ -368,24 +456,52 @@ function quando(segundos) {
   return `há ${Math.round(min / 1440)} dias`;
 }
 
-/** Envio do ZIP do Moodle, quem ficou sem dono e a fila do executor. */
-function Entregas({ id, ead, alunos, aoMudar, editar }) {
-  const [msg, setMsg] = useState(null);
+/** O que o servidor fez com o ZIP, numa frase. */
+function frasesDoZip(r) {
+  const partes = [`${plural(r.recebidas, 'submissão nova ou alterada', 'submissões novas ou alteradas')}`];
+  if (r.iguais) partes.push(`${plural(r.iguais, 'igual à anterior', 'iguais às anteriores')}`);
+  if (r.sem_dono.length) partes.push(`${plural(r.sem_dono.length, 'nome sem dono', 'nomes sem dono')}`);
+  if (r.edicoes_descartadas.length) partes.push(`${plural(r.edicoes_descartadas.length, 'edição sua descartada', 'edições suas descartadas')} (o aluno mandou código novo)`);
+  if (r.ignorados.length) partes.push(`${plural(r.ignorados.length, 'arquivo fora do padrão ignorado', 'arquivos fora do padrão ignorados')}`);
+  return `${partes.join(', ')}.`;
+}
 
-  async function enviar(arquivo) {
+/** E com a planilha de notas, só pelas datas de envio. */
+function frasesDaPlanilha(r) {
+  let texto = `Planilha do Moodle: ${plural(r.com_data, 'data de envio registrada', 'datas de envio registradas')}`;
+  if (r.atrasados !== null) texto += `, ${plural(r.atrasados, 'enviada depois do prazo', 'enviadas depois do prazo')}`;
+  texto += '.';
+  if (r.ilegiveis.length) texto += ` Data ilegível: ${r.ilegiveis.join(', ')}.`;
+  if (r.sem_aluno.length) texto += ` Sem aluno na turma: ${r.sem_aluno.join(', ')}.`;
+  return texto;
+}
+
+/** Envio do ZIP do Moodle (e da planilha de notas, pelas datas de envio), quem
+    ficou sem dono e a fila do executor. */
+function Entregas({ id, pacote, aoMudar, editar }) {
+  const { ead, avaliacao } = pacote;
+  const alunos = pacote.turma.alunos;
+  const [msg, setMsg] = useState(null);
+  const tiposAtraso = (avaliacao.efeitos || []).filter((t) => t.sugerir === 'atraso');
+  const envios = pacote.envios || {};
+
+  // O ZIP começa com "PK"; o resto é tratado como a planilha de notas.
+  async function enviar(arquivos) {
     setMsg(null);
-    try {
-      const r = await api('POST', rota('avaliacoes', id, 'submissoes'), arquivo);
-      const partes = [`${plural(r.recebidas, 'submissão nova ou alterada', 'submissões novas ou alteradas')}`];
-      if (r.iguais) partes.push(`${plural(r.iguais, 'igual à anterior', 'iguais às anteriores')}`);
-      if (r.sem_dono.length) partes.push(`${plural(r.sem_dono.length, 'nome sem dono', 'nomes sem dono')}`);
-      if (r.edicoes_descartadas.length) partes.push(`${plural(r.edicoes_descartadas.length, 'edição sua descartada', 'edições suas descartadas')} (o aluno mandou código novo)`);
-      if (r.ignorados.length) partes.push(`${plural(r.ignorados.length, 'arquivo fora do padrão ignorado', 'arquivos fora do padrão ignorados')}`);
-      setMsg({ ok: true, texto: `${partes.join(', ')}.` });
-      aoMudar();
-    } catch (err) {
-      setMsg({ ok: false, texto: err.message });
+    const textos = [];
+    let ok = true;
+    for (const arquivo of arquivos) {
+      try {
+        const zip = (await arquivo.slice(0, 2).text()) === 'PK';
+        const r = await api('POST', rota('avaliacoes', id, zip ? 'submissoes' : 'envios'), arquivo);
+        textos.push(zip ? frasesDoZip(r) : frasesDaPlanilha(r));
+      } catch (err) {
+        ok = false;
+        textos.push(`${arquivo.name}: ${err.message}`);
+      }
     }
+    setMsg({ ok, texto: textos.join(' ') });
+    aoMudar();
   }
 
   async function associar(chave, aluno) {
@@ -399,12 +515,27 @@ function Entregas({ id, ead, alunos, aoMudar, editar }) {
   }
 
   const botao = editar && html`
-    <${BotaoArquivo} accept=".zip,application/zip" rotulo=${ead ? 'Enviar novo ZIP' : 'Enviar submissões do Moodle (ZIP)'} rotuloOcupado="Enviando…" aoEscolher=${enviar} />
+    <${BotaoArquivo} accept=".zip,application/zip,.csv,text/csv" varios rotulo=${ead ? 'Enviar novo ZIP ou planilha' : 'Enviar submissões do Moodle (ZIP)'}
+      rotuloOcupado="Enviando…" aoEscolherVarios=${enviar}
+      title="O ZIP de “Baixar todas as submissões” e, para o atraso, a planilha de “Baixar planilha de notas”. Os dois juntos também vão." />
+  `;
+  const atrasados = avaliacao.prazo && tiposAtraso.length
+    ? alunos.filter((al) => atraso(avaliacao.prazo, avaliacao.tolerancia, envios[al.id], tiposAtraso[0].operacao.unidade) > 0).length
+    : null;
+  const linhaAtraso = tiposAtraso.length > 0 && html`
+    <br /><span class=${!avaliacao.prazo || !Object.keys(envios).length ? 'pendente' : 'suave'}>
+      ${!avaliacao.prazo
+        ? 'Sem prazo: defina o prazo em Editar para sugerir o desconto por atraso'
+        : !Object.keys(envios).length
+          ? 'Sem datas de envio: envie a planilha de notas do Moodle para sugerir o atraso'
+          : `${plural(Object.keys(envios).length, 'data de envio', 'datas de envio')}, ${plural(atrasados, 'depois do prazo', 'depois do prazo')}`}
+    </span>
   `;
   if (!ead) {
     return html`
       <div class="entregas vazia">
         ${botao}
+        ${linhaAtraso && html`<p>${linhaAtraso}</p>`}
         ${msg && html`<p class=${msg.ok ? 'ok' : 'erro'} role="status">${msg.texto}</p>`}
       </div>
     `;
@@ -421,6 +552,7 @@ function Entregas({ id, ead, alunos, aoMudar, editar }) {
             ${(ead.aguardando > 0 || ead.plagio_pendente) && (ead.executor_visto_em ? ` (visto ${quando(ead.executor_visto_em)})` : ' (nenhum executor conectado desde que o servidor subiu)')}
           </span>`}
           ${ead.erro_pipeline && html`<br /><span class="erro">${ead.erro_pipeline}</span>`}
+          ${linhaAtraso}
         </p>
         <div class="acoes">
           ${botao}

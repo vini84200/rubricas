@@ -36,6 +36,8 @@ dados/
   correcoes/<avaliacao>/<aluno>.json
   submissoes/<avaliacao>/<aluno>/ arquivos enviados pelo aluno (do ZIP do Moodle)
   submissoes/<avaliacao>/.edicoes/<aluno>/  mudanças do professor sobre esses arquivos
+  submissoes/<avaliacao>/.envios.json       data do envio de cada aluno, da planilha de notas do Moodle
+  efeitos/<id>.toml               tipos de efeito sobre a nota (zero por plágio, atraso, bônus)
   apelidos/<turma>.json           nome no Moodle → aluno, das associações feitas à mão
   arquivadas.toml                 rubricas, turmas e avaliações arquivadas (listas de ids)
   pipelines/<avaliacao>/          pipeline.toml e anexos (testes.py, esqueleto.py, referencias/)
@@ -154,6 +156,7 @@ alguns segundos depois de marcar, um botão "Desfazer" devolve o critério ao qu
 | deslizar para baixo | `↓` ou `Backspace` | voltar um critério |
 | | `1`–`9` | escolher o nível (1 = o de menos pontos) |
 | | `S` | pular sem marcar (no celular: "Pular sem marcar", nas opções) |
+| | `G` | aceitar a sugestão das checagens; no resumo, a do efeito (plágio, atraso) |
 | | `C` | comentar |
 | | `Z` | desfazer a última marcação |
 | | `Enter` | no resumo: próximo aluno |
@@ -242,6 +245,61 @@ quem não foi avaliado ou está incompleto mantém o que o Moodle tinha, e linha
 alterada: Não" não é mexida. O separador decimal segue o da planilha (o Moodle em inglês leria
 "7,5" como 75), a planilha sai sempre separada por vírgula (o padrão do envio), e se a nota máxima da tarefa difere da avaliação a nota é convertida. A tela lista
 quem ficou de fora e por quê. Código em `src/moodle.rs`.
+
+## Efeitos sobre a nota
+
+Um efeito muda a **nota final** de um aluno depois da conta das rubricas: zero por plágio,
+desconto por atraso, bônus. Os tipos ficam num catálogo, `efeitos/<id>.toml`, criado e alterado
+pela API em TOML (a skill do Claude ensina o formato). A tela `#/efeitos` só os mostra.
+
+```toml
+titulo = "Desconto por atraso"
+descricao = "Um ponto por dia, até cinco."           # opcional
+operacao = { tipo = "por_unidade", pontos = -1.0, limite = -5.0 }   # unidade = "hora" conta por hora
+sugerir = "atraso"         # ou "plagio": vira sugestão quando o sinal aparece
+feedback = true            # padrão; false = não vai aos Comentários de feedback do Moodle
+encerra = false            # true = o aluno conta como corrigido sem marcar os critérios
+```
+
+| `operacao.tipo` | Faz |
+| --- | --- |
+| `fixar` | `nota = 0`: a nota final passa a ser essa |
+| `multiplicar` | `fator = 0.8`: multiplica a nota |
+| `somar` | `pontos = 1.0`: soma (negativo subtrai) |
+| `por_unidade` | `pontos` × a quantidade (dias de atraso), sem passar de `limite` |
+| `teto` | `nota = 5`: a nota não passa disso |
+
+O valor pode ser `"na_hora"` (por exemplo, `pontos = "na_hora"` num "Ajuste"): quem aplica digita
+o número e uma justificativa. **A ordem da conta é fixa:** primeiro multiplica, depois soma (e por
+unidade), depois o teto; `fixar` vence tudo; no fim, a nota fica entre 0 e a máxima. A conta
+existe em `src/efeitos.rs` e em `web/js/nota.js`, que precisam andar juntos.
+
+Em "Editar", a avaliação escolhe os tipos que usa e guarda uma **cópia** deles, como faz com as
+rubricas. Mudar o tipo no catálogo não muda notas já dadas: a tela de notas avisa e oferece
+atualizar a cópia. Com um tipo de atraso, o formulário pede também o **prazo** e uma
+**tolerância** em minutos.
+
+**Na correção.** Os efeitos ficam no resumo do aluno: as sugestões no alto, com "Aplicar" (`G`) e
+"Dispensar"; os aplicados com "Alterar" e "Tirar"; um botão para cada tipo que falta. Quando há
+sugestão, um aviso aparece acima do cartão desde o primeiro critério, e tocar nele leva ao resumo.
+Dispensar grava quem dispensou e o sinal daquele momento: a sugestão volta só se o sinal piorar
+(similaridade maior, mais dias de atraso). Aplicar pede o mesmo acesso que marcar critérios.
+
+- **Plágio:** o par mais parecido acima do limiar do JPlag sugere o efeito aos dois alunos.
+- **Atraso:** a data do envio vem da coluna "Última modificação (envio)" da planilha de notas do
+  Moodle. Ela entra pelo mesmo botão do ZIP (os dois podem ir juntos), e "Preencher planilha do
+  Moodle" também atualiza as datas. Cada 24 h começadas depois do prazo contam um dia; dentro
+  da tolerância, não é atraso. As datas não têm fuso: o prazo e o Moodle usam o mesmo relógio.
+
+A tela de notas e o CSV mostram a nota antes dos efeitos, os efeitos e a nota final. O texto de
+cada efeito ("Desconto por atraso (2 dias): −2", mais a justificativa) vai aos Comentários de
+feedback da planilha do Moodle, a não ser que o tipo tenha `feedback = false`.
+
+| Pedido | Resposta |
+| --- | --- |
+| `GET /api/efeitos.txt` | uma linha por tipo: `id \| título \| operação`, e o sinal que sugere |
+| `GET/PUT /api/efeitos/{id}.toml` | o tipo; o `PUT` valida e grava (ou cria), e pede poder criar rubricas |
+| `DELETE /api/efeitos/{id}` | tira do catálogo; as avaliações que o usam ficam com a cópia |
 
 ## Claude e scripts
 

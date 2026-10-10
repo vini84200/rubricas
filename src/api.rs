@@ -3,7 +3,8 @@
 //! protegida é registrada com o que é preciso poder para usá-la (`Metodos`).
 
 use crate::auth::{self, Auth, ErroLogin};
-use crate::dados::{self, Arquivadas, Dados, Tipo};
+use crate::dados::{self, AlteracaoEfeitos, Arquivadas, Dados, EscolhaEfeitos, Tipo};
+use crate::efeitos::{Dispensa, EfeitoAplicado};
 use crate::ead;
 use crate::estatico::Web;
 use crate::modelo::*;
@@ -203,6 +204,13 @@ pub fn rotas(estado: Estado) -> Router {
                 .get(Item(Avaliacoes, Ver), pacote)
                 .put(Item(Avaliacoes, Editar), salvar_avaliacao)
                 .delete(Item(Avaliacoes, Apagar), apagar_avaliacao),
+        )
+        .rota("/efeitos", metodos().get(Dentro, listar_efeitos))
+        .rota("/efeitos.txt", metodos().get(Dentro, listar_efeitos_texto))
+        .rota(
+            "/efeitos/{id}",
+            // O catálogo é de todos; quem cria rubricas cria e muda os tipos.
+            metodos().get(Dentro, ler_efeito).put(Sistema(Criar), salvar_efeito).delete(Sistema(Criar), apagar_efeito),
         )
         .rota("/avaliacoes/{id}/correcoes/{aluno}", metodos().patch(Item(Avaliacoes, Corrigir), alterar_correcao))
         .rota("/avaliacoes/{id}/notas.csv", metodos().get(Item(Avaliacoes, Exportar), exportar))
@@ -548,6 +556,16 @@ struct DadosAvaliacao {
     /// Origens cuja cópia deve ser refeita a partir da pasta.
     #[serde(default)]
     atualizar: Vec<String>,
+    /// Ids dos tipos de efeito, do catálogo.
+    #[serde(default)]
+    efeitos: Vec<String>,
+    #[serde(default)]
+    prazo: Option<String>,
+    #[serde(default)]
+    tolerancia: u32,
+    /// Tipos de efeito cuja cópia deve ser refeita a partir do catálogo.
+    #[serde(default)]
+    atualizar_efeitos: Vec<String>,
 }
 
 async fn listar_avaliacoes(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Res<Json<Value>> {
@@ -586,10 +604,22 @@ async fn pacote(State(e): State<Estado>, Extension(u): Extension<Quem>, Path(id)
     let turma = e.dados.ler_turma(&avaliacao.turma)?;
     let correcoes = e.dados.ler_correcoes(&id)?;
     let desatualizadas = e.dados.rubricas_desatualizadas(&avaliacao);
+    let efeitos_desatualizados = e.dados.efeitos_desatualizados(&avaliacao);
     let ead = ead::resumo(&e, &id)?;
+    let envios = e.dados.envios(&id)?;
     let arquivada = e.dados.arquivadas().contem(Tipo::Avaliacoes, &id);
     let acoes = e.visao(&u).acoes(Recurso::Item(Tipo::Avaliacoes, &id));
-    Ok(Json(json!({ "avaliacao": avaliacao, "turma": turma, "correcoes": correcoes, "desatualizadas": desatualizadas, "ead": ead, "arquivada": arquivada, "acoes": acoes })))
+    Ok(Json(json!({
+        "avaliacao": avaliacao,
+        "turma": turma,
+        "correcoes": correcoes,
+        "desatualizadas": desatualizadas,
+        "efeitos_desatualizados": efeitos_desatualizados,
+        "ead": ead,
+        "envios": envios,
+        "arquivada": arquivada,
+        "acoes": acoes,
+    })))
 }
 
 /// Pôr uma rubrica ou turma numa avaliação copia o conteúdo delas: pede poder
@@ -614,7 +644,8 @@ fn exigir_usar(e: &Estado, u: &Quem, id: Option<&str>, d: &DadosAvaliacao) -> Re
 
 fn gravar_avaliacao(d: &Dados, id: Option<&str>, a: DadosAvaliacao) -> dados::Res<Avaliacao> {
     let rubricas = a.rubricas.into_iter().map(|r| (r.origem, r.peso)).collect();
-    d.salvar_avaliacao(id, a.titulo.trim().to_string(), a.turma, a.nota_maxima, rubricas, &a.atualizar)
+    let efeitos = EscolhaEfeitos { ids: a.efeitos, prazo: a.prazo, tolerancia: a.tolerancia, atualizar: a.atualizar_efeitos };
+    d.salvar_avaliacao(id, a.titulo.trim().to_string(), a.turma, a.nota_maxima, rubricas, &a.atualizar, &efeitos)
 }
 
 async fn criar_avaliacao(State(e): State<Estado>, Extension(u): Extension<Quem>, Json(d): Json<DadosAvaliacao>) -> Res<Json<Avaliacao>> {
@@ -636,6 +667,48 @@ async fn apagar_avaliacao(State(e): State<Estado>, Path(id): Path<String>) -> Re
     e.apagar(Tipo::Avaliacoes, &id)
 }
 
+// ----- tipos de efeito -----
+
+/// Os problemas citam arquivos pelo nome: só quem vê tudo os vê.
+async fn listar_efeitos(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Res<Json<Value>> {
+    let (efeitos, problemas) = e.dados.listar_efeitos()?;
+    let problemas = if e.visao(&u).pode(Recurso::Sistema, Acao::VerTudo) { problemas } else { Vec::new() };
+    Ok(Json(json!({ "efeitos": efeitos, "problemas": problemas })))
+}
+
+/// Uma linha por tipo: `id | título | operação | sinal`.
+async fn listar_efeitos_texto(State(e): State<Estado>) -> Res<Response> {
+    let (efeitos, problemas) = e.dados.listar_efeitos()?;
+    let mut texto = String::new();
+    for t in &efeitos {
+        let op = serde_json::to_value(&t.operacao).ok().and_then(|v| v["tipo"].as_str().map(String::from)).unwrap_or_default();
+        let sinal = t.sugerir.map(|s| format!(" | sugere com {}", json!(s).as_str().unwrap_or(""))).unwrap_or_default();
+        texto.push_str(&format!("{} | {} | {op}{sinal}\n", t.id, t.titulo));
+    }
+    for p in problemas {
+        texto.push_str(&format!("! {p}\n"));
+    }
+    Ok(texto_puro(texto))
+}
+
+async fn ler_efeito(State(e): State<Estado>, Path(id): Path<String>) -> Res<Response> {
+    Ok(match id.strip_suffix(".toml") {
+        Some(id) => texto_puro(e.dados.efeito_toml(id)?),
+        None => Json(e.dados.ler_efeito(&id)?).into_response(),
+    })
+}
+
+/// Só em TOML, o arquivo inteiro; responde com uma linha.
+async fn salvar_efeito(State(e): State<Estado>, Path(id): Path<String>, corpo: String) -> Res<Response> {
+    let t = e.dados.salvar_efeito_toml(id_do_item(&id), &corpo)?;
+    Ok(texto_puro(format!("Gravado: efeitos/{}.toml ({})\n", t.id, t.titulo)))
+}
+
+async fn apagar_efeito(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {
+    e.dados.apagar_efeito(id_do_item(&id))?;
+    Ok(Json(json!({})))
+}
+
 // ----- correções -----
 
 #[derive(Deserialize)]
@@ -647,11 +720,29 @@ struct AlteracaoResposta {
 }
 
 #[derive(Deserialize)]
+struct AlteracaoEfeito {
+    efeito: String,
+    /// `null` tira o efeito.
+    aplicado: Option<EfeitoAplicado>,
+}
+
+#[derive(Deserialize)]
+struct AlteracaoDispensa {
+    efeito: String,
+    /// `null` desfaz a dispensa.
+    dispensa: Option<Dispensa>,
+}
+
+#[derive(Deserialize)]
 struct Alteracoes {
     #[serde(default)]
     respostas: Vec<AlteracaoResposta>,
     #[serde(default)]
     comentario_geral: Option<String>,
+    #[serde(default)]
+    efeitos: Vec<AlteracaoEfeito>,
+    #[serde(default)]
+    dispensadas: Vec<AlteracaoDispensa>,
 }
 
 async fn alterar_correcao(
@@ -661,7 +752,11 @@ async fn alterar_correcao(
     Json(a): Json<Alteracoes>,
 ) -> Res<Json<Value>> {
     let respostas = a.respostas.into_iter().map(|r| (r.rubrica, r.criterio, r.resposta)).collect();
-    let (correcao, recusadas) = e.dados.alterar_correcao(&id, &aluno, respostas, a.comentario_geral, &u.nome, auth::agora())?;
+    let efeitos = AlteracaoEfeitos {
+        efeitos: a.efeitos.into_iter().map(|x| (x.efeito, x.aplicado)).collect(),
+        dispensadas: a.dispensadas.into_iter().map(|x| (x.efeito, x.dispensa)).collect(),
+    };
+    let (correcao, recusadas) = e.dados.alterar_correcao(&id, &aluno, respostas, a.comentario_geral, efeitos, &u.nome, auth::agora())?;
     Ok(Json(json!({ "correcao": correcao, "recusadas": recusadas })))
 }
 

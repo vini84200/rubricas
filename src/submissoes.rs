@@ -249,6 +249,8 @@ impl Destino {
     }
 }
 
+const ENVIOS: &str = ".envios.json";
+
 impl Dados {
     pub(crate) fn pasta_submissoes(&self, avaliacao: &str) -> Res<PathBuf> {
         checar_id(avaliacao)?;
@@ -270,6 +272,26 @@ impl Dados {
 
     pub(crate) fn apelidos(&self, turma: &str) -> Res<BTreeMap<String, String>> {
         Ok(ler_json(&self.arquivo_apelidos(turma)?)?.unwrap_or_default())
+    }
+
+    /// Quando cada aluno enviou no Moodle (`"AAAA-MM-DDTHH:MM"`), da planilha de notas.
+    pub fn envios(&self, avaliacao: &str) -> Res<BTreeMap<String, String>> {
+        Ok(ler_json(&self.pasta_submissoes(avaliacao)?.join(ENVIOS))?.unwrap_or_default())
+    }
+
+    /// Guarda as datas lidas da planilha. Quem está nela fica com a data dela (ou
+    /// sem data, se não enviou); quem não está fica com a que tinha.
+    pub fn gravar_envios(&self, avaliacao: &str, lidas: &BTreeMap<String, Option<String>>) -> Res<()> {
+        let caminho = self.pasta_submissoes(avaliacao)?.join(ENVIOS);
+        let _g = self.travar();
+        let mut envios: BTreeMap<String, String> = ler_json(&caminho)?.unwrap_or_default();
+        for (aluno, data) in lidas {
+            match data {
+                Some(d) => envios.insert(aluno.clone(), d.clone()),
+                None => envios.remove(aluno),
+            };
+        }
+        Ok(gravar(&caminho, serde_json::to_string_pretty(&envios).unwrap().as_bytes())?)
     }
 
     /// Guarda as submissões do ZIP. Quem está no ZIP tem a submissão substituída;
@@ -514,7 +536,7 @@ pub(crate) mod testes {
         )
         .unwrap();
         d.criar_turma("d", "matricula,nome\n1,Ana Souza\n2,Bruno Lima\n3,João Prado\n").unwrap();
-        d.salvar_avaliacao(None, "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
+        d.salvar_avaliacao(None, "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &Default::default()).unwrap();
         (raiz, d)
     }
 
@@ -565,8 +587,8 @@ pub(crate) mod testes {
         .unwrap();
         // Ana e Bruno já foram corrigidos; João não.
         let marca = || vec![("codigo".into(), "funciona".into(), Some(Resposta { marcacao: Marcacao::Binaria { atende: true }, comentario: String::new() }))];
-        d.alterar_correcao("ead", "1", marca(), None, "vini", 20).unwrap();
-        d.alterar_correcao("ead", "2", marca(), None, "vini", 20).unwrap();
+        d.alterar_correcao("ead", "1", marca(), None, Default::default(), "vini", 20).unwrap();
+        d.alterar_correcao("ead", "2", marca(), None, Default::default(), "vini", 20).unwrap();
 
         let r = d
             .importar_submissoes(
@@ -591,7 +613,7 @@ pub(crate) mod testes {
         assert!(!s.alunos["3"].mudou_depois_da_correcao, "sem correção não há o que avisar");
         // as marcações continuam lá; mexer na correção depois apaga o aviso
         assert_eq!(d.ler_correcao("ead", "1").unwrap().unwrap().respostas["codigo"].len(), 1);
-        d.alterar_correcao("ead", "1", marca(), None, "vini", 40).unwrap();
+        d.alterar_correcao("ead", "1", marca(), None, Default::default(), "vini", 40).unwrap();
         assert!(!d.submissoes("ead").unwrap().alunos["1"].mudou_depois_da_correcao);
         std::fs::remove_dir_all(&raiz).unwrap();
     }
@@ -611,7 +633,7 @@ pub(crate) mod testes {
         assert_eq!(d.arquivo_submissao("ead", "2", "main.py").unwrap(), b"b1");
 
         // o próximo ZIP, mesmo de outra avaliação da turma, já casa sozinho
-        d.salvar_avaliacao(None, "EAD 2".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
+        d.salvar_avaliacao(None, "EAD 2".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &[], &Default::default()).unwrap();
         let r = d.importar_submissoes("ead-2", &zip(&[("Bruninho L._7_assignsubmission_file_/main.py", "b2")]), 20).unwrap();
         assert!(r.sem_dono.is_empty());
         assert_eq!(d.arquivo_submissao("ead-2", "2", "main.py").unwrap(), b"b2");

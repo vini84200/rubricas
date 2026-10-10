@@ -1,6 +1,6 @@
 ---
 name: rubricas
-description: Cria, lê e altera rubricas e pipelines de checagem automática no servidor Rubricas (rubrica.vini84200.cc) pela API em TOML. Use quando o usuário pedir para criar, montar, ajustar ou revisar uma rubrica, um critério, um roteiro de correção, ou as checagens automáticas (casos de teste, pytest, estilo, plágio) de uma avaliação de EAD.
+description: Cria, lê e altera rubricas e pipelines de checagem automática no servidor Rubricas (rubrica.vini84200.cc) pela API em TOML. Use quando o usuário pedir para criar, montar, ajustar ou revisar uma rubrica, um critério, um roteiro de correção, ou as checagens automáticas (casos de teste, pytest, estilo, plágio) de uma avaliação de EAD, ou os tipos de efeito sobre a nota (zero por plágio, desconto por atraso, bônus).
 ---
 
 # Rubricas
@@ -107,3 +107,29 @@ comando = "python3 -m py_compile $PROGRAMA"
 - **Casos:** cubra os exemplos do enunciado e as bordas que a especificação cita (entrada vazia, negativo, limite). Os prompts do `input("Digite…")` não entram na saída comparada, porque cada aluno escreve o seu: em `saida`, ponha só o que o programa imprime com `print`. Um prompt feito com `print("Digite:")` antes do `input()` continua na saída: se o enunciado não padroniza isso, prefira comparar com `pytest`. `considerar_prompts = true` (na checagem) os mantém; `ignorar_maiusculas = true` e `argumentos = ["x"]` também são opcionais.
 - **Plágio:** `base` é o código dado a todos (não conta como cópia); `referencias` é uma pasta de anexos com soluções conhecidas.
 - **Executor:** o servidor nunca roda código. Quem roda é `rubricas executor --servidor URL` (podman), no notebook ou noutra máquina.
+
+## Efeitos sobre a nota
+
+Tipos de efeito (zero por plágio, desconto por atraso, bônus) mudam a nota final do aluno depois das rubricas. Ficam num catálogo à parte. Cada avaliação escolhe os seus pela tela "Editar" e guarda uma cópia deles.
+
+```sh
+curl -sfH "$A" "$RUBRICAS_URL/api/efeitos.txt"                       # id | título | operação [| sugere com …]
+curl -sfH "$A" "$RUBRICAS_URL/api/efeitos/ID.toml"
+curl -sH "$A" -X PUT --data-binary @efeito.toml "$RUBRICAS_URL/api/efeitos/ID.toml"
+```
+
+```toml
+titulo = "Desconto por atraso"
+descricao = "Um ponto por dia, até cinco."     # opcional
+operacao = { tipo = "por_unidade", pontos = -1.0, limite = -5.0 }
+sugerir = "atraso"       # opcional: "atraso" ou "plagio"
+feedback = true          # opcional (padrão true): false não manda o texto ao aluno pelo Moodle
+encerra = false          # opcional: true conta a correção como concluída sem marcar critérios
+```
+
+- **Operações:** `fixar { nota }`, `multiplicar { fator }`, `somar { pontos }` (negativo subtrai), `por_unidade { pontos, limite?, unidade? }` (unidade `"dia"`, o padrão, ou `"hora"`), `teto { nota }`.
+- **Valor aberto:** o valor pode ser `"na_hora"`. Quem aplica digita o número e é obrigado a justificar.
+- **Ordem fixa na conta:** primeiro `multiplicar`, depois `somar` e `por_unidade`, depois `teto`. `fixar` vence tudo. A nota final fica entre 0 e a nota máxima.
+- **Sinais:** `sugerir = "atraso"` usa o prazo da avaliação e a data de envio da planilha do Moodle. `sugerir = "plagio"` usa o limiar do JPlag do pipeline. Nos dois casos é só uma sugestão: quem avalia decide.
+- **Unidades de atraso:** cada dia começado conta inteiro. No `por_unidade`, `limite` tem o mesmo sinal de `pontos`.
+
