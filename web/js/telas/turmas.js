@@ -2,7 +2,8 @@
 import { html, useState } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { ir, rota, plural } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { sessao, pode } from '../sessao.js';
 
 function LinhaTurma(t) {
   return html`
@@ -21,11 +22,11 @@ export function ListaTurmas() {
   return html`
     <div class="tela">
     <${Titulo} titulo="Turmas">
-      <a class="botao primario" href="#/turmas/nova">Nova turma</a>
+      ${sessao.pode('criar') && html`<a class="botao primario" href="#/turmas/nova">Nova turma</a>`}
     <//>
     <${Estado} ...${estado} />
     ${dados && !dados.length && html`
-      <${Vazio} titulo="Nenhuma turma ainda">
+      <${Vazio} titulo=${sessao.pode('criar') ? 'Nenhuma turma ainda' : 'Nenhuma turma compartilhada com você'}>
         <p class="suave">Cole uma lista de alunos ou coloque um CSV com as colunas matrícula e nome na pasta <code>turmas</code>.</p>
       <//>
     `}
@@ -142,12 +143,12 @@ export function DetalheTurma({ id }) {
   return html`
     <div class="tela">
     <${Titulo} titulo=${id} voltar=${{ href: '#/turmas', texto: 'Turmas' }}>
-      <button class="botao" onClick=${() => setTrocando(!trocando)}>Substituir lista</button>
-      ${dados && !dados.arquivada && html`<button class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
-      <button class="botao perigo" onClick=${apagar}>Apagar</button>
+      ${pode(dados, 'editar') && html`<button class="botao" onClick=${() => setTrocando(!trocando)}>Substituir lista</button>`}
+      ${dados && !dados.arquivada && pode(dados, 'arquivar') && html`<button class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
+      ${pode(dados, 'apagar') && html`<button class="botao perigo" onClick=${apagar}>Apagar</button>`}
     <//>
     <${Estado} ...${estado} recarregar=${recarregar} />
-    ${dados?.arquivada && html`<${AvisoArquivada} texto="Turma arquivada: fica fora da lista e da escolha de turma nas avaliações novas." aoDesarquivar=${alternarArquivada} />`}
+    ${dados?.arquivada && pode(dados, 'arquivar') && html`<${AvisoArquivada} texto="Turma arquivada: fica fora da lista e da escolha de turma nas avaliações novas." aoDesarquivar=${alternarArquivada} />`}
     ${erro && html`<p class="erro" role="alert">${erro}</p>`}
     ${trocando && html`
       <form class="formulario" onSubmit=${substituir}>
@@ -168,6 +169,7 @@ export function DetalheTurma({ id }) {
         </tbody>
       </table>
     `}
+    ${pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${`/turmas/${encodeURIComponent(id)}`} pasta="turmas" />`}
     </div>
   `;
 }

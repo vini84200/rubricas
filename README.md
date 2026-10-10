@@ -18,8 +18,10 @@ O binário é único: a aplicação web vai embutida nele.
 | Comando | O que faz |
 | --- | --- |
 | `rubricas servir [--dados DIR] [--endereco IP:PORTA] [--web DIR]` | Sobe o servidor. `--web` serve a pasta `web/` do disco em vez da embutida, para desenvolver sem recompilar. |
-| `rubricas usuario NOME [--dados DIR]` | Cria o usuário ou troca a senha. Com `RUBRICAS_SENHA` no ambiente, não pergunta. |
-| `rubricas usuario NOME --remover` | Remove o usuário; as sessões dele deixam de valer na hora. |
+| `rubricas usuario NOME [--dados DIR] [--papel P]` | Cria o usuário ou troca a senha. Com `RUBRICAS_SENHA` no ambiente, não pergunta. O primeiro usuário é admin; os seguintes, monitor, a menos que `--papel` diga outro. Num usuário que já existe, `--papel` troca só o papel. Veja [Permissões](#permissões). |
+| `rubricas usuario NOME --remover` | Remove o usuário e os acessos dele; as sessões dele deixam de valer na hora. |
+| `rubricas compartilhar TIPO ID USUARIO PAPEL [--remover]` | Dá (ou tira) um papel numa `avaliacao`, `rubrica` ou `turma`. |
+| `rubricas politica` | Mostra a política de permissões em uso (Rego). |
 | `rubricas token NOME [--remover]` | Cria o token de API do usuário (substitui o anterior) ou o remove. Veja [Claude e scripts](#claude-e-scripts). |
 | `rubricas skill instalar` | Copia a skill do Claude Code para `~/.claude/skills/rubricas/`. |
 | `rubricas executor --servidor URL [--continuo]` | Roda as checagens pendentes em contêineres podman. Veja [EAD](#ead-submissões-do-moodle-e-checagens). |
@@ -38,7 +40,9 @@ dados/
   arquivadas.toml                 rubricas, turmas e avaliações arquivadas (listas de ids)
   pipelines/<avaliacao>/          pipeline.toml e anexos (testes.py, esqueleto.py, referencias/)
   relatorios/<avaliacao>/         resultado das checagens por aluno e do JPlag
-  usuarios.toml                   usuários, hashes Argon2id das senhas e SHA-256 dos tokens
+  usuarios.toml                   usuários, papel global, hashes Argon2id das senhas e SHA-256 dos tokens
+  acessos.toml                    quem tem que papel em cada avaliação, rubrica e turma
+  politica.rego                   (opcional) política de permissões própria, no lugar da embutida
   .sessoes.json                   sessões abertas (só o hash de cada token)
 ```
 
@@ -227,7 +231,8 @@ editado direto na pasta é notado em até 10 minutos.
 
 Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
 servidor com `rubricas token NOME`, mostrado uma vez só e guardado como SHA-256. Ele tem os mesmos
-poderes do usuário e deixa de valer quando o usuário troca a senha ou é removido.
+poderes do usuário (as mesmas [permissões](#permissões)) e deixa de valer quando o usuário troca a
+senha ou é removido. As listas em texto mostram só o que o dono do token pode ver.
 **Notas de volta ao Moodle.** Na tarefa, com o feedback "Planilha de notas offline" ligado, baixe
 "Planilha de notas" e mande o arquivo em "Preencher planilha do Moodle" na tela da avaliação: a
 mesma planilha volta preenchida, pronta para "Carregar planilha de notas" na tarefa. Cada linha
@@ -258,16 +263,60 @@ o arquivo inteiro não muda identidades. A skill em `claude/skills/rubricas/SKIL
 Claude Code. Instale com `rubricas skill instalar` e defina `RUBRICAS_URL` e `RUBRICAS_TOKEN` no
 ambiente da máquina onde o Claude roda.
 
+## Permissões
+
+Cada usuário tem um **papel global**:
+
+| Papel | Pode |
+| --- | --- |
+| `admin` | tudo, em tudo; cria, remove e muda o papel de usuários (aba Usuários) |
+| `professor` | criar avaliações, rubricas e turmas, e vira dono do que cria |
+| `monitor` | só o que compartilharem com ele |
+| `executor` | pegar a fila de checagens e baixar pipeline e código de qualquer avaliação, sem ver notas (o token do `rubricas executor`) |
+
+Em cada avaliação, rubrica ou turma, alguém pode ter um **papel no item**, dado em "Compartilhar"
+(no fim da página do item, para quem é dono) ou com `rubricas compartilhar`:
+
+| Papel no item | Avaliação | Rubrica e turma |
+| --- | --- | --- |
+| `leitor` | vê notas, código e relatórios; baixa as notas | vê (e usa a rubrica ou turma em avaliações próprias) |
+| `avaliador` | + corrige e edita o código do aluno | — |
+| `editor` | + altera a avaliação, envia ZIPs, mexe nas checagens, arquiva | + altera e arquiva |
+| `dono` | + apaga e compartilha | + apaga e compartilha |
+
+Os casos do dia a dia: o professor cria a avaliação e dá `avaliador` ao monitor da turma; o monitor
+abre a lista e vê só ela. Para usar a rubrica de um colega, ele lhe dá `leitor` na rubrica. Uma
+avaliação compartilhada não leva junto a turma nem as rubricas de origem: quem a edita continua
+podendo salvá-la com elas, mas só troca por outras que possa ver. Não dá para tirar o último dono
+de um item nem o último admin do sistema. Apagar um item ou um usuário apaga os acessos dele.
+Usuários que existiam antes das permissões (sem papel em `usuarios.toml`) são admin. Quem só pode
+ver uma avaliação e abre a tela de avaliar volta para as notas. Ao perder o acesso, a cópia guardada
+no aparelho é apagada na próxima vez que ele tentar abrir a avaliação com rede. Editar uma turma muda
+a lista de alunos de todas as avaliações que a usam, inclusive as que o editor não vê.
+
+**Como funciona.** A regra está em Rego, a linguagem do [Open Policy Agent](https://www.openpolicyagent.org/),
+em `src/politica.rego`, avaliada dentro do servidor pelo [regorus](https://github.com/microsoft/regorus).
+A política recebe quem pede (nome e papel global), o item e o papel concedido nele, e devolve as
+ações permitidas (`ver`, `exportar`, `corrigir`, `editar`, `arquivar`, `apagar`, `compartilhar`,
+`ler_checagens`; e no sistema, `criar`, `gerir_usuarios`, `executar`, `ver_tudo`). Cada rota da API
+declara a ação que exige numa tabela em `src/api.rs`; rota fora da tabela é negada, e um teste
+confere que toda rota registrada está nela. As listas mostram só o que se pode ver, e cada item
+vem com as suas `acoes`, que a tela usa para esconder os botões que não valem.
+
+Para mudar a regra (por exemplo, monitores verem todas as rubricas), grave
+`rubricas politica > dados/politica.rego`, edite e reinicie o servidor. Uma política com erro
+impede o servidor de subir, em vez de liberar ou negar tudo às cegas.
+
 ## Autenticação e publicação
 
-- Usuários e tokens são criados só pela linha de comando; não há cadastro pela web.
+- Usuários são criados pela linha de comando ou, por um admin, na aba Usuários. Tokens de API só
+  pela linha de comando. Cada um troca a própria senha clicando no nome, no alto da tela.
 - Sessão por cookie `HttpOnly`, `SameSite=Strict`, 30 dias; ganha `Secure` quando o pedido chega
   com `X-Forwarded-Proto: https`.
 - Trocar a senha, remover ou recriar um usuário encerra as sessões abertas dele.
 - "Sair" sem conexão não consegue encerrar a sessão no servidor na hora: o aparelho volta à tela
   de entrada e encerra a sessão assim que a rede voltar.
 - Oito senhas erradas para o mesmo usuário bloqueiam novas tentativas por até 10 minutos.
-- Todos os usuários veem e editam tudo: não há papéis nem separação por turma.
 
 O padrão é escutar só em `127.0.0.1`. Para usar no celular, publique atrás de um proxy com HTTPS
 (navegadores só instalam PWA e ativam o modo offline em HTTPS ou em `localhost`). Com Caddy:

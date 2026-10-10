@@ -7,6 +7,8 @@ import { ListaRubricas, EditorRubrica } from './telas/rubricas.js';
 import { ListaTurmas, NovaTurma, DetalheTurma } from './telas/turmas.js';
 import { Avaliar } from './telas/avaliar.js';
 import { TelaChecagens, Acompanhar } from './telas/ead.js';
+import { Usuarios, Conta } from './telas/usuarios.js';
+import { sessao } from './sessao.js';
 
 function lerRota() {
   const partes = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map((p) => {
@@ -21,6 +23,8 @@ function lerRota() {
 
 function Tela({ partes }) {
   const [secao, a, b] = partes;
+  if (secao === 'usuarios') return html`<${Usuarios} />`;
+  if (secao === 'conta') return html`<${Conta} />`;
   if (secao === 'rubricas') {
     if (!a) return html`<${ListaRubricas} />`;
     return html`<${EditorRubrica} key=${a} id=${a === 'nova' ? null : a} />`;
@@ -44,18 +48,19 @@ const SECOES = [
 ];
 
 function Moldura({ usuario, partes, aoSair }) {
-  const atual = SECOES.some(([s]) => s === partes[0]) ? partes[0] : 'avaliacoes';
+  const secoes = sessao.pode('gerir_usuarios') ? [...SECOES, ['usuarios', 'Usuários']] : SECOES;
+  const atual = secoes.some(([s]) => s === partes[0]) || partes[0] === 'conta' ? partes[0] : 'avaliacoes';
   return html`
     <div class="moldura">
       <header class="topo">
         <a class="marca" href="#/avaliacoes">Rubricas</a>
         <nav class="abas" aria-label="Seções">
-          ${SECOES.map(
+          ${secoes.map(
             ([s, nome]) => html`<a href="#/${s}" class=${cls('aba', s === atual && 'atual')} aria-current=${s === atual ? 'page' : null}>${nome}</a>`,
           )}
         </nav>
         <div class="conta">
-          <span class="conta-nome">${usuario}</span>
+          <a class="conta-nome" href="#/conta" title="Sua conta e senha" aria-current=${atual === 'conta' ? 'page' : null}>${usuario}</a>
           <button class="botao-texto" onClick=${aoSair}>Sair</button>
         </div>
       </header>
@@ -116,7 +121,9 @@ function App() {
   const [expirou, setExpirou] = useState(false);
   const [erroFila, setErroFila] = useState('');
 
-  function definir(nome) {
+  function definir(nome, dados) {
+    if (dados) sessao.definir(dados);
+    else if (!nome) sessao.definir(null);
     fila.usarUsuario(nome);
     setUsuario(nome);
     if (nome) {
@@ -134,7 +141,7 @@ function App() {
       }
       const r = await api('GET', '/sessao');
       setSemRede(false);
-      definir(r.usuario);
+      definir(r.usuario, r);
     } catch (e) {
       if (e.semRede) {
         // Sem rede, quem já entrou neste aparelho segue com o que está guardado.
@@ -189,7 +196,7 @@ function App() {
       if (e.semRede) localStorage.setItem(SAIDA_PENDENTE, '1');
     }
     for (const k of Object.keys(localStorage)) {
-      if (k.startsWith('rubricas.pacote.') || k === 'rubricas.usuario') localStorage.removeItem(k);
+      if (k.startsWith('rubricas.pacote.') || k === 'rubricas.usuario' || k === 'rubricas.sessao') localStorage.removeItem(k);
     }
     definir(null);
   }
@@ -199,7 +206,7 @@ function App() {
     return html`
       <div class="raiz">
         ${semRede && html`<div class="faixa-aviso">Sem conexão com o servidor.</div>`}
-        <${Entrar} expirou=${expirou} aoEntrar=${(u) => { localStorage.removeItem(SAIDA_PENDENTE); definir(u); fila.enviarAgora(); }} />
+        <${Entrar} expirou=${expirou} aoEntrar=${() => { localStorage.removeItem(SAIDA_PENDENTE); verificar(); fila.enviarAgora(); }} />
       </div>
     `;
   }

@@ -1,7 +1,8 @@
 //! Rotas da correção de EAD: submissões do Moodle, pipelines, executor e a tela
 //! "Acompanhar" (SSE).
 
-use crate::api::{Erro, Estado, Res, Usuario, marca_arquivada, texto_puro};
+use crate::api::{Erro, Estado, Res, marca_arquivada, texto_puro};
+use crate::permissoes::{Quem, Recurso};
 use crate::auth;
 use crate::dados::{Dados, Tipo};
 use crate::fila::{ResultadoPlagio, Tarefa};
@@ -160,16 +161,20 @@ pub fn resumo(e: &Estado, id: &str) -> Res<Value> {
 }
 
 /// Trabalho pesado de disco (ZIP, hashes) fora do executor assíncrono.
-async fn bloqueante<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
+pub(crate) async fn bloqueante<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
     tokio::task::spawn_blocking(f).await.map_err(|_| Erro(StatusCode::INTERNAL_SERVER_ERROR, "Falha interna".into()))?
 }
 
 // ----- avaliações em texto (para o Claude) -----
 
-async fn avaliacoes_texto(State(e): State<Estado>) -> Res<Response> {
+async fn avaliacoes_texto(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Res<Response> {
     let mut texto = String::new();
     let arquivadas = e.dados.arquivadas();
+    let visao = e.visao(&u);
     for a in e.dados.listar_avaliacoes()? {
+        if !visao.pode(Recurso::Item(Tipo::Avaliacoes, &a.id), "ver") {
+            continue;
+        }
         let rubricas: Vec<&str> = a.rubricas.iter().map(|r| r.origem.as_str()).collect();
         let pipeline = if e.dados.pipeline_toml(&a.id)?.is_some() { "com pipeline" } else { "sem pipeline" };
         let arquivada = marca_arquivada(arquivadas.contem(Tipo::Avaliacoes, &a.id));
@@ -252,13 +257,13 @@ async fn submissao(State(e): State<Estado>, Path((id, aluno)): Path<(String, Str
 /// Mudança pontual do professor no código do aluno; as checagens rodam de novo.
 async fn editar_arquivo(
     State(e): State<Estado>,
-    Extension(u): Extension<Usuario>,
+    Extension(u): Extension<Quem>,
     Path((id, aluno, caminho)): Path<(String, String, String)>,
     corpo: Bytes,
 ) -> Res<Json<Value>> {
     let dados = e.dados.clone();
     let r = bloqueante(move || {
-        dados.editar_arquivo(&id, &aluno, &caminho, &corpo, &u.0, auth::agora())?;
+        dados.editar_arquivo(&id, &aluno, &caminho, &corpo, &u.nome, auth::agora())?;
         json_submissao(&dados, &id, &aluno)
     })
     .await?;
@@ -269,13 +274,13 @@ async fn editar_arquivo(
 /// Volta o arquivo ao que o aluno enviou.
 async fn desfazer_edicao(
     State(e): State<Estado>,
-    Extension(u): Extension<Usuario>,
+    Extension(u): Extension<Quem>,
     Path((id, aluno, caminho)): Path<(String, String, String)>,
 ) -> Res<Json<Value>> {
     let dados = e.dados.clone();
     let r = bloqueante(move || {
         let original = dados.arquivo_original(&id, &aluno, &caminho)?;
-        dados.editar_arquivo(&id, &aluno, &caminho, &original, &u.0, auth::agora())?;
+        dados.editar_arquivo(&id, &aluno, &caminho, &original, &u.nome, auth::agora())?;
         json_submissao(&dados, &id, &aluno)
     })
     .await?;
@@ -326,11 +331,13 @@ async fn baixar_jplag(State(e): State<Estado>, Path(id): Path<String>) -> Res<Re
 // ----- pipelines -----
 
 /// Uma linha por avaliação com pipeline: id | checagens | anexos | pendentes.
-async fn pipelines_texto(State(e): State<Estado>) -> Res<Response> {
+async fn pipelines_texto(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Res<Response> {
     let dados = e.dados.clone();
+    let permissoes = e.permissoes.clone();
     let texto = bloqueante(move || {
+        let visao = permissoes.visao(&u);
         let mut texto = String::new();
-        for a in dados.listar_avaliacoes()? {
+        for a in dados.listar_avaliacoes()?.into_iter().filter(|a| visao.pode(Recurso::Item(Tipo::Avaliacoes, &a.id), "ver")) {
             if dados.pipeline_toml(&a.id)?.is_none() {
                 continue;
             }
@@ -451,8 +458,8 @@ async fn gravar_jplag(State(e): State<Estado>, Path(id): Path<String>, corpo: By
 
 // ----- acompanhar -----
 
-async fn definir_foco(State(e): State<Estado>, Extension(u): Extension<Usuario>, Json(f): Json<Foco>) -> Json<Value> {
-    e.avisos.foco(&u.0).send_if_modified(|atual| {
+async fn definir_foco(State(e): State<Estado>, Extension(u): Extension<Quem>, Json(f): Json<Foco>) -> Json<Value> {
+    e.avisos.foco(&u.nome).send_if_modified(|atual| {
         let mudou = atual.as_ref() != Some(&f);
         *atual = Some(f);
         mudou
@@ -461,8 +468,8 @@ async fn definir_foco(State(e): State<Estado>, Extension(u): Extension<Usuario>,
 }
 
 /// O foco atual na hora de conectar e um evento a cada troca de aluno.
-async fn eventos_foco(State(e): State<Estado>, Extension(u): Extension<Usuario>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let mut rx = e.avisos.foco(&u.0).subscribe();
+async fn eventos_foco(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = e.avisos.foco(&u.nome).subscribe();
     let evento = |f: &Option<Foco>| Ok(Event::default().event("foco").json_data(f).unwrap_or_default());
     let primeiro = evento(&rx.borrow_and_update());
     let mudancas = stream::unfold(rx, move |mut rx| async move {

@@ -605,6 +605,11 @@ export function Avaliar({ id, alunoId }) {
   async function carregar() {
     try {
       const p = await carregarPacote(id);
+      // Quem só pode ver não marca nada aqui: as marcações seriam recusadas depois.
+      if (p.acoes && !p.acoes.includes('corrigir')) {
+        ir(rota('avaliacoes', id));
+        return;
+      }
       setCorrecoes(p.correcoes);
       setPacote(p);
       setErro(null);

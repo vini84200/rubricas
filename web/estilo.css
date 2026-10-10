@@ -114,6 +114,8 @@ button:disabled { cursor: default; opacity: .45; }
 .aba.atual { background: var(--giz); color: var(--tinta); }
 .conta { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 15px; }
 .conta .botao-texto { color: inherit; }
+.conta-nome { color: inherit; padding: 8px 4px; }
+.conta-nome[aria-current] { text-decoration: none; font-weight: 700; }
 
 .conteudo { max-width: 860px; margin: 0 auto; padding: 24px 16px 120px; }
 
@@ -124,7 +126,7 @@ button:disabled { cursor: default; opacity: .45; }
     background: var(--quadro); justify-content: space-around;
   }
   .aba { flex: 1; text-align: center; padding: 10px 6px; }
-  .conta-nome { display: none; }
+  .conta-nome { max-width: 38vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 
 .alerta-fila {
@@ -897,3 +899,24 @@ label.botao.ocupado { opacity: .6; cursor: progress; }
 .painel-codigo.grande .editor-fundo, .painel-codigo.grande .editor-area { font-size: 17px; }
 .folha .editor-barra { position: sticky; bottom: 0; z-index: 2; }
 @media (pointer: coarse) { .editor-dica { display: none; } .editor-barra .botao { flex: 1; } }
+
+/* ---------- Compartilhar e usuários ---------- */
+
+/* Agrupa campos (para desabilitar todos de uma vez) sem mexer no layout. */
+fieldset.limpo { display: contents; }
+fieldset.limpo:disabled .icone, fieldset.limpo:disabled .acoes-lista { display: none; }
+
+.compartilhar { margin-top: 32px; padding-top: 8px; border-top: 1.5px solid var(--linha); }
+.compartilhar > summary { font-weight: 700; cursor: pointer; padding: 10px 0; }
+.acessos { list-style: none; margin: 0 0 12px; padding: 0; }
+.acessos > li { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.acesso-nome { flex: 1 1 8em; min-width: 0; overflow-wrap: anywhere; }
+.acessos select { flex: 0 1 22em; width: auto; }
+.acesso-novo { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.acesso-novo select { flex: 1 1 14em; width: auto; }
+
+.usuarios { margin-bottom: 32px; }
+.usuario { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 4px; }
+.usuario-nome { flex: 1 1 10em; font-weight: 700; }
+.usuario select { flex: 0 1 22em; width: auto; }
+.usuario .erro { flex-basis: 100%; margin: 0; }

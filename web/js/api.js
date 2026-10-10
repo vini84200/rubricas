@@ -111,7 +111,7 @@ async function enviar() {
       erro = e;
     }
     if (dono !== deQuem) break; // trocou de usuário durante o envio
-    if (erro && erro.status !== 404 && erro.status !== 422) {
+    if (erro && erro.status !== 403 && erro.status !== 404 && erro.status !== 422) {
       // Sem rede, sessão vencida ou servidor com problema: o lote fica na fila.
       falhando = true;
       if (!erro.semRede && erro.status !== 401) ultimoErro = erro.message;
@@ -131,7 +131,7 @@ async function enviar() {
     falhando = false;
     espera = 1000;
     if (erro) {
-      // 404: o aluno saiu da turma ou a avaliação foi apagada.
+      // 404: o aluno saiu da turma ou a avaliação foi apagada; 403: tiraram o seu acesso.
       ultimoErro = `As marcações de ${aluno} em “${avaliacao}” não foram salvas: ${erro.message}`;
       recusas += 1;
     } else {
@@ -254,6 +254,8 @@ export async function carregarPacote(id) {
     pacote = await api('GET', `/avaliacoes/${encodeURIComponent(id)}`);
     guardar(chavePacote, pacote);
   } catch (e) {
+    // Sem acesso (revogado) ou apagada: a cópia deste aparelho também some.
+    if (e.status === 403 || e.status === 404) localStorage.removeItem(chavePacote);
     if (!e.semRede) throw e;
     pacote = recuperar(chavePacote);
     if (!pacote) throw e;

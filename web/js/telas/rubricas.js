@@ -3,7 +3,8 @@ import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { TIPOS, maximo, maximoRubrica, ehRoteiro, contarCriterios, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, chave, cls, pts, guarda } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { sessao, pode } from '../sessao.js';
 
 function LinhaRubrica(r) {
   return html`
@@ -22,12 +23,12 @@ export function ListaRubricas() {
   return html`
     <div class="tela">
     <${Titulo} titulo="Rubricas">
-      <a class="botao primario" href="#/rubricas/nova">Nova rubrica</a>
+      ${sessao.pode('criar') && html`<a class="botao primario" href="#/rubricas/nova">Nova rubrica</a>`}
     <//>
     <${Estado} ...${estado} />
     ${dados?.problemas.map((p) => html`<p class="aviso erro" role="alert">Arquivo ignorado — ${p}</p>`)}
     ${dados && !dados.rubricas.length && html`
-      <${Vazio} titulo="Nenhuma rubrica ainda">
+      <${Vazio} titulo=${sessao.pode('criar') ? 'Nenhuma rubrica ainda' : 'Nenhuma rubrica compartilhada com você'}>
         <p class="suave">Monte uma aqui ou coloque arquivos <code>.toml</code> na pasta <code>rubricas</code>.</p>
       <//>
     `}
@@ -440,18 +441,22 @@ export function EditorRubrica({ id }) {
   }
   if (!r) return null;
 
+  // Quem só pode ver enxerga tudo aberto e nada editável.
+  const soLeitura = !!id && !pode(dados, 'editar');
   const soCriterios = contarCriterios(r);
   const total = r.criterios.reduce((s, c) => s + maximoRascunho(c) * (Number.isFinite(lerNum(c.peso)) ? lerNum(c.peso) : 0), 0);
 
   return html`
     <div class="tela">
     <${Titulo} titulo=${id ? r.titulo || 'Rubrica' : 'Nova rubrica'} voltar=${{ href: '#/rubricas', texto: 'Rubricas' }}>
-      ${id && html`<button type="button" class="botao" onClick=${copiar} disabled=${sujo}>Duplicar</button>`}
-      ${id && !arquivada && html`<button type="button" class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
-      ${id && html`<button type="button" class="botao perigo" onClick=${apagar}>Apagar</button>`}
+      ${id && sessao.pode('criar') && html`<button type="button" class="botao" onClick=${copiar} disabled=${sujo}>Duplicar</button>`}
+      ${id && !arquivada && pode(dados, 'arquivar') && html`<button type="button" class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
+      ${id && pode(dados, 'apagar') && html`<button type="button" class="botao perigo" onClick=${apagar}>Apagar</button>`}
     <//>
-    ${arquivada && html`<${AvisoArquivada} texto="Rubrica arquivada: fica fora da lista e da escolha de rubricas nas avaliações. Quem já a usa continua igual." aoDesarquivar=${alternarArquivada} />`}
+    ${soLeitura && html`<p class="aviso">${sessao.pode('criar') ? 'Você pode ver esta rubrica e usá-la nas suas avaliações, mas não alterá-la. Para adaptar, duplique.' : 'Você pode ver esta rubrica, mas não alterá-la.'}</p>`}
+    ${arquivada && pode(dados, 'arquivar') && html`<${AvisoArquivada} texto="Rubrica arquivada: fica fora da lista e da escolha de rubricas nas avaliações. Quem já a usa continua igual." aoDesarquivar=${alternarArquivada} />`}
     <form class="formulario editor" onSubmit=${salvar}>
+      <fieldset class="limpo" disabled=${soLeitura}>
       <label class="campo">
         <span>Título</span>
         <input required maxlength="120" placeholder="Trabalho final: código" value=${r.titulo} onInput=${(e) => mudar({ ...r, titulo: e.target.value })} />
@@ -466,7 +471,7 @@ export function EditorRubrica({ id }) {
       <div class="criterios">
         ${r.criterios.map((c, i) => {
           const props = {
-            c, i, total: r.criterios.length, aberto: abertos.has(c._k), alternar: () => alternar(c._k),
+            c, i, total: r.criterios.length, aberto: soLeitura || abertos.has(c._k), alternar: () => alternar(c._k),
             aoMudar: (novo) => mudarCriterios(r.criterios.map((x) => (x._k === c._k ? novo : x))),
             aoMover: (d) => mudarCriterios(mover(r.criterios, i, d)),
             aoRemover: () => mudarCriterios(r.criterios.filter((x) => x._k !== c._k)),
@@ -481,7 +486,8 @@ export function EditorRubrica({ id }) {
         <button type="button" class="botao" onClick=${() => adicionar(passoNovo())}>Adicionar passo de roteiro</button>
       </div>
 
-      <div class="barra-salvar">
+      </fieldset>
+      ${!soLeitura && html`<div class="barra-salvar">
         <span class="barra-info">
           ${resumoItens(r)}, ${pts(total)}
           ${sujo && html`<span class="pendente"> — alterações não salvas</span>`}
@@ -489,8 +495,9 @@ export function EditorRubrica({ id }) {
         </span>
         ${erro && html`<span class="erro" role="alert">${erro}</span>`}
         <button class="botao primario" disabled=${ocupado || (!sujo && !!id)}>${ocupado ? 'Salvando…' : id ? 'Salvar' : 'Criar rubrica'}</button>
-      </div>
+      </div>`}
     </form>
+    ${id && pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${`/rubricas/${encodeURIComponent(id)}`} pasta="rubricas" />`}
     </div>
   `;
 }

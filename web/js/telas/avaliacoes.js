@@ -3,7 +3,8 @@ import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api, carregarPacote } from '../api.js';
 import { calcular, maximoRubrica, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { sessao, pode } from '../sessao.js';
 import { textoPlagio } from '../codigo.js';
 
 function LinhaAvaliacao(a) {
@@ -14,7 +15,7 @@ function LinhaAvaliacao(a) {
         <span class="linha-meta">${a.turma}, ${a.concluidos} de ${plural(a.alunos, 'aluno', 'alunos')}</span>
         <${Progresso} concluidos=${a.concluidos} iniciados=${a.iniciados} total=${a.alunos} />
       </a>
-      <a class="botao primario" href=${`#${rota('avaliar', a.id)}`}>Avaliar</a>
+      ${pode(a, 'corrigir') && html`<a class="botao primario" href=${`#${rota('avaliar', a.id)}`}>Avaliar</a>`}
     </li>
   `;
 }
@@ -25,10 +26,15 @@ export function ListaAvaliacoes() {
   return html`
     <div class="tela">
     <${Titulo} titulo="Avaliações">
-      <a class="botao primario" href="#/avaliacoes/nova">Nova avaliação</a>
+      ${sessao.pode('criar') && html`<a class="botao primario" href="#/avaliacoes/nova">Nova avaliação</a>`}
     <//>
     <${Estado} ...${estado} />
-    ${dados && !dados.length && html`
+    ${dados && !dados.length && !sessao.pode('criar') && html`
+      <${Vazio} titulo="Nenhuma avaliação compartilhada com você">
+        <p class="suave">Quando alguém der acesso a você numa avaliação, ela aparece aqui.</p>
+      <//>
+    `}
+    ${dados && !dados.length && sessao.pode('criar') && html`
       <${Vazio} titulo="Nenhuma avaliação ainda">
         <p class="suave">Uma avaliação junta uma turma e as rubricas que você vai usar para corrigir. Você precisa de pelo menos uma <a href="#/rubricas">rubrica</a> e uma <a href="#/turmas">turma</a>.</p>
       <//>
@@ -73,6 +79,8 @@ export function FormAvaliacao({ id }) {
 
   // Arquivadas só aparecem se já estão escolhidas, para não sumirem da avaliação.
   const turmasVisiveis = turmas.dados.filter((t) => !t.arquivada || t.id === f.turma);
+  // A turma de uma avaliação compartilhada pode não estar compartilhada com quem edita.
+  if (f.turma && atual.dados && !turmasVisiveis.some((t) => t.id === f.turma)) turmasVisiveis.push(atual.dados.turma);
   // Rubricas da pasta, mais as que a avaliação já usa e foram apagadas de lá.
   const opcoes = rubricas.dados.rubricas.filter((r) => !r.arquivada || r.id in f.escolhidas);
   for (const ra of atual.dados?.avaliacao.rubricas || []) {
@@ -239,12 +247,12 @@ export function Resultados({ id }) {
   return html`
     <div class="tela">
     <${Titulo} titulo=${a.titulo} voltar=${{ href: '#/avaliacoes', texto: 'Avaliações' }}>
-      <a class="botao primario" href=${`#${rota('avaliar', id)}`}>Avaliar</a>
+      ${pode(pacote, 'corrigir') && html`<a class="botao primario" href=${`#${rota('avaliar', id)}`}>Avaliar</a>`}
     <//>
     ${pacote.offline && html`<p class="aviso">Sem conexão: mostrando a última cópia guardada neste aparelho.</p>`}
     ${aviso && html`<p class="aviso erro" role="alert">${aviso}</p>`}
-    ${pacote.arquivada && html`<${AvisoArquivada} texto="Avaliação arquivada: fica fora da lista e o executor não roda mais as checagens dela. As notas continuam aqui." aoDesarquivar=${alternarArquivada} />`}
-    ${desatualizadas.length > 0 && html`
+    ${pacote.arquivada && pode(pacote, 'arquivar') && html`<${AvisoArquivada} texto="Avaliação arquivada: fica fora da lista e o executor não roda mais as checagens dela. As notas continuam aqui." aoDesarquivar=${alternarArquivada} />`}
+    ${desatualizadas.length > 0 && pode(pacote, 'editar') && html`
       <p class="aviso">
         ${desatualizadas.length === 1 ? 'Uma rubrica mudou' : 'Rubricas mudaram'} na pasta depois de entrar nesta avaliação. As correções continuam usando a cópia antiga.
         <button class="botao pequeno" onClick=${atualizarCopias}>Atualizar cópia</button>
@@ -255,15 +263,17 @@ export function Resultados({ id }) {
       <${Progresso} concluidos=${concluidos} iniciados=${iniciados} total=${turma.alunos.length} />
     </div>
 
-    <${Entregas} id=${id} ead=${ead} alunos=${turma.alunos} aoMudar=${carregar} />
+    ${(ead || pode(pacote, 'editar')) && html`<${Entregas} id=${id} ead=${ead} alunos=${turma.alunos} aoMudar=${carregar} editar=${pode(pacote, 'editar')} />`}
 
     <div class="acoes acoes-notas">
-      <a class="botao pequeno" href=${csv} download>Baixar notas (CSV)</a>
-      <a class="botao pequeno" href=${`${csv}?br=1`} download>CSV para Excel em português</a>
-      <${PlanilhaMoodle} id=${id} />
-      <a class="botao pequeno" href=${`#${rota('avaliacoes', id, 'editar')}`}>Editar</a>
-      ${!pacote.arquivada && html`<button class="botao pequeno" onClick=${alternarArquivada}>Arquivar</button>`}
-      <button class="botao pequeno perigo" onClick=${apagar}>Apagar</button>
+      ${pode(pacote, 'exportar') && html`
+        <a class="botao pequeno" href=${csv} download>Baixar notas (CSV)</a>
+        <a class="botao pequeno" href=${`${csv}?br=1`} download>CSV para Excel em português</a>
+        <${PlanilhaMoodle} id=${id} />
+      `}
+      ${pode(pacote, 'editar') && html`<a class="botao pequeno" href=${`#${rota('avaliacoes', id, 'editar')}`}>Editar</a>`}
+      ${!pacote.arquivada && pode(pacote, 'arquivar') && html`<button class="botao pequeno" onClick=${alternarArquivada}>Arquivar</button>`}
+      ${pode(pacote, 'apagar') && html`<button class="botao pequeno perigo" onClick=${apagar}>Apagar</button>`}
     </div>
 
     <div class="rolagem">
@@ -297,6 +307,7 @@ export function Resultados({ id }) {
         </tbody>
       </table>
     </div>
+    ${pode(pacote, 'compartilhar') && !pacote.offline && html`<${Compartilhar} caminho=${`/avaliacoes/${encodeURIComponent(id)}`} pasta="avaliacoes" />`}
     </div>
   `;
 }
@@ -378,7 +389,7 @@ function quando(segundos) {
 }
 
 /** Envio do ZIP do Moodle, quem ficou sem dono e a fila do executor. */
-function Entregas({ id, ead, alunos, aoMudar }) {
+function Entregas({ id, ead, alunos, aoMudar, editar }) {
   const [enviando, setEnviando] = useState(false);
   const [msg, setMsg] = useState(null);
   const base = `/avaliacoes/${encodeURIComponent(id)}`;
@@ -414,7 +425,7 @@ function Entregas({ id, ead, alunos, aoMudar }) {
     }
   }
 
-  const botao = html`
+  const botao = editar && html`
     <label class=${cls('botao', 'pequeno', enviando && 'ocupado')}>
       <input type="file" accept=".zip,application/zip" class="escondido" disabled=${enviando} onChange=${enviar} />
       ${enviando ? 'Enviando…' : ead ? 'Enviar novo ZIP' : 'Enviar submissões do Moodle (ZIP)'}
@@ -448,7 +459,7 @@ function Entregas({ id, ead, alunos, aoMudar }) {
         </div>
       </div>
       ${msg && html`<p class=${msg.ok ? 'ok' : 'erro'} role="status">${msg.texto}</p>`}
-      ${ead.sem_dono.length > 0 && html`
+      ${ead.sem_dono.length > 0 && editar && html`
         <div class="sem-dono">
           <p><strong>Sem dono:</strong> estes nomes do Moodle não casaram com ninguém da turma. Escolha o aluno; a associação vale para os próximos ZIPs.</p>
           <ul>
