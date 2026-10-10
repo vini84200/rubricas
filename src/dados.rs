@@ -6,11 +6,12 @@
 //!   turmas/<id>.csv                 matricula,nome
 //!   avaliacoes/<id>.json            título, turma e cópia das rubricas usadas
 //!   correcoes/<avaliacao>/<aluno>.json
+//!   arquivadas.toml                 ids de rubricas, turmas e avaliações fora das listas
 //!   usuarios.toml                   criado por `rubricas usuario <nome>`
 //! ```
 
 use crate::modelo::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::{fs, io};
@@ -89,6 +90,64 @@ pub struct Recusada {
     pub motivo: String,
 }
 
+/// O que se arquiva. Cada um é um arquivo `<pasta>/<id>.<ext>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tipo {
+    Rubricas,
+    Turmas,
+    Avaliacoes,
+}
+
+impl Tipo {
+    fn pasta(self) -> &'static str {
+        match self {
+            Tipo::Rubricas => "rubricas",
+            Tipo::Turmas => "turmas",
+            Tipo::Avaliacoes => "avaliacoes",
+        }
+    }
+
+    fn extensao(self) -> &'static str {
+        match self {
+            Tipo::Rubricas => "toml",
+            Tipo::Turmas => "csv",
+            Tipo::Avaliacoes => "json",
+        }
+    }
+}
+
+/// Ids arquivados: somem das listas e das escolhas, mas continuam no disco e
+/// funcionando. Fica num arquivo à parte porque turma é CSV e não tem onde marcar.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Arquivadas {
+    #[serde(default)]
+    rubricas: BTreeSet<String>,
+    #[serde(default)]
+    turmas: BTreeSet<String>,
+    #[serde(default)]
+    avaliacoes: BTreeSet<String>,
+}
+
+impl Arquivadas {
+    fn ids_mut(&mut self, tipo: Tipo) -> &mut BTreeSet<String> {
+        match tipo {
+            Tipo::Rubricas => &mut self.rubricas,
+            Tipo::Turmas => &mut self.turmas,
+            Tipo::Avaliacoes => &mut self.avaliacoes,
+        }
+    }
+
+    pub fn contem(&self, tipo: Tipo, id: &str) -> bool {
+        let ids = match tipo {
+            Tipo::Rubricas => &self.rubricas,
+            Tipo::Turmas => &self.turmas,
+            Tipo::Avaliacoes => &self.avaliacoes,
+        };
+        ids.contains(id)
+    }
+}
+
 impl Dados {
     pub fn abrir(raiz: impl Into<PathBuf>) -> io::Result<Self> {
         let raiz = raiz.into();
@@ -132,6 +191,54 @@ impl Dados {
         }
         ids.sort_by_key(|a| a.to_lowercase());
         Ok(ids)
+    }
+
+    // ----- arquivadas -----
+
+    fn ler_arquivadas(&self) -> Res<Arquivadas> {
+        match ler_opcional(&self.raiz.join("arquivadas.toml"))? {
+            None => Ok(Arquivadas::default()),
+            Some(t) => toml::from_str(&t).map_err(|e| Erro::Invalido(format!("arquivadas.toml: {}", erro_toml(&t, &e)))),
+        }
+    }
+
+    /// Para mostrar: um arquivo estragado à mão vale como nada arquivado, em vez
+    /// de derrubar as listas, a tela de avaliar e a fila. Arquivar pela tela mostra o erro.
+    pub fn arquivadas(&self) -> Arquivadas {
+        self.ler_arquivadas().unwrap_or_else(|e| {
+            eprintln!("arquivadas.toml ignorado: {e:?}");
+            Arquivadas::default()
+        })
+    }
+
+    /// Arquiva (`true`) ou devolve às listas (`false`).
+    pub fn arquivar(&self, tipo: Tipo, id: &str, arquivada: bool) -> Res<()> {
+        let _g = self.trava.lock().unwrap();
+        let caminho = self.caminho(tipo.pasta(), id, tipo.extensao())?;
+        // Desarquivar não exige o arquivo: limpa um id que sumiu por fora.
+        if arquivada && !caminho.is_file() {
+            return Err(Erro::NaoEncontrado(format!("“{id}” não existe em {}/", tipo.pasta())));
+        }
+        self.marcar_arquivada(tipo, id, arquivada)
+    }
+
+    /// Ao apagar: o item já se foi, e um `arquivadas.toml` ruim não deve virar erro do apagar.
+    fn esquecer_arquivada(&self, tipo: Tipo, id: &str) {
+        if let Err(e) = self.marcar_arquivada(tipo, id, false) {
+            eprintln!("{}/{id} apagado, mas continua em arquivadas.toml: {e:?}", tipo.pasta());
+        }
+    }
+
+    /// Precisa da trava já tomada.
+    fn marcar_arquivada(&self, tipo: Tipo, id: &str, arquivada: bool) -> Res<()> {
+        let mut a = self.ler_arquivadas()?;
+        let ids = a.ids_mut(tipo);
+        let mudou = if arquivada { ids.insert(id.to_string()) } else { ids.remove(id) };
+        if mudou {
+            let texto = toml::to_string_pretty(&a).map_err(|e| Erro::Invalido(e.to_string()))?;
+            gravar(&self.raiz.join("arquivadas.toml"), texto.as_bytes())?;
+        }
+        Ok(())
     }
 
     // ----- rubricas -----
@@ -202,7 +309,11 @@ impl Dados {
         let caminho = self.caminho("rubricas", id, "toml")?;
         match fs::remove_file(caminho) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("Rubrica “{id}” não existe"))),
-            outro => Ok(outro?),
+            outro => {
+                outro?;
+                self.esquecer_arquivada(Tipo::Rubricas, id);
+                Ok(())
+            }
         }
     }
 
@@ -255,7 +366,11 @@ impl Dados {
         let caminho = self.caminho("turmas", id, "csv")?;
         match fs::remove_file(caminho) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("Turma “{id}” não existe"))),
-            outro => Ok(outro?),
+            outro => {
+                outro?;
+                self.esquecer_arquivada(Tipo::Turmas, id);
+                Ok(())
+            }
         }
     }
 
@@ -346,6 +461,7 @@ impl Dados {
                 _ => {}
             }
         }
+        self.esquecer_arquivada(Tipo::Avaliacoes, id);
         Ok(())
     }
 
@@ -506,6 +622,56 @@ pontos = 1.0
         // erro de validação também é recusado e não toca no arquivo
         assert!(matches!(d.salvar_rubrica_toml("codigo", "titulo = \"x\"\n"), Err(Erro::Invalido(_))));
         assert_eq!(d.ler_rubrica("codigo").unwrap(), r);
+        fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
+    fn arquivar_e_desarquivar() {
+        let raiz = pasta("arquivar");
+        let d = Dados::abrir(&raiz).unwrap();
+        fs::write(raiz.join("rubricas/codigo.toml"), RUBRICA).unwrap();
+        d.salvar_turma("Turma D", "1,Ana\n", true).unwrap();
+        d.salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
+
+        d.arquivar(Tipo::Rubricas, "codigo", true).unwrap();
+        d.arquivar(Tipo::Turmas, "Turma D", true).unwrap();
+        d.arquivar(Tipo::Avaliacoes, "tf", true).unwrap();
+        let a = d.arquivadas();
+        assert!(a.contem(Tipo::Rubricas, "codigo") && a.contem(Tipo::Turmas, "Turma D") && a.contem(Tipo::Avaliacoes, "tf"));
+        assert!(!a.contem(Tipo::Turmas, "codigo"));
+        // um arquivo só, legível e editável à mão
+        assert!(fs::read_to_string(raiz.join("arquivadas.toml")).unwrap().contains("\"Turma D\""));
+
+        // arquivar de novo não duplica; desarquivar devolve
+        d.arquivar(Tipo::Turmas, "Turma D", true).unwrap();
+        d.arquivar(Tipo::Turmas, "Turma D", false).unwrap();
+        assert!(!d.arquivadas().contem(Tipo::Turmas, "Turma D"));
+
+        // o que não existe não se arquiva
+        assert!(matches!(d.arquivar(Tipo::Rubricas, "sumiu", true), Err(Erro::NaoEncontrado(_))));
+        assert!(matches!(d.arquivar(Tipo::Rubricas, "../usuarios", true), Err(Erro::Invalido(_))));
+
+        // apagar tira do arquivo: recriar com o mesmo nome não nasce arquivado
+        d.arquivar(Tipo::Turmas, "Turma D", true).unwrap();
+        d.apagar_avaliacao("tf").unwrap();
+        d.apagar_turma("Turma D").unwrap();
+        d.apagar_rubrica("codigo").unwrap();
+        let a = d.arquivadas();
+        assert!(!a.contem(Tipo::Rubricas, "codigo") && !a.contem(Tipo::Turmas, "Turma D") && !a.contem(Tipo::Avaliacoes, "tf"));
+
+        // um id cujo arquivo sumiu por fora ainda pode ser desarquivado
+        fs::write(raiz.join("arquivadas.toml"), "turmas = [\"sumiu\"]\n").unwrap();
+        d.arquivar(Tipo::Turmas, "sumiu", false).unwrap();
+        assert!(!d.arquivadas().contem(Tipo::Turmas, "sumiu"));
+
+        // o arquivo estragado à mão não derruba a leitura (nada arquivado) nem o apagar;
+        // só gravar por cima dele é recusado, para não perder o que estava lá
+        d.salvar_turma("Turma E", "1,Ana\n", true).unwrap();
+        fs::write(raiz.join("arquivadas.toml"), "turmas = [").unwrap();
+        assert!(!d.arquivadas().contem(Tipo::Turmas, "Turma E"));
+        assert!(matches!(d.arquivar(Tipo::Turmas, "Turma E", true), Err(Erro::Invalido(_))));
+        d.apagar_turma("Turma E").unwrap();
+        assert_eq!(fs::read_to_string(raiz.join("arquivadas.toml")).unwrap(), "turmas = [");
         fs::remove_dir_all(&raiz).unwrap();
     }
 

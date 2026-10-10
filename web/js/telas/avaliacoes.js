@@ -3,11 +3,25 @@ import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api, carregarPacote } from '../api.js';
 import { calcular, maximoRubrica, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, Progresso } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
 import { textoPlagio } from '../codigo.js';
+
+function LinhaAvaliacao(a) {
+  return html`
+    <li class="linha-avaliacao">
+      <a class="linha" href=${`#${rota('avaliacoes', a.id)}`}>
+        <span class="linha-titulo">${a.titulo}</span>
+        <span class="linha-meta">${a.turma}, ${a.concluidos} de ${plural(a.alunos, 'aluno', 'alunos')}</span>
+        <${Progresso} concluidos=${a.concluidos} iniciados=${a.iniciados} total=${a.alunos} />
+      </a>
+      <a class="botao primario" href=${`#${rota('avaliar', a.id)}`}>Avaliar</a>
+    </li>
+  `;
+}
 
 export function ListaAvaliacoes() {
   const { dados, ...estado } = useDados('/avaliacoes');
+  const ativas = dados?.filter((a) => !a.arquivada) || [];
   return html`
     <div class="tela">
     <${Titulo} titulo="Avaliações">
@@ -19,20 +33,8 @@ export function ListaAvaliacoes() {
         <p class="suave">Uma avaliação junta uma turma e as rubricas que você vai usar para corrigir. Você precisa de pelo menos uma <a href="#/rubricas">rubrica</a> e uma <a href="#/turmas">turma</a>.</p>
       <//>
     `}
-    ${dados?.length > 0 && html`
-      <ul class="lista">
-        ${dados.map((a) => html`
-          <li class="linha-avaliacao">
-            <a class="linha" href=${`#${rota('avaliacoes', a.id)}`}>
-              <span class="linha-titulo">${a.titulo}</span>
-              <span class="linha-meta">${a.turma}, ${a.concluidos} de ${plural(a.alunos, 'aluno', 'alunos')}</span>
-              <${Progresso} concluidos=${a.concluidos} iniciados=${a.iniciados} total=${a.alunos} />
-            </a>
-            <a class="botao primario" href=${`#${rota('avaliar', a.id)}`}>Avaliar</a>
-          </li>
-        `)}
-      </ul>
-    `}
+    ${ativas.length > 0 && html`<ul class="lista">${ativas.map(LinhaAvaliacao)}</ul>`}
+    ${dados && html`<${ListaArquivadas} itens=${dados.filter((a) => a.arquivada)} linha=${LinhaAvaliacao} />`}
     </div>
   `;
 }
@@ -58,7 +60,8 @@ export function FormAvaliacao({ id }) {
   }, [atual.dados]);
 
   useEffect(() => {
-    if (f && !f.turma && turmas.dados?.length === 1) setF({ ...f, turma: turmas.dados[0].id });
+    const ativas = turmas.dados?.filter((t) => !t.arquivada);
+    if (f && !f.turma && ativas?.length === 1) setF({ ...f, turma: ativas[0].id });
   }, [turmas.dados, f]);
 
   const carregando = rubricas.carregando || turmas.carregando || atual.carregando;
@@ -68,8 +71,10 @@ export function FormAvaliacao({ id }) {
     return html`<div class="tela"><${Titulo} titulo=${id ? 'Editar avaliação' : 'Nova avaliação'} voltar=${volta} /><${Estado} carregando=${carregando} erro=${erroCarga} /></div>`;
   }
 
+  // Arquivadas só aparecem se já estão escolhidas, para não sumirem da avaliação.
+  const turmasVisiveis = turmas.dados.filter((t) => !t.arquivada || t.id === f.turma);
   // Rubricas da pasta, mais as que a avaliação já usa e foram apagadas de lá.
-  const opcoes = [...rubricas.dados.rubricas];
+  const opcoes = rubricas.dados.rubricas.filter((r) => !r.arquivada || r.id in f.escolhidas);
   for (const ra of atual.dados?.avaliacao.rubricas || []) {
     if (!opcoes.some((r) => r.id === ra.origem)) opcoes.push({ ...ra.rubrica, id: ra.origem, _soCopia: true });
   }
@@ -118,7 +123,7 @@ export function FormAvaliacao({ id }) {
           <span>Turma</span>
           <select required value=${f.turma} onChange=${(e) => setF({ ...f, turma: e.target.value })}>
             <option value="" disabled>Escolha a turma</option>
-            ${turmas.dados.map((t) => html`<option value=${t.id}>${t.id} (${t.alunos.length})</option>`)}
+            ${turmasVisiveis.map((t) => html`<option value=${t.id}>${t.id} (${t.alunos.length})${t.arquivada ? ', arquivada' : ''}</option>`)}
           </select>
         </label>
         <label class="campo curto">
@@ -126,11 +131,11 @@ export function FormAvaliacao({ id }) {
           <input class="numero" inputmode="decimal" required value=${f.nota_maxima} onInput=${(e) => setF({ ...f, nota_maxima: e.target.value })} />
         </label>
       </div>
-      ${!turmas.dados.length && html`<p class="aviso">Nenhuma turma cadastrada. <a href="#/turmas/nova">Criar uma turma</a></p>`}
+      ${!turmasVisiveis.length && html`<p class="aviso">${turmas.dados.length ? 'Todas as turmas estão arquivadas.' : 'Nenhuma turma cadastrada.'} <a href="#/turmas/nova">Criar uma turma</a></p>`}
 
       <fieldset class="campo">
         <legend>Rubricas</legend>
-        ${!opcoes.length && html`<p class="aviso">Nenhuma rubrica cadastrada. <a href="#/rubricas/nova">Montar uma rubrica</a></p>`}
+        ${!opcoes.length && html`<p class="aviso">${rubricas.dados.rubricas.length ? 'Todas as rubricas estão arquivadas.' : 'Nenhuma rubrica cadastrada.'} <a href="#/rubricas/nova">Montar uma rubrica</a></p>`}
         <ul class="escolhas">
           ${opcoes.map((r) => {
             const marcada = r.id in f.escolhidas;
@@ -140,7 +145,7 @@ export function FormAvaliacao({ id }) {
                   <input type="checkbox" checked=${marcada} onChange=${() => alternar(r.id)} />
                   <span>
                     <span class="linha-titulo">${r.titulo}</span>
-                    <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}${r._soCopia ? ' (só existe a cópia desta avaliação)' : ''}</span>
+                    <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}${r._soCopia ? ' (só existe a cópia desta avaliação)' : ''}${r.arquivada ? ' (arquivada)' : ''}</span>
                   </span>
                 </label>
                 ${marcada && ordem.length > 1 && html`
@@ -211,6 +216,15 @@ export function Resultados({ id }) {
     }
   }
 
+  async function alternarArquivada() {
+    try {
+      await arquivar(`/avaliacoes/${encodeURIComponent(id)}`, !pacote.arquivada);
+      carregar();
+    } catch (e) {
+      setAviso(e.message);
+    }
+  }
+
   async function apagar() {
     if (!confirm(`Apagar a avaliação “${a.titulo}” e todas as correções dela?`)) return;
     try {
@@ -229,6 +243,7 @@ export function Resultados({ id }) {
     <//>
     ${pacote.offline && html`<p class="aviso">Sem conexão: mostrando a última cópia guardada neste aparelho.</p>`}
     ${aviso && html`<p class="aviso erro" role="alert">${aviso}</p>`}
+    ${pacote.arquivada && html`<${AvisoArquivada} texto="Avaliação arquivada: fica fora da lista e o executor não roda mais as checagens dela. As notas continuam aqui." aoDesarquivar=${alternarArquivada} />`}
     ${desatualizadas.length > 0 && html`
       <p class="aviso">
         ${desatualizadas.length === 1 ? 'Uma rubrica mudou' : 'Rubricas mudaram'} na pasta depois de entrar nesta avaliação. As correções continuam usando a cópia antiga.
@@ -247,6 +262,7 @@ export function Resultados({ id }) {
       <a class="botao pequeno" href=${`${csv}?br=1`} download>CSV para Excel em português</a>
       <${PlanilhaMoodle} id=${id} />
       <a class="botao pequeno" href=${`#${rota('avaliacoes', id, 'editar')}`}>Editar</a>
+      ${!pacote.arquivada && html`<button class="botao pequeno" onClick=${alternarArquivada}>Arquivar</button>`}
       <button class="botao pequeno perigo" onClick=${apagar}>Apagar</button>
     </div>
 

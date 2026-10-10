@@ -2,10 +2,22 @@
 import { html, useState } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { ir, rota, plural } from '../util.js';
-import { useDados, Estado, Titulo, Vazio } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
+
+function LinhaTurma(t) {
+  return html`
+    <li>
+      <a class="linha" href=${`#${rota('turmas', t.id)}`}>
+        <span class="linha-titulo">${t.id}</span>
+        <span class="linha-meta">${t.alunos.length ? plural(t.alunos.length, 'aluno', 'alunos') : 'arquivo ilegível'}</span>
+      </a>
+    </li>
+  `;
+}
 
 export function ListaTurmas() {
   const { dados, ...estado } = useDados('/turmas');
+  const ativas = dados?.filter((t) => !t.arquivada) || [];
   return html`
     <div class="tela">
     <${Titulo} titulo="Turmas">
@@ -17,18 +29,8 @@ export function ListaTurmas() {
         <p class="suave">Cole uma lista de alunos ou coloque um CSV com as colunas matrícula e nome na pasta <code>turmas</code>.</p>
       <//>
     `}
-    ${dados?.length > 0 && html`
-      <ul class="lista">
-        ${dados.map((t) => html`
-          <li>
-            <a class="linha" href=${`#${rota('turmas', t.id)}`}>
-              <span class="linha-titulo">${t.id}</span>
-              <span class="linha-meta">${t.alunos.length ? plural(t.alunos.length, 'aluno', 'alunos') : 'arquivo ilegível'}</span>
-            </a>
-          </li>
-        `)}
-      </ul>
-    `}
+    ${ativas.length > 0 && html`<ul class="lista">${ativas.map(LinhaTurma)}</ul>`}
+    ${dados && html`<${ListaArquivadas} itens=${dados.filter((t) => t.arquivada)} linha=${LinhaTurma} />`}
     </div>
   `;
 }
@@ -117,6 +119,16 @@ export function DetalheTurma({ id }) {
     }
   }
 
+  async function alternarArquivada() {
+    setErro('');
+    try {
+      await arquivar(`/turmas/${encodeURIComponent(id)}`, !dados.arquivada);
+      recarregar();
+    } catch (err) {
+      setErro(err.message);
+    }
+  }
+
   async function apagar() {
     if (!confirm(`Apagar a turma ${id}? O arquivo turmas/${id}.csv será removido.`)) return;
     try {
@@ -131,9 +143,11 @@ export function DetalheTurma({ id }) {
     <div class="tela">
     <${Titulo} titulo=${id} voltar=${{ href: '#/turmas', texto: 'Turmas' }}>
       <button class="botao" onClick=${() => setTrocando(!trocando)}>Substituir lista</button>
+      ${dados && !dados.arquivada && html`<button class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
       <button class="botao perigo" onClick=${apagar}>Apagar</button>
     <//>
     <${Estado} ...${estado} recarregar=${recarregar} />
+    ${dados?.arquivada && html`<${AvisoArquivada} texto="Turma arquivada: fica fora da lista e da escolha de turma nas avaliações novas." aoDesarquivar=${alternarArquivada} />`}
     ${erro && html`<p class="erro" role="alert">${erro}</p>`}
     ${trocando && html`
       <form class="formulario" onSubmit=${substituir}>

@@ -62,3 +62,29 @@ export function Progresso({ concluidos, iniciados = 0, total }) {
     </div>
   `;
 }
+
+/** Arquiva (`true`) ou desarquiva o recurso em `caminho` (`/turmas/…`). */
+export function arquivar(caminho, arquivada) {
+  return api('PUT', `${caminho}/arquivada`, { arquivada });
+}
+
+/** Os itens arquivados ficam fechados no fim da lista, a um toque de distância. */
+export function ListaArquivadas({ itens, linha }) {
+  if (!itens.length) return null;
+  return html`
+    <details class="arquivadas">
+      <summary>Arquivadas (${itens.length})</summary>
+      <ul class="lista">${itens.map(linha)}</ul>
+    </details>
+  `;
+}
+
+/** Faixa no alto de um item arquivado, com o desfazer à mão. */
+export function AvisoArquivada({ texto, aoDesarquivar }) {
+  return html`
+    <p class="aviso">
+      ${texto}
+      <button class="botao pequeno" onClick=${aoDesarquivar}>Desarquivar</button>
+    </p>
+  `;
+}

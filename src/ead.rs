@@ -1,9 +1,9 @@
 //! Rotas da correção de EAD: submissões do Moodle, pipelines, executor e a tela
 //! "Acompanhar" (SSE).
 
-use crate::api::{Erro, Estado, Res, Usuario, texto_puro};
+use crate::api::{Erro, Estado, Res, Usuario, marca_arquivada, texto_puro};
 use crate::auth;
-use crate::dados::Dados;
+use crate::dados::{Dados, Tipo};
 use crate::fila::{ResultadoPlagio, Tarefa};
 use crate::moodle;
 use crate::pipeline::Relatorio;
@@ -168,10 +168,12 @@ async fn bloqueante<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'stat
 
 async fn avaliacoes_texto(State(e): State<Estado>) -> Res<Response> {
     let mut texto = String::new();
+    let arquivadas = e.dados.arquivadas();
     for a in e.dados.listar_avaliacoes()? {
         let rubricas: Vec<&str> = a.rubricas.iter().map(|r| r.origem.as_str()).collect();
         let pipeline = if e.dados.pipeline_toml(&a.id)?.is_some() { "com pipeline" } else { "sem pipeline" };
-        texto.push_str(&format!("{} | {} | turma {} | rubricas: {} | {pipeline}\n", a.id, a.titulo, a.turma, rubricas.join(", ")));
+        let arquivada = marca_arquivada(arquivadas.contem(Tipo::Avaliacoes, &a.id));
+        texto.push_str(&format!("{} | {} | turma {} | rubricas: {} | {pipeline}{arquivada}\n", a.id, a.titulo, a.turma, rubricas.join(", ")));
     }
     Ok(texto_puro(texto))
 }

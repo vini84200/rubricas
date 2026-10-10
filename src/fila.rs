@@ -12,7 +12,7 @@
 //! trabalho está pendente enquanto não há relatório dessa versão, ou enquanto o
 //! relatório tem erro de execução.
 
-use crate::dados::{Dados, Erro, Res, checar_id, gravar, ler_opcional};
+use crate::dados::{Dados, Erro, Res, Tipo, checar_id, gravar, ler_opcional};
 use crate::executor::MOTOR;
 use crate::pipeline::{self, Pipeline, Relatorio, Situacao};
 use crate::submissoes::{Arquivos, InfoArquivo, listar, resumo};
@@ -183,7 +183,11 @@ impl Dados {
         Ok(fila)
     }
 
+    /// Vazia se a avaliação está arquivada: o executor não roda mais nada dela.
     pub fn fila_da_avaliacao(&self, avaliacao: &str, p: &Pipeline) -> Res<Vec<Tarefa>> {
+        if self.arquivadas().contem(Tipo::Avaliacoes, avaliacao) {
+            return Ok(Vec::new());
+        }
         let vp = self.versao_pipeline(avaliacao)?;
         let subs = self.submissoes(avaliacao)?;
         let rel = self.pasta_relatorios(avaliacao)?;
@@ -428,6 +432,14 @@ saida = "1"
         assert!(d.relatorio("ead", "1").unwrap().unwrap().1, "relatório da versão editada é o atual");
 
         d.salvar_pipeline_toml("ead", &PIPELINE.replace("saida = \"1\"", "saida = \"2\"")).unwrap();
+        assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
+
+        // avaliação arquivada não roda mais nada; desarquivada, volta
+        d.arquivar(Tipo::Avaliacoes, "ead", true).unwrap();
+        assert!(pendentes(&d).is_empty());
+        let p = d.ler_pipeline("ead").unwrap().unwrap();
+        assert!(d.fila_da_avaliacao("ead", &p).unwrap().is_empty(), "nada aguardando o executor");
+        d.arquivar(Tipo::Avaliacoes, "ead", false).unwrap();
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
         std::fs::remove_dir_all(&raiz).unwrap();
     }

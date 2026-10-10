@@ -9,7 +9,7 @@ Cada rubrica é um arquivo TOML no servidor. Leia só a que vai mudar e grave o 
 
 ```sh
 A="Authorization: Bearer $RUBRICAS_TOKEN"
-curl -sfH "$A" "$RUBRICAS_URL/api/rubricas.txt"                  # id | título | critérios | passos
+curl -sfH "$A" "$RUBRICAS_URL/api/rubricas.txt"                  # id | título | critérios | passos [| arquivada]
 curl -sfH "$A" "$RUBRICAS_URL/api/rubricas/ID.toml"              # o arquivo
 curl -sH "$A" -X PUT --data-binary @arq.toml "$RUBRICAS_URL/api/rubricas/ID.toml"   # grava ou cria
 ```
@@ -64,7 +64,7 @@ escala = { tipo = "ponto_unico", esperado = "Estado em structs; salva em arquivo
 Uma avaliação pode ter um pipeline: checagens que o executor roda no código de cada aluno e que viram **sugestões** de marcação no cartão (quem decide é o professor). O pipeline pertence à avaliação e usa os ids dos critérios das rubricas dela.
 
 ```sh
-curl -sfH "$A" "$RUBRICAS_URL/api/avaliacoes.txt"                      # id | título | turma | rubricas | com/sem pipeline
+curl -sfH "$A" "$RUBRICAS_URL/api/avaliacoes.txt"                      # id | título | turma | rubricas | com/sem pipeline [| arquivada]
 curl -sfH "$A" "$RUBRICAS_URL/api/pipelines.txt"                        # id | checagens | anexos | pendentes
 curl -sfH "$A" "$RUBRICAS_URL/api/pipelines/AV/pipeline.toml"           # o pipeline
 curl -sH "$A" -X PUT --data-binary @pipeline.toml "$RUBRICAS_URL/api/pipelines/AV/pipeline.toml"

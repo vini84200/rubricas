@@ -35,6 +35,7 @@ dados/
   submissoes/<avaliacao>/<aluno>/ arquivos enviados pelo aluno (do ZIP do Moodle)
   submissoes/<avaliacao>/.edicoes/<aluno>/  mudanças do professor sobre esses arquivos
   apelidos/<turma>.json           nome no Moodle → aluno, das associações feitas à mão
+  arquivadas.toml                 rubricas, turmas e avaliações arquivadas (listas de ids)
   pipelines/<avaliacao>/          pipeline.toml e anexos (testes.py, esqueleto.py, referencias/)
   relatorios/<avaliacao>/         resultado das checagens por aluno e do JPlag
   usuarios.toml                   usuários, hashes Argon2id das senhas e SHA-256 dos tokens
@@ -119,6 +120,21 @@ pontos da rubrica = Σ peso_critério × pontos do critério
 Critério sem marcação conta zero; passos de roteiro não contam. A nota é mostrada com duas casas, arredondando meio para cima.
 A conta e o arredondamento existem em dois lugares que precisam andar juntos: `src/modelo.rs` e
 `src/api.rs` (exportação), `web/js/nota.js` e `web/js/util.js` (tela).
+
+### Arquivar
+
+Rubricas, turmas e avaliações de semestres passados podem ser arquivadas pelo botão "Arquivar" na
+tela de cada uma. Nada é apagado nem deixa de funcionar: o item só sai da lista (fica em
+"Arquivadas", fechado no fim dela) e das escolhas de turma e rubrica ao montar uma avaliação. Uma
+avaliação arquivada sai da fila do executor. Os ids ficam em `arquivadas.toml`, um arquivo só
+porque turma é CSV e não tem onde guardar a marca. Se o arquivo tiver um erro, nada aparece como
+arquivado (o erro vai para o log) até ele ser consertado:
+
+```toml
+rubricas = []
+turmas = ["INF01202-D-2026-1"]
+avaliacoes = ["pratica-1"]
+```
 
 ## Avaliar
 
@@ -228,13 +244,14 @@ Para gastar poucos tokens, as rubricas também são lidas e gravadas em texto:
 
 | Pedido | Resposta |
 | --- | --- |
-| `GET /api/rubricas.txt` | uma linha por rubrica: `id \| título \| N critérios \| M passos` |
+| `GET /api/rubricas.txt` | uma linha por rubrica: `id \| título \| N critérios \| M passos`, com `\| arquivada` no fim das arquivadas |
 | `GET /api/rubricas/{id}.toml` | o arquivo, sem os `id` que saem dos nomes |
 | `PUT /api/rubricas/{id}.toml` | valida, grava (ou cria) e responde numa linha; erro com linha e coluna |
-| `GET /api/avaliacoes.txt` | uma linha por avaliação: `id \| título \| turma \| rubricas \| com/sem pipeline` |
+| `GET /api/avaliacoes.txt` | uma linha por avaliação: `id \| título \| turma \| rubricas \| com/sem pipeline`, com `\| arquivada` no fim das arquivadas |
 | `GET /api/pipelines.txt` | uma linha por pipeline: `id \| checagens \| anexos \| pendentes` |
 | `GET/PUT /api/pipelines/{avaliacao}/pipeline.toml` | o pipeline; o `PUT` valida contra a avaliação e avisa anexos que faltam |
 | `GET/PUT/DELETE /api/pipelines/{avaliacao}/{arquivo}` | anexos do pipeline |
+| `PUT /api/{rubricas,turmas,avaliacoes}/{id}/arquivada` | `{"arquivada": true}` arquiva; `false` devolve às listas |
 
 No `PUT`, critérios e níveis sem `id` herdam o id do item de mesmo nome na versão gravada: reescrever
 o arquivo inteiro não muda identidades. A skill em `claude/skills/rubricas/SKILL.md` ensina isso ao

@@ -156,6 +156,9 @@ button:disabled { cursor: default; opacity: .45; }
 .linha-meta { display: block; font-size: 15px; color: var(--tinta-2); }
 .linha-avaliacao { display: flex; align-items: center; gap: 12px; }
 .linha-avaliacao .linha { flex: 1; min-width: 0; }
+.arquivadas { margin-top: 24px; }
+.arquivadas > summary { font-weight: 700; font-size: 15px; color: var(--tinta-2); cursor: pointer; padding: 8px 0; }
+.arquivadas .lista { opacity: .75; }
 
 .progresso {
   display: flex; height: 6px; margin-top: 8px; max-width: 360px;

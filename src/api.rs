@@ -2,7 +2,7 @@
 //! (`Authorization: Bearer …`), menos `/api/entrar`.
 
 use crate::auth::{self, Auth, ErroLogin};
-use crate::dados::{self, Dados};
+use crate::dados::{self, Arquivadas, Dados, Tipo};
 use crate::ead;
 use crate::estatico::Web;
 use crate::modelo::*;
@@ -10,7 +10,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -63,6 +63,9 @@ pub fn rotas(estado: Estado) -> Router {
         .route("/avaliacoes/{id}", get(pacote).put(salvar_avaliacao).delete(apagar_avaliacao))
         .route("/avaliacoes/{id}/correcoes/{aluno}", patch(alterar_correcao))
         .route("/avaliacoes/{id}/notas.csv", get(exportar))
+        .route("/rubricas/{id}/arquivada", put(|e, p, j| arquivar(Tipo::Rubricas, e, p, j)))
+        .route("/turmas/{id}/arquivada", put(|e, p, j| arquivar(Tipo::Turmas, e, p, j)))
+        .route("/avaliacoes/{id}/arquivada", put(|e, p, j| arquivar(Tipo::Avaliacoes, e, p, j)))
         .merge(ead::rotas())
         .route_layer(middleware::from_fn_with_state(estado.clone(), exigir_sessao));
     let api = Router::new()
@@ -184,20 +187,52 @@ async fn sessao(Extension(u): Extension<Usuario>) -> Json<Value> {
     Json(json!({ "usuario": u.0 }))
 }
 
+// ----- arquivadas -----
+
+#[derive(Deserialize)]
+struct Arquivar {
+    arquivada: bool,
+}
+
+async fn arquivar(tipo: Tipo, State(e): State<Estado>, Path(id): Path<String>, Json(a): Json<Arquivar>) -> Res<Json<Value>> {
+    e.dados.arquivar(tipo, &id, a.arquivada)?;
+    if tipo == Tipo::Avaliacoes {
+        e.avisos.fila_mudou();
+    }
+    Ok(Json(json!({ "arquivada": a.arquivada })))
+}
+
+/// O item (que tem `id`) como JSON, com `arquivada` ao lado dos campos dele.
+fn com_arquivada(item: impl serde::Serialize, tipo: Tipo, arquivadas: &Arquivadas) -> Value {
+    let mut v = json!(item);
+    let arquivada = v["id"].as_str().is_some_and(|id| arquivadas.contem(tipo, id));
+    v["arquivada"] = json!(arquivada);
+    v
+}
+
+/// O fim da linha das listas em texto.
+pub(crate) fn marca_arquivada(arquivada: bool) -> &'static str {
+    if arquivada { " | arquivada" } else { "" }
+}
+
 // ----- rubricas -----
 
 async fn listar_rubricas(State(e): State<Estado>) -> Res<Json<Value>> {
     let (rubricas, problemas) = e.dados.listar_rubricas()?;
+    let arquivadas = e.dados.arquivadas();
+    let rubricas: Vec<Value> = rubricas.into_iter().map(|r| com_arquivada(r, Tipo::Rubricas, &arquivadas)).collect();
     Ok(Json(json!({ "rubricas": rubricas, "problemas": problemas })))
 }
 
 /// Para quem gasta tokens lendo (o Claude): uma linha por rubrica.
 async fn listar_rubricas_texto(State(e): State<Estado>) -> Res<Response> {
     let (rubricas, problemas) = e.dados.listar_rubricas()?;
+    let arquivadas = e.dados.arquivadas();
     let mut texto = String::new();
     for r in &rubricas {
         let (criterios, passos) = r.contagem();
-        texto.push_str(&format!("{} | {} | {criterios} critérios | {passos} passos\n", r.id, r.titulo));
+        let arquivada = marca_arquivada(arquivadas.contem(Tipo::Rubricas, &r.id));
+        texto.push_str(&format!("{} | {} | {criterios} critérios | {passos} passos{arquivada}\n", r.id, r.titulo));
     }
     for p in problemas {
         texto.push_str(&format!("! {p}\n"));
@@ -215,7 +250,7 @@ pub(crate) fn texto_puro(texto: String) -> Response {
 async fn ler_rubrica(State(e): State<Estado>, Path(id): Path<String>) -> Res<Response> {
     Ok(match id.strip_suffix(".toml") {
         Some(id) => texto_puro(e.dados.rubrica_toml(id)?),
-        None => Json(e.dados.ler_rubrica(&id)?).into_response(),
+        None => Json(com_arquivada(e.dados.ler_rubrica(&id)?, Tipo::Rubricas, &e.dados.arquivadas())).into_response(),
     })
 }
 
@@ -254,12 +289,13 @@ struct ListaAlunos {
     csv: String,
 }
 
-async fn listar_turmas(State(e): State<Estado>) -> Res<Json<Vec<Turma>>> {
-    Ok(Json(e.dados.listar_turmas()?))
+async fn listar_turmas(State(e): State<Estado>) -> Res<Json<Vec<Value>>> {
+    let arquivadas = e.dados.arquivadas();
+    Ok(Json(e.dados.listar_turmas()?.into_iter().map(|t| com_arquivada(t, Tipo::Turmas, &arquivadas)).collect()))
 }
 
-async fn ler_turma(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Turma>> {
-    Ok(Json(e.dados.ler_turma(&id)?))
+async fn ler_turma(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {
+    Ok(Json(com_arquivada(e.dados.ler_turma(&id)?, Tipo::Turmas, &e.dados.arquivadas())))
 }
 
 async fn criar_turma(State(e): State<Estado>, Json(t): Json<NovaTurma>) -> Res<Json<Turma>> {
@@ -310,6 +346,7 @@ fn dez() -> f64 {
 
 async fn listar_avaliacoes(State(e): State<Estado>) -> Res<Json<Value>> {
     let mut lista = Vec::new();
+    let arquivadas = e.dados.arquivadas();
     for a in e.dados.listar_avaliacoes()? {
         let alunos = e.dados.ler_turma(&a.turma).map(|t| t.alunos).unwrap_or_default();
         let correcoes = e.dados.ler_correcoes(&a.id).unwrap_or_default();
@@ -332,6 +369,7 @@ async fn listar_avaliacoes(State(e): State<Estado>) -> Res<Json<Value>> {
             "alunos": alunos.len(),
             "concluidos": concluidos,
             "iniciados": iniciados,
+            "arquivada": arquivadas.contem(Tipo::Avaliacoes, &a.id),
         }));
     }
     Ok(Json(json!(lista)))
@@ -344,7 +382,8 @@ async fn pacote(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Val
     let correcoes = e.dados.ler_correcoes(&id)?;
     let desatualizadas = e.dados.rubricas_desatualizadas(&avaliacao);
     let ead = ead::resumo(&e, &id)?;
-    Ok(Json(json!({ "avaliacao": avaliacao, "turma": turma, "correcoes": correcoes, "desatualizadas": desatualizadas, "ead": ead })))
+    let arquivada = e.dados.arquivadas().contem(Tipo::Avaliacoes, &id);
+    Ok(Json(json!({ "avaliacao": avaliacao, "turma": turma, "correcoes": correcoes, "desatualizadas": desatualizadas, "ead": ead, "arquivada": arquivada })))
 }
 
 fn gravar_avaliacao(e: &Estado, id: Option<&str>, d: DadosAvaliacao) -> Res<Json<Avaliacao>> {

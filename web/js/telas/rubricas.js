@@ -3,10 +3,22 @@ import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { TIPOS, maximo, maximoRubrica, ehRoteiro, contarCriterios, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, chave, cls, pts, guarda } from '../util.js';
-import { useDados, Estado, Titulo, Vazio } from './comum.js';
+import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar } from './comum.js';
+
+function LinhaRubrica(r) {
+  return html`
+    <li>
+      <a class="linha" href=${`#${rota('rubricas', r.id)}`}>
+        <span class="linha-titulo">${r.titulo}</span>
+        <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}</span>
+      </a>
+    </li>
+  `;
+}
 
 export function ListaRubricas() {
   const { dados, ...estado } = useDados('/rubricas');
+  const ativas = dados?.rubricas.filter((r) => !r.arquivada) || [];
   return html`
     <div class="tela">
     <${Titulo} titulo="Rubricas">
@@ -19,18 +31,8 @@ export function ListaRubricas() {
         <p class="suave">Monte uma aqui ou coloque arquivos <code>.toml</code> na pasta <code>rubricas</code>.</p>
       <//>
     `}
-    ${dados?.rubricas.length > 0 && html`
-      <ul class="lista">
-        ${dados.rubricas.map((r) => html`
-          <li>
-            <a class="linha" href=${`#${rota('rubricas', r.id)}`}>
-              <span class="linha-titulo">${r.titulo}</span>
-              <span class="linha-meta">${resumoItens(r)}, ${pts(maximoRubrica(r))}</span>
-            </a>
-          </li>
-        `)}
-      </ul>
-    `}
+    ${ativas.length > 0 && html`<ul class="lista">${ativas.map(LinhaRubrica)}</ul>`}
+    ${dados && html`<${ListaArquivadas} itens=${dados.rubricas.filter((r) => r.arquivada)} linha=${LinhaRubrica} />`}
     </div>
   `;
 }
@@ -299,6 +301,8 @@ export function EditorRubrica({ id }) {
   const [erro, setErro] = useState('');
   const [ocupado, setOcupado] = useState(false);
   const [salvo, setSalvo] = useState(false);
+  // À parte do rascunho: arquivar não mexe nas alterações por salvar.
+  const [arquivada, setArquivada] = useState(false);
 
   // A navegação pergunta antes de sair enquanto houver alterações não salvas.
   useEffect(() => {
@@ -320,6 +324,7 @@ export function EditorRubrica({ id }) {
   useEffect(() => {
     if (dados) {
       receber(dados);
+      setArquivada(!!dados.arquivada);
     } else if (!id && r) {
       setAbertos(new Set([r.criterios[0]._k]));
     }
@@ -404,6 +409,16 @@ export function EditorRubrica({ id }) {
     }
   }
 
+  async function alternarArquivada() {
+    setErro('');
+    try {
+      await arquivar(`/rubricas/${encodeURIComponent(id)}`, !arquivada);
+      setArquivada(!arquivada);
+    } catch (err) {
+      setErro(err.message);
+    }
+  }
+
   async function copiar() {
     try {
       const corpo = doRascunho(r);
@@ -432,8 +447,10 @@ export function EditorRubrica({ id }) {
     <div class="tela">
     <${Titulo} titulo=${id ? r.titulo || 'Rubrica' : 'Nova rubrica'} voltar=${{ href: '#/rubricas', texto: 'Rubricas' }}>
       ${id && html`<button type="button" class="botao" onClick=${copiar} disabled=${sujo}>Duplicar</button>`}
+      ${id && !arquivada && html`<button type="button" class="botao" onClick=${alternarArquivada}>Arquivar</button>`}
       ${id && html`<button type="button" class="botao perigo" onClick=${apagar}>Apagar</button>`}
     <//>
+    ${arquivada && html`<${AvisoArquivada} texto="Rubrica arquivada: fica fora da lista e da escolha de rubricas nas avaliações. Quem já a usa continua igual." aoDesarquivar=${alternarArquivada} />`}
     <form class="formulario editor" onSubmit=${salvar}>
       <label class="campo">
         <span>Título</span>
