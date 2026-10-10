@@ -1,9 +1,13 @@
-# Exemplo. Usuários e tokens são criados dentro do contêiner:
+# Servidor + executor sobre a pasta ./dados. Usuários e tokens são criados dentro do contêiner:
 #   docker compose run --rm rubricas usuario vini --dados /dados
-#   docker compose run --rm rubricas token vini --dados /dados
+# O executor precisa de um usuário com papel executor e do token dele num .env ao lado:
+#   docker compose run --rm -e RUBRICAS_SENHA="$(openssl rand -hex 16)" rubricas usuario executor --papel executor --dados /dados
+#   echo "RUBRICAS_TOKEN=$(docker compose run --rm rubricas token executor --dados /dados | head -n1)" >> .env
 services:
   rubricas:
-    build: .
+    build:
+      context: .
+      target: servidor
     restart: unless-stopped
     # O dono dos arquivos em ./dados é quem roda o contêiner, não root.
     user: "${UID:-1000}:${GID:-1000}"
@@ -12,3 +16,24 @@ services:
     ports:
       # Só local: o proxy HTTPS (Caddy, cloudflared…) é quem fica exposto.
       - "127.0.0.1:8080:8080"
+
+  executor:
+    build:
+      context: .
+      target: executor
+    restart: unless-stopped
+    depends_on:
+      - rubricas
+    # O executor sobe os contêineres das checagens com um podman próprio; aninhar
+    # contêineres (cgroups para --memory/--cpus, overlay) pede privilégio. O código
+    # do aluno continua isolado no contêiner de dentro, sem rede.
+    privileged: true
+    environment:
+      RUBRICAS_URL: http://rubricas:8080
+      RUBRICAS_TOKEN: ${RUBRICAS_TOKEN:-}
+    volumes:
+      # Imagens (python, JPlag) sobrevivem a recriar o contêiner.
+      - imagens:/var/lib/containers
+
+volumes:
+  imagens:

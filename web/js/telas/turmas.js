@@ -2,7 +2,7 @@
 import { html, useState } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { ir, rota, plural } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { useDados, useAcao, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
 import { sessao, pode } from '../sessao.js';
 
 function LinhaTurma(t) {
@@ -65,20 +65,11 @@ function CampoLista({ csv, setCsv }) {
 export function NovaTurma() {
   const [nome, setNome] = useState('');
   const [csv, setCsv] = useState('');
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro } = useAcao();
 
-  async function salvar(e) {
+  function salvar(e) {
     e.preventDefault();
-    setOcupado(true);
-    setErro('');
-    try {
-      const t = await api('POST', '/turmas', { nome, csv });
-      ir(rota('turmas', t.id));
-    } catch (err) {
-      setErro(err.message);
-      setOcupado(false);
-    }
+    rodar(async () => ir(rota('turmas', (await api('POST', '/turmas', { nome, csv })).id)));
   }
 
   return html`
@@ -102,42 +93,33 @@ export function NovaTurma() {
 }
 
 export function DetalheTurma({ id }) {
-  const { dados, recarregar, ...estado } = useDados(`/turmas/${encodeURIComponent(id)}`);
+  const caminho = rota('turmas', id);
+  const { dados, recarregar, ...estado } = useDados(caminho);
   const [trocando, setTrocando] = useState(false);
   const [csv, setCsv] = useState('');
-  const [erro, setErro] = useState('');
+  const { rodar, erro } = useAcao();
 
-  async function substituir(e) {
+  function substituir(e) {
     e.preventDefault();
-    setErro('');
-    try {
-      await api('PUT', `/turmas/${encodeURIComponent(id)}`, { csv });
+    rodar(async () => {
+      await api('PUT', caminho, { csv });
       setTrocando(false);
       setCsv('');
       recarregar();
-    } catch (err) {
-      setErro(err.message);
-    }
+    });
   }
 
-  async function alternarArquivada() {
-    setErro('');
-    try {
-      await arquivar(`/turmas/${encodeURIComponent(id)}`, !dados.arquivada);
-      recarregar();
-    } catch (err) {
-      setErro(err.message);
-    }
-  }
+  const alternarArquivada = () => rodar(async () => {
+    await arquivar(caminho, !dados.arquivada);
+    recarregar();
+  });
 
-  async function apagar() {
+  function apagar() {
     if (!confirm(`Apagar a turma ${id}? O arquivo turmas/${id}.csv será removido.`)) return;
-    try {
-      await api('DELETE', `/turmas/${encodeURIComponent(id)}`);
+    rodar(async () => {
+      await api('DELETE', caminho);
       ir('/turmas');
-    } catch (err) {
-      setErro(err.message);
-    }
+    });
   }
 
   return html`
@@ -169,7 +151,7 @@ export function DetalheTurma({ id }) {
         </tbody>
       </table>
     `}
-    ${pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${`/turmas/${encodeURIComponent(id)}`} pasta="turmas" />`}
+    ${pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${caminho} pasta="turmas" />`}
     </div>
   `;
 }

@@ -1,29 +1,32 @@
 //! Usuários, a própria senha e o compartilhamento de avaliações, rubricas e
-//! turmas. Quem pode chamar cada rota está em `api::exigencia`.
+//! turmas. Cada rota diz o que exige ao ser registrada.
 
-use crate::api::{Erro, Estado, Res};
-use crate::auth;
-use crate::dados::Tipo;
-use crate::ead::bloqueante;
-use crate::permissoes::{Quem, Recurso, nome_tipo};
+use crate::api::{Erro, Estado, Exigencia, Res, Rotas, bloqueante, metodos};
+use crate::auth::{self, Usuarios};
+use crate::dados::{self, Tipo};
+use crate::permissoes::{Acao, Permissoes, Quem, Recurso};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch, put};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub fn rotas() -> Router<Estado> {
-    let mut r = Router::new()
-        .route("/usuarios", get(listar_usuarios).post(criar_usuario))
-        .route("/usuarios/{nome}", patch(alterar_usuario).delete(remover_usuario))
-        .route("/senha", put(trocar_senha));
-    for (pasta, tipo) in [("avaliacoes", Tipo::Avaliacoes), ("rubricas", Tipo::Rubricas), ("turmas", Tipo::Turmas)] {
+pub fn rotas() -> Rotas {
+    use Exigencia::*;
+    let gerir = Sistema(Acao::GerirUsuarios);
+    let mut r = Rotas::new()
+        .rota("/usuarios", metodos().get(Dentro, listar_usuarios).post(gerir, criar_usuario))
+        .rota("/usuarios/{nome}", metodos().patch(gerir, alterar_usuario).delete(gerir, remover_usuario))
+        .rota("/senha", metodos().put(Dentro, trocar_senha));
+    for tipo in [Tipo::Avaliacoes, Tipo::Rubricas, Tipo::Turmas] {
+        let compartilhar = Item(tipo, Acao::Compartilhar);
         r = r
-            .route(&format!("/{pasta}/{{id}}/acessos"), get(move |e, p| listar_acessos(tipo, e, p)))
-            .route(
-                &format!("/{pasta}/{{id}}/acessos/{{usuario}}"),
-                put(move |e, u, p, j| conceder(tipo, e, u, p, j)).delete(move |e, u, p| revogar(tipo, e, u, p)),
+            .rota(&format!("/{}/{{id}}/acessos", tipo.pasta()), metodos().get(compartilhar, move |e, p| listar_acessos(tipo, e, p)))
+            .rota(
+                &format!("/{}/{{id}}/acessos/{{usuario}}", tipo.pasta()),
+                metodos()
+                    .put(compartilhar, move |e, u, p, j| conceder(tipo, e, u, p, j))
+                    .delete(compartilhar, move |e, p| revogar(tipo, e, p)),
             );
     }
     r
@@ -33,8 +36,11 @@ fn invalido(m: impl Into<String>) -> Erro {
     Erro(StatusCode::UNPROCESSABLE_ENTITY, m.into())
 }
 
-fn interno(m: String) -> Erro {
-    Erro(StatusCode::INTERNAL_SERVER_ERROR, m)
+/// Remove o usuário e os acessos dele, que não devem valer para outro criado
+/// depois com o mesmo nome. Recusa remover o último que gere usuários.
+pub(crate) fn remover(usuarios: &Usuarios, permissoes: &Permissoes, nome: &str) -> dados::Res<()> {
+    usuarios.remover(nome, |papel| permissoes.gere_usuarios(papel))?;
+    permissoes.esquecer_usuario(nome)
 }
 
 // ----- usuários -----
@@ -42,9 +48,11 @@ fn interno(m: String) -> Erro {
 /// Todos veem a lista de nomes (para escolher com quem compartilhar); só quem
 /// gere usuários vê quem tem token de API.
 async fn listar_usuarios(State(e): State<Estado>, Extension(u): Extension<Quem>) -> Res<Json<Value>> {
-    let gere = e.visao(&u).pode(Recurso::Sistema, "gerir_usuarios");
-    let lista: Vec<Value> = auth::listar(e.dados.raiz())
-        .map_err(interno)?
+    let gere = e.visao(&u).pode(Recurso::Sistema, Acao::GerirUsuarios);
+    let lista: Vec<Value> = e
+        .auth
+        .usuarios
+        .listar()?
         .into_iter()
         .map(|r| if gere { json!(r) } else { json!({ "nome": r.nome, "papel": r.papel }) })
         .collect();
@@ -59,15 +67,6 @@ fn checar_papel_global(e: &Estado, papel: &str) -> Res<()> {
     }
 }
 
-/// Recusa deixar o sistema sem nenhum admin.
-fn checar_resta_admin(e: &Estado, sem: &str) -> Res<()> {
-    let outros = auth::listar(e.dados.raiz()).map_err(interno)?.into_iter().filter(|r| r.papel == "admin" && !r.nome.eq_ignore_ascii_case(sem)).count();
-    if outros == 0 {
-        return Err(Erro(StatusCode::CONFLICT, "É preciso ficar pelo menos um admin.".into()));
-    }
-    Ok(())
-}
-
 #[derive(Deserialize)]
 struct NovoUsuario {
     nome: String,
@@ -78,12 +77,8 @@ struct NovoUsuario {
 async fn criar_usuario(State(e): State<Estado>, Json(n): Json<NovoUsuario>) -> Res<Json<Value>> {
     checar_papel_global(&e, &n.papel)?;
     let nome = n.nome.trim().to_string();
-    if auth::nome_gravado(e.dados.raiz(), &nome).is_some() {
-        return Err(Erro(StatusCode::CONFLICT, format!("Já existe o usuário {nome}.")));
-    }
-    let raiz = e.dados.raiz().to_path_buf();
-    let n2 = nome.clone();
-    bloqueante(move || auth::definir_senha(&raiz, &n2, &n.senha, &n.papel).map_err(invalido)).await?;
+    let (auth, n2) = (e.auth.clone(), nome.clone());
+    bloqueante(move || Ok(auth.usuarios.criar(&n2, &n.senha, &n.papel)?)).await?;
     Ok(Json(json!({ "nome": nome })))
 }
 
@@ -97,20 +92,14 @@ struct AlteracaoUsuario {
 }
 
 async fn alterar_usuario(State(e): State<Estado>, Path(nome): Path<String>, Json(a): Json<AlteracaoUsuario>) -> Res<Json<Value>> {
-    let raiz = e.dados.raiz().to_path_buf();
-    let nome = auth::nome_gravado(&raiz, &nome).ok_or(Erro(StatusCode::NOT_FOUND, format!("Não existe usuário {nome}.")))?;
+    let nome = e.auth.usuarios.nome_gravado(&nome).ok_or(Erro(StatusCode::NOT_FOUND, format!("Não existe usuário {nome}.")))?;
     if let Some(papel) = &a.papel {
         checar_papel_global(&e, papel)?;
-        if papel != "admin" {
-            checar_resta_admin(&e, &nome)?;
-        }
+        e.auth.usuarios.definir_papel(&nome, papel, |p| e.permissoes.gere_usuarios(p))?;
     }
     if let Some(senha) = a.senha {
-        let (r, n) = (raiz.clone(), nome.clone());
-        bloqueante(move || auth::definir_senha(&r, &n, &senha, "").map(|_| ()).map_err(invalido)).await?;
-    }
-    if let Some(papel) = &a.papel {
-        auth::definir_papel(&raiz, &nome, papel).map_err(interno)?;
+        let (auth, n) = (e.auth.clone(), nome.clone());
+        bloqueante(move || Ok(auth.usuarios.trocar_senha(&n, &senha)?)).await?;
     }
     Ok(Json(json!({ "nome": nome })))
 }
@@ -119,11 +108,7 @@ async fn remover_usuario(State(e): State<Estado>, Extension(u): Extension<Quem>,
     if nome.eq_ignore_ascii_case(&u.nome) {
         return Err(Erro(StatusCode::CONFLICT, "Você não pode remover a si mesmo.".into()));
     }
-    checar_resta_admin(&e, &nome)?;
-    if !auth::remover_usuario(e.dados.raiz(), &nome).map_err(interno)? {
-        return Err(Erro(StatusCode::NOT_FOUND, format!("Não existe usuário {nome}.")));
-    }
-    e.permissoes.esquecer_usuario(&nome).map_err(interno)?;
+    remover(&e.auth.usuarios, &e.permissoes, &nome)?;
     Ok(Json(json!({})))
 }
 
@@ -134,12 +119,12 @@ struct TrocaSenha {
 }
 
 async fn trocar_senha(State(e): State<Estado>, Extension(u): Extension<Quem>, Json(t): Json<TrocaSenha>) -> Res<Json<Value>> {
-    let raiz = e.dados.raiz().to_path_buf();
+    let auth = e.auth.clone();
     bloqueante(move || {
-        if !auth::senha_confere(&raiz, &u.nome, &t.atual) {
+        if !auth.usuarios.senha_confere(&u.nome, &t.atual) {
             return Err(Erro(StatusCode::FORBIDDEN, "A senha atual não confere.".into()));
         }
-        auth::definir_senha(&raiz, &u.nome, &t.nova, "").map_err(invalido)
+        Ok(auth.usuarios.trocar_senha(&u.nome, &t.nova)?)
     })
     .await?;
     // Trocar a senha derruba todas as sessões, inclusive esta: a tela pede para entrar de novo.
@@ -149,36 +134,20 @@ async fn trocar_senha(State(e): State<Estado>, Extension(u): Extension<Quem>, Js
 // ----- compartilhar -----
 
 fn existe(e: &Estado, tipo: Tipo, id: &str) -> Res<()> {
-    match tipo {
-        Tipo::Avaliacoes => e.dados.ler_avaliacao(id).map(|_| ()),
-        Tipo::Rubricas => e.dados.ler_rubrica(id).map(|_| ()),
-        Tipo::Turmas => e.dados.ler_turma(id).map(|_| ()),
-    }
-    .map_err(Erro::from)
+    if e.dados.existe(tipo, id)? { Ok(()) } else { Err(Erro(StatusCode::NOT_FOUND, format!("“{id}” não existe em {}/", tipo.pasta()))) }
 }
 
 async fn listar_acessos(tipo: Tipo, State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {
     existe(&e, tipo, &id)?;
     Ok(Json(json!({
         "acessos": e.permissoes.acessos(tipo, &id),
-        "papeis": e.permissoes.papeis()[nome_tipo(tipo)],
+        "papeis": e.permissoes.papeis()[tipo.nome()],
     })))
 }
 
 #[derive(Deserialize)]
 struct Concessao {
     papel: String,
-}
-
-/// Recusa tirar o último dono: o item ficaria só para o admin.
-fn checar_resta_dono(e: &Estado, tipo: Tipo, id: &str, sem: &str) -> Res<()> {
-    let acessos = e.permissoes.acessos(tipo, id);
-    let era_dono = acessos.iter().any(|a| a.papel == "dono" && a.usuario.eq_ignore_ascii_case(sem));
-    let outros = acessos.iter().filter(|a| a.papel == "dono" && !a.usuario.eq_ignore_ascii_case(sem)).count();
-    if era_dono && outros == 0 {
-        return Err(Erro(StatusCode::CONFLICT, "É preciso ficar pelo menos um dono. Dê o papel de dono a outra pessoa antes.".into()));
-    }
-    Ok(())
 }
 
 async fn conceder(
@@ -189,20 +158,13 @@ async fn conceder(
     Json(c): Json<Concessao>,
 ) -> Res<Json<Value>> {
     existe(&e, tipo, &id)?;
-    let usuario = auth::nome_gravado(e.dados.raiz(), &usuario).ok_or(Erro(StatusCode::NOT_FOUND, format!("Não existe usuário {usuario}.")))?;
-    if !e.permissoes.papel_valido(tipo, &c.papel) {
-        return Err(invalido(format!("Papel desconhecido: {}", c.papel)));
-    }
-    if c.papel != "dono" {
-        checar_resta_dono(&e, tipo, &id, &usuario)?;
-    }
-    e.permissoes.conceder(tipo, &id, &usuario, &c.papel, &u.nome, auth::agora()).map_err(interno)?;
+    let usuario = e.auth.usuarios.nome_gravado(&usuario).ok_or(Erro(StatusCode::NOT_FOUND, format!("Não existe usuário {usuario}.")))?;
+    e.permissoes.conceder(tipo, &id, &usuario, &c.papel, &u.nome, auth::agora())?;
     Ok(Json(json!({ "acessos": e.permissoes.acessos(tipo, &id) })))
 }
 
-async fn revogar(tipo: Tipo, State(e): State<Estado>, Extension(_u): Extension<Quem>, Path((id, usuario)): Path<(String, String)>) -> Res<Json<Value>> {
-    checar_resta_dono(&e, tipo, &id, &usuario)?;
-    if !e.permissoes.revogar(tipo, &id, &usuario).map_err(interno)? {
+async fn revogar(tipo: Tipo, State(e): State<Estado>, Path((id, usuario)): Path<(String, String)>) -> Res<Json<Value>> {
+    if !e.permissoes.revogar(tipo, &id, &usuario)? {
         return Err(Erro(StatusCode::NOT_FOUND, format!("{usuario} não tinha acesso.")));
     }
     Ok(Json(json!({ "acessos": e.permissoes.acessos(tipo, &id) })))

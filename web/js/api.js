@@ -1,5 +1,7 @@
 // Acesso ao servidor e fila de correções por enviar.
-import { guardar, recuperar } from './util.js';
+import { CHAVES, guardar, recuperar, apagar } from './armazem.js';
+import { aplicarLote, chaveItem, descontar, separar, tamanho } from './lote.js';
+import { rota } from './util.js';
 
 export class ErroApi extends Error {
   constructor(status, mensagem) {
@@ -48,11 +50,8 @@ export async function api(metodo, caminho, corpo) {
 // separada por usuário, então fechar a aba ou perder o sinal no meio da aula não
 // perde nada: o envio recomeça quando a conexão (ou a sessão) volta.
 //
-// Formato: { "<avaliacao>\n<aluno>": { respostas: { "<origem>\n<criterio>": resposta|null },
-//                                       comentario_geral?: string } }
+// Formato: { "<avaliacao>\n<aluno>": lote } — o lote está descrito em lote.js.
 // ---------------------------------------------------------------------------
-
-const SEP = '\n';
 
 let dono = null;
 let pendentes = {};
@@ -65,13 +64,10 @@ let recusas = 0;
 const ouvintes = new Set();
 const aoConfirmar = new Set();
 
-const chaveFila = () => `rubricas.fila.v1:${dono}`;
+const chaveFila = () => CHAVES.fila(dono);
 
 function contar() {
-  return Object.values(pendentes).reduce(
-    (n, p) => n + Object.keys(p.respostas || {}).length + (p.comentario_geral !== undefined ? 1 : 0),
-    0,
-  );
+  return Object.values(pendentes).reduce((n, p) => n + tamanho(p), 0);
 }
 
 function avisar() {
@@ -95,10 +91,10 @@ async function enviar() {
   for (const k of chaves) {
     const lote = pendentes[k];
     if (!lote) continue;
-    const [avaliacao, aluno] = k.split(SEP);
+    const [avaliacao, aluno] = separar(k);
     const corpo = {
       respostas: Object.entries(lote.respostas || {}).map(([c, resposta]) => {
-        const [rubrica, criterio] = c.split(SEP);
+        const [rubrica, criterio] = separar(c);
         return { rubrica, criterio, resposta };
       }),
     };
@@ -106,7 +102,7 @@ async function enviar() {
     let resultado = null;
     let erro = null;
     try {
-      resultado = await api('PATCH', `/avaliacoes/${encodeURIComponent(avaliacao)}/correcoes/${encodeURIComponent(aluno)}`, corpo);
+      resultado = await api('PATCH', rota('avaliacoes', avaliacao, 'correcoes', aluno), corpo);
     } catch (e) {
       erro = e;
     }
@@ -120,14 +116,9 @@ async function enviar() {
     }
     // O servidor respondeu de vez. Sai da fila só o que foi enviado; marcações
     // feitas durante o envio continuam nela.
-    const atual = pendentes[k];
-    if (atual) {
-      for (const [c, r] of Object.entries(lote.respostas || {})) {
-        if (JSON.stringify(atual.respostas?.[c]) === JSON.stringify(r)) delete atual.respostas[c];
-      }
-      if (atual.comentario_geral === lote.comentario_geral) delete atual.comentario_geral;
-      if (!Object.keys(atual.respostas || {}).length && atual.comentario_geral === undefined) delete pendentes[k];
-    }
+    const resto = descontar(pendentes[k], lote);
+    if (resto) pendentes[k] = resto;
+    else delete pendentes[k];
     falhando = false;
     espera = 1000;
     if (erro) {
@@ -170,7 +161,7 @@ export const fila = {
   /** Registra alterações de um aluno. `respostas` usa a chave "<origem>\n<criterio>". */
   adicionar(avaliacao, aluno, { respostas, comentario_geral }) {
     if (!dono) return;
-    const k = avaliacao + SEP + aluno;
+    const k = chaveItem(avaliacao, aluno);
     const lote = structuredClone(pendentes[k] || { respostas: {} });
     Object.assign(lote.respostas, respostas || {});
     if (comentario_geral !== undefined) lote.comentario_geral = comentario_geral;
@@ -184,7 +175,7 @@ export const fila = {
   de(avaliacao) {
     const saida = {};
     for (const [k, lote] of Object.entries(pendentes)) {
-      const [av, aluno] = k.split(SEP);
+      const [av, aluno] = separar(k);
       if (av === avaliacao) saida[aluno] = lote;
     }
     return saida;
@@ -216,9 +207,7 @@ export const fila = {
     agendar(0);
   },
 
-  chave(origem, criterio) {
-    return origem + SEP + criterio;
-  },
+  chave: chaveItem,
 };
 
 window.addEventListener('online', () => fila.enviarAgora());
@@ -228,34 +217,17 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && contar()) fila.enviarAgora();
 });
 
-/** Aplica um lote da fila sobre uma correção (cópia). */
-export function aplicarLote(correcao, lote) {
-  const c = structuredClone(correcao || { respostas: {} });
-  c.respostas ||= {};
-  if (!lote) return c;
-  for (const [k, resposta] of Object.entries(lote.respostas || {})) {
-    const [origem, criterio] = k.split(SEP);
-    if (resposta === null) {
-      if (c.respostas[origem]) delete c.respostas[origem][criterio];
-    } else {
-      (c.respostas[origem] ||= {})[criterio] = resposta;
-    }
-  }
-  if (lote.comentario_geral !== undefined) c.comentario_geral = lote.comentario_geral;
-  return c;
-}
-
 /** Carrega o pacote de uma avaliação; sem rede, usa a última cópia guardada. */
 export async function carregarPacote(id) {
-  const chavePacote = `rubricas.pacote.${id}`;
+  const chavePacote = CHAVES.pacote(id);
   let pacote;
   let offline = false;
   try {
-    pacote = await api('GET', `/avaliacoes/${encodeURIComponent(id)}`);
+    pacote = await api('GET', rota('avaliacoes', id));
     guardar(chavePacote, pacote);
   } catch (e) {
     // Sem acesso (revogado) ou apagada: a cópia deste aparelho também some.
-    if (e.status === 403 || e.status === 404) localStorage.removeItem(chavePacote);
+    if (e.status === 403 || e.status === 404) apagar(chavePacote);
     if (!e.semRede) throw e;
     pacote = recuperar(chavePacote);
     if (!pacote) throw e;
@@ -270,7 +242,7 @@ export async function carregarPacote(id) {
 
 /** Atualiza a cópia offline com o estado local, para um recarregamento sem rede. */
 export function guardarCorrecoes(id, correcoes) {
-  const chavePacote = `rubricas.pacote.${id}`;
+  const chavePacote = CHAVES.pacote(id);
   const pacote = recuperar(chavePacote);
   if (pacote) guardar(chavePacote, { ...pacote, correcoes });
 }

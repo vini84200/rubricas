@@ -193,9 +193,14 @@ números de linha e destaque de Python (Prism, em `web/vendor/prism.js`); em tel
 código e as checagens do aluno que o mesmo usuário abriu em outro aparelho e troca sozinha (SSE,
 com batimento a cada 30 s para o proxy não cortar a conexão).
 
-**Editar o código.** O botão "Editar" no código abre um editor (Tab indenta, Enter mantém o
-recuo, Ctrl+S salva) para mudanças pontuais, como corrigir um erro de sintaxe e ver se o resto
-funciona. Salvar põe o aluno de volta na fila do executor; as checagens passam a usar a versão
+**Editar o código.** O botão "Editar" no código abre um editor (CodeMirror 6) para mudanças
+pontuais, como corrigir um erro de sintaxe e ver se o resto funciona. Tab e Shift+Tab mudam o recuo
+de todas as linhas selecionadas, Enter acerta o recuo depois de `:`, Ctrl+Z desfaz, Ctrl+F busca e
+Ctrl+S salva. Erros de sintaxe e nomes não definidos aparecem sublinhados em vermelho enquanto se
+digita, com a mensagem ao passar o mouse; imports e variáveis sem uso, em amarelo. Quem verifica é
+o [Ruff](https://docs.astral.sh/ruff/) compilado para WebAssembly, rodando no navegador. O editor e o
+Ruff (11 MB) ficam em `web/vendor/sob-demanda/` e só são baixados quando alguém abre o editor: não
+entram no cache offline de quem só avalia. Salvar põe o aluno de volta na fila do executor; as checagens passam a usar a versão
 editada e o cartão avisa "Código editado por …". O original fica guardado em
 `submissoes/<avaliacao>/.edicoes/` à parte: "Ver original" mostra o que o aluno enviou e "Desfazer
 edição" volta a ele. O plágio sempre compara os originais. Se um ZIP novo traz código diferente do
@@ -227,12 +232,6 @@ da avaliação mostra quantas submissões aguardam o executor e quando ele foi v
 `--continuo`, ele acorda quando um ZIP chega ou o pipeline é gravado pela API; um `pipeline.toml`
 editado direto na pasta é notado em até 10 minutos.
 
-## Claude e scripts
-
-Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
-servidor com `rubricas token NOME`, mostrado uma vez só e guardado como SHA-256. Ele tem os mesmos
-poderes do usuário (as mesmas [permissões](#permissões)) e deixa de valer quando o usuário troca a
-senha ou é removido. As listas em texto mostram só o que o dono do token pode ver.
 **Notas de volta ao Moodle.** Na tarefa, com o feedback "Planilha de notas offline" ligado, baixe
 "Planilha de notas" e mande o arquivo em "Preencher planilha do Moodle" na tela da avaliação: a
 mesma planilha volta preenchida, pronta para "Carregar planilha de notas" na tarefa. Cada linha
@@ -244,6 +243,12 @@ alterada: Não" não é mexida. O separador decimal segue o da planilha (o Moodl
 "7,5" como 75), a planilha sai sempre separada por vírgula (o padrão do envio), e se a nota máxima da tarefa difere da avaliação a nota é convertida. A tela lista
 quem ficou de fora e por quê. Código em `src/moodle.rs`.
 
+## Claude e scripts
+
+Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
+servidor com `rubricas token NOME`, mostrado uma vez só e guardado como SHA-256. Ele tem os mesmos
+poderes do usuário (as mesmas [permissões](#permissões)) e deixa de valer quando o usuário troca a
+senha ou é removido. As listas em texto mostram só o que o dono do token pode ver.
 
 Para gastar poucos tokens, as rubricas também são lidas e gravadas em texto:
 
@@ -299,9 +304,13 @@ em `src/politica.rego`, avaliada dentro do servidor pelo [regorus](https://githu
 A política recebe quem pede (nome e papel global), o item e o papel concedido nele, e devolve as
 ações permitidas (`ver`, `exportar`, `corrigir`, `editar`, `arquivar`, `apagar`, `compartilhar`,
 `ler_checagens`; e no sistema, `criar`, `gerir_usuarios`, `executar`, `ver_tudo`). Cada rota da API
-declara a ação que exige numa tabela em `src/api.rs`; rota fora da tabela é negada, e um teste
-confere que toda rota registrada está nela. As listas mostram só o que se pode ver, e cada item
-vem com as suas `acoes`, que a tela usa para esconder os botões que não valem.
+é registrada junto com a ação que exige (`metodos().get(Item(Avaliacoes, Ver), …)` em `src/api.rs`);
+não há como registrar uma rota protegida sem dizer isso. As listas mostram só o que se pode ver, e
+cada item vem com as suas `acoes`, que a tela usa para esconder os botões que não valem.
+
+O servidor não conhece nomes de papéis: o de quem cria um item é o último da lista dele em `papeis`
+(e todo item fica com ao menos um), o sistema nunca fica sem alguém que possa `gerir_usuarios`, e
+`papel_global_padrao` diz o papel de quem é criado pelo terminal sem `--papel`.
 
 Para mudar a regra (por exemplo, monitores verem todas as rubricas), grave
 `rubricas politica > dados/politica.rego`, edite e reinicie o servidor. Uma política com erro
@@ -317,6 +326,9 @@ impede o servidor de subir, em vez de liberar ou negar tudo às cegas.
 - "Sair" sem conexão não consegue encerrar a sessão no servidor na hora: o aparelho volta à tela
   de entrada e encerra a sessão assim que a rede voltar.
 - Oito senhas erradas para o mesmo usuário bloqueiam novas tentativas por até 10 minutos.
+- A política de segurança (CSP) só aceita scripts do próprio servidor. As duas exceções são para o
+  editor de código: WebAssembly (`'wasm-unsafe-eval'`, para o Ruff) e CSS inline (o CodeMirror
+  injeta o seu).
 
 O padrão é escutar só em `127.0.0.1`. Para usar no celular, publique atrás de um proxy com HTTPS
 (navegadores só instalam PWA e ativam o modo offline em HTTPS ou em `localhost`). Com Caddy:
@@ -327,13 +339,17 @@ rubricas.exemplo.org {
 }
 ```
 
-Com Docker, há um `Dockerfile` (binário sobre `distroless`) e um `compose.yaml` de exemplo que
-publica só em `127.0.0.1:8080`, para o proxy HTTPS ficar na frente:
+Com Docker, há um `Dockerfile` (alvo `servidor`: binário sobre `distroless`; alvo `executor`:
+binário sobre `quay.io/podman/stable`) e um `compose.yaml` que sobe os dois sobre `./dados`. O
+servidor publica só em `127.0.0.1:8080`, para o proxy HTTPS ficar na frente; o executor fala com
+ele pela rede interna e roda as checagens num podman aninhado (`privileged`), com as imagens num
+volume próprio. O token do executor vai no `.env`:
 
 ```sh
-docker compose up -d --build
 docker compose run --rm rubricas usuario vini --dados /dados
-docker compose run --rm rubricas token vini --dados /dados
+docker compose run --rm -e RUBRICAS_SENHA="$(openssl rand -hex 16)" rubricas usuario executor --papel executor --dados /dados
+echo "RUBRICAS_TOKEN=$(docker compose run --rm rubricas token executor --dados /dados | head -n1)" >> .env
+docker compose up -d --build
 ```
 
 ## Desenvolver
@@ -346,7 +362,9 @@ cargo run -- servir --dados dados --web web            # front-end do disco, sem
 
 O front-end não tem etapa de build: módulos ES em `web/js`, com `htm` + Preact num arquivo só em
 `web/vendor/preact-htm.js` (cópia de `htm@3.1.1`, `preact/standalone.module.js`), o Prism em
-`web/vendor/prism.js` (`prismjs@1.30.0`, core e Python, embrulhados como módulo ES) e a fonte
+`web/vendor/prism.js` (`prismjs@1.30.0`, core e Python, embrulhados como módulo ES), o editor em
+`web/vendor/sob-demanda/` (CodeMirror 6 empacotado uma vez com esbuild e o
+`@astral-sh/ruff-wasm-web@0.17.0`; versões e receita nos `LEIAME-*.txt` de lá) e a fonte
 Atkinson Hyperlegible em `web/fontes` (de `@fontsource/atkinson-hyperlegible@5.3.0`).
 
 ## O que não faz

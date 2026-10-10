@@ -3,9 +3,9 @@
 // "Acompanhar", que segue no monitor o aluno aberto em outro aparelho.
 import { html, useState, useEffect, useRef } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
-import { PainelCodigo } from '../codigo.js';
+import { PainelCodigo, avisosDoCodigo, referencia, nomeAluno } from '../codigo.js';
 import { rota, plural, cls } from '../util.js';
-import { useDados, Estado, Titulo, Vazio } from './comum.js';
+import { useDados, useTelaInteira, Estado, Titulo, Vazio } from './comum.js';
 
 const TIPOS = { casos: 'Casos de entrada e saída', pytest: 'Testes (pytest)', estilo: 'Estilo (ruff)', comando: 'Comando' };
 
@@ -17,15 +17,14 @@ function detalhe(c) {
 }
 
 function nomeDe(alunos, id) {
-  if (id.startsWith('referencias/')) return `Referência: ${id.slice('referencias/'.length)}`;
-  return alunos.find((a) => a.id === id)?.nome || id;
+  const ref = referencia(id);
+  return ref ? `Referência: ${ref}` : nomeAluno(alunos, id);
 }
 
 export function TelaChecagens({ id }) {
-  const enc = encodeURIComponent(id);
-  const pipeline = useDados(`/pipelines/${enc}`);
-  const plagio = useDados(`/avaliacoes/${enc}/plagio`);
-  const pacote = useDados(`/avaliacoes/${enc}`);
+  const pipeline = useDados(rota('pipelines', id));
+  const plagio = useDados(rota('avaliacoes', id, 'plagio'));
+  const pacote = useDados(rota('avaliacoes', id));
   const [todos, setTodos] = useState(false);
   const volta = { href: `#${rota('avaliacoes', id)}`, texto: 'Notas' };
   const carregando = pipeline.carregando || plagio.carregando || pacote.carregando;
@@ -74,7 +73,7 @@ export function TelaChecagens({ id }) {
       <p class="suave">Arquivo do aluno: ${p.pipeline.arquivo ? html`renomeado para <code>${p.pipeline.arquivo}</code>` : 'o único .py da submissão'}. Limite: ${p.pipeline.tempo} s por execução, ${p.pipeline.memoria} de memória, imagem <code>${p.pipeline.imagem}</code>.</p>
     `}
     ${p.anexos.length > 0 && html`
-      <p class="anexos"><strong>Anexos:</strong> ${p.anexos.map((a, i) => html`${i ? ', ' : ' '}<a href=${`api/pipelines/${enc}/${a.caminho.split('/').map(encodeURIComponent).join('/')}`} download>${a.caminho}</a>`)}</p>
+      <p class="anexos"><strong>Anexos:</strong> ${p.anexos.map((a, i) => html`${i ? ', ' : ' '}<a href=${`api${rota('pipelines', id, ...a.caminho.split('/'))}`} download>${a.caminho}</a>`)}</p>
     `}
     ${p.toml && html`<details class="fonte-toml"><summary>Ver pipeline.toml</summary><pre>${p.toml}</pre></details>`}
 
@@ -102,7 +101,7 @@ export function TelaChecagens({ id }) {
         ${pares.length > visiveis.length && html`<button class="botao-texto" onClick=${() => setTodos(true)}>Mostrar os ${pares.length} pares</button>`}
       `}
       <div class="acoes">
-        <a class="botao pequeno" href=${`api/avaliacoes/${enc}/plagio.jplag`} download>Baixar o relatório .jplag</a>
+        <a class="botao pequeno" href=${`api${rota('avaliacoes', id, 'plagio.jplag')}`} download>Baixar o relatório .jplag</a>
         <a class="botao-texto" href="https://jplag.github.io/JPlag/" target="_blank" rel="noopener">Abrir o visualizador oficial do JPlag</a>
       </div>
     `}
@@ -140,7 +139,7 @@ export function Acompanhar() {
   useEffect(() => {
     if (!foco) return undefined;
     let vivo = true;
-    const carregar = () => api('GET', `/avaliacoes/${encodeURIComponent(foco.avaliacao)}`)
+    const carregar = () => api('GET', rota('avaliacoes', foco.avaliacao))
       .then((p) => {
         if (!vivo) return;
         setPacote(p);
@@ -156,10 +155,7 @@ export function Acompanhar() {
     };
   }, [foco?.avaliacao, foco?.aluno]);
 
-  useEffect(() => {
-    document.documentElement.classList.add('avaliando');
-    return () => document.documentElement.classList.remove('avaliando');
-  }, []);
+  useTelaInteira();
 
   const aluno = foco && pacote?.avaliacao.id === foco.avaliacao ? pacote.turma.alunos.find((a) => a.id === foco.aluno) : null;
   return html`
@@ -184,7 +180,8 @@ export function Acompanhar() {
         `}
         ${foco && !aluno && !erro && html`<p class="acompanhar-espera" aria-busy="true">Carregando…</p>`}
         ${aluno && !pacote.ead && html`<p class="acompanhar-espera">Esta avaliação não tem submissões do Moodle.</p>`}
-        ${aluno && pacote.ead && html`<${PainelCodigo} grande avaliacao=${foco.avaliacao} aluno=${aluno.id} ead=${pacote.ead} alunos=${pacote.turma.alunos} aoMudar=${() => recarregar.current()} />`}
+        ${aluno && pacote.ead && html`<${PainelCodigo} grande avaliacao=${foco.avaliacao} aluno=${aluno.id} ead=${pacote.ead}
+          avisos=${avisosDoCodigo(pacote.ead, aluno.id, pacote.turma.alunos)} aoMudar=${() => recarregar.current()} />`}
       </main>
     </div>
   `;

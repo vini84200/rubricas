@@ -4,7 +4,9 @@ import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import Prism from '../vendor/prism.js';
 import { api } from './api.js';
 import { diferencas } from './diff.js';
-import { cls, plural, guarda } from './util.js';
+import { criarEditor } from './editor.js';
+import { cls, plural, guarda, rota } from './util.js';
+import { useAcao, useGuarda } from './telas/comum.js';
 
 const cache = new Map();
 
@@ -22,7 +24,7 @@ export function useSubmissao(avaliacao, aluno, versao) {
     setEstado({ dados: guardado?.dados || null, erro: null });
     if (guardado && guardado.versao === versao) return undefined;
     let vivo = true;
-    api('GET', `/avaliacoes/${encodeURIComponent(avaliacao)}/submissoes/${encodeURIComponent(aluno)}`)
+    api('GET', rota('avaliacoes', avaliacao, 'submissoes', aluno))
       .then((dados) => {
         cache.set(chave, { dados, versao });
         if (vivo) setEstado({ dados, erro: null });
@@ -77,42 +79,26 @@ function Fonte({ texto, caminho, tamanho, href }) {
   `;
 }
 
-/** Insere texto onde está o cursor sem perder o desfazer (Ctrl+Z) do navegador. */
-function inserir(area, texto) {
-  area.focus();
-  // Com texto vazio, `insertText` não apaga a seleção: aí vale `delete`.
-  const feito = texto ? document.execCommand('insertText', false, texto) : document.execCommand('delete');
-  if (!feito) area.setRangeText(texto, area.selectionStart, area.selectionEnd, 'end');
+function resumoVerificacao(v) {
+  if (!v) return '';
+  if (v.carregando) return 'Carregando o verificador…';
+  if (v.indisponivel) return 'Verificador indisponível';
+  if (!v.erros && !v.avisos) return 'Sem erros';
+  return [v.erros && plural(v.erros, 'erro', 'erros'), v.avisos && plural(v.avisos, 'aviso', 'avisos')].filter(Boolean).join(', ');
 }
 
-/** Editor leve: um textarea transparente sobre o código destacado. Tab indenta,
-    Enter mantém a indentação (e acrescenta depois de `:`), Ctrl+S salva. */
+/** CodeMirror com os erros do Ruff sublinhados. Tab e Shift+Tab mexem no
+    recuo de todas as linhas selecionadas; Ctrl+S salva; Esc sai sem mudanças. */
 function Editor({ caminho, inicial, aoSalvar, aoCancelar }) {
+  const caixa = useRef(null);
   const [texto, setTexto] = useState(inicial);
+  const [aberto, setAberto] = useState(false);
+  const [verificacao, setVerificacao] = useState(null);
   const [ocupado, setOcupado] = useState(false);
   const [erro, setErro] = useState('');
-  const area = useRef(null);
-  const fundo = useRef(null);
-  const gutter = useRef(null);
   const mudou = texto !== inicial;
-
-  useEffect(() => {
-    area.current?.focus();
-  }, []);
-  // Trocar de aluno ou de tela com a edição por salvar pergunta antes.
-  useEffect(() => {
-    guarda.ativa = mudou;
-    return () => {
-      guarda.ativa = false;
-    };
-  }, [mudou]);
-
-  function rolar() {
-    const t = area.current;
-    fundo.current.scrollTop = t.scrollTop;
-    fundo.current.scrollLeft = t.scrollLeft;
-    gutter.current.scrollTop = t.scrollTop;
-  }
+  // Os atalhos do CodeMirror chamam sempre a versão atual destas funções.
+  const atual = useRef({});
 
   async function salvar() {
     if (ocupado) return;
@@ -120,6 +106,7 @@ function Editor({ caminho, inicial, aoSalvar, aoCancelar }) {
       aoCancelar();
       return;
     }
+    if (verificacao?.erros && !confirm(`O código tem ${plural(verificacao.erros, 'erro', 'erros')}. Salvar e checar mesmo assim?`)) return;
     setOcupado(true);
     setErro('');
     try {
@@ -131,59 +118,48 @@ function Editor({ caminho, inicial, aoSalvar, aoCancelar }) {
       setOcupado(false);
     }
   }
+  atual.current = { salvar, sair: () => !mudou && aoCancelar() };
 
-  function aoTeclar(e) {
-    // As teclas do editor não chegam aos atalhos da tela de avaliar.
-    e.stopPropagation();
-    const t = area.current;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      salvar();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      if (!mudou) aoCancelar();
-    } else if (e.key === 'Tab' && !e.ctrlKey && !e.altKey) {
-      e.preventDefault();
-      if (!e.shiftKey) {
-        inserir(t, '    ');
-      } else {
-        const cursor = t.selectionStart;
-        const inicio = t.value.lastIndexOf('\n', cursor - 1) + 1;
-        const espacos = t.value.slice(inicio).match(/^ {1,4}/)?.[0].length || 0;
-        if (espacos) {
-          t.setSelectionRange(inicio, inicio + espacos);
-          inserir(t, '');
-          // O cursor recua junto com a linha, em vez de ir para o começo dela.
-          const novo = Math.max(inicio, cursor - espacos);
-          t.setSelectionRange(novo, novo);
-        }
-      }
-      setTexto(t.value);
-    } else if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
-      e.preventDefault();
-      const linha = t.value.slice(t.value.lastIndexOf('\n', t.selectionStart - 1) + 1, t.selectionStart);
-      let recuo = linha.match(/^[ \t]*/)[0];
-      if (/:\s*(#.*)?$/.test(linha)) recuo += '    ';
-      inserir(t, `\n${recuo}`);
-      setTexto(t.value);
-    }
-  }
+  useEffect(() => {
+    let vista = null;
+    let vivo = true;
+    criarEditor(caixa.current, {
+      texto: inicial,
+      python: caminho.endsWith('.py'),
+      aoMudar: setTexto,
+      aoSalvar: () => atual.current.salvar(),
+      aoSair: () => atual.current.sair(),
+      aoVerificar: (v) => vivo && setVerificacao(v),
+    })
+      .then((v) => {
+        if (vivo) {
+          vista = v;
+          setAberto(true);
+        } else v.destroy();
+      })
+      .catch((e) => vivo && setErro(`Não foi possível abrir o editor: ${e.message}`));
+    return () => {
+      vivo = false;
+      vista?.destroy();
+    };
+  }, []);
 
+  // Trocar de aluno ou de tela com a edição por salvar pergunta antes.
+  useGuarda(mudou);
+
+  const status = resumoVerificacao(verificacao);
+  // As teclas do editor não chegam aos atalhos da tela de avaliar.
   return html`
-    <div class="editor">
-      <div class="editor-corpo">
-        <pre class="codigo-numeros" ref=${gutter} aria-hidden="true">${numeros(`${texto}\n`)}</pre>
-        <div class="editor-camadas">
-          <pre class="codigo-texto editor-fundo" ref=${fundo} aria-hidden="true"><${Destacado} texto=${`${texto}\n`} caminho=${caminho} /></pre>
-          <textarea class="editor-area" ref=${area} value=${texto} wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"
-            aria-label=${`Editar ${caminho}`} onInput=${(e) => setTexto(e.target.value)} onScroll=${rolar} onKeyDown=${aoTeclar}></textarea>
-        </div>
+    <div class="editor-codigo">
+      <div class="editor-corpo" ref=${caixa} onKeyDown=${(e) => e.stopPropagation()}>
+        ${!aberto && !erro && html`<p class="codigo-vazio" aria-busy="true">Abrindo o editor…</p>`}
       </div>
       <div class="editor-barra">
-        <span class="editor-dica">O original do aluno fica guardado. <kbd>Ctrl</kbd>+<kbd>S</kbd> salva.</span>
+        ${status && html`<span class="editor-status" data-erros=${verificacao?.erros > 0 ? 'sim' : verificacao?.avisos > 0 ? 'avisos' : null} role="status">${status}</span>`}
+        <span class="editor-dica"><kbd>Tab</kbd> recua as linhas selecionadas · <kbd>Ctrl</kbd>+<kbd>S</kbd> salva · o original fica guardado</span>
         ${erro && html`<span class="erro" role="alert">${erro}</span>`}
         <button type="button" class="botao pequeno editor-cancelar" disabled=${ocupado} onClick=${() => (!mudou || confirm('Descartar a edição?')) && aoCancelar()}>Cancelar</button>
-        <button type="button" class="botao pequeno primario" disabled=${ocupado} onClick=${salvar}>${ocupado ? 'Salvando…' : 'Salvar e checar de novo'}</button>
+        <button type="button" class="botao pequeno primario" disabled=${ocupado || !aberto} onClick=${salvar}>${ocupado ? 'Salvando…' : 'Salvar e checar de novo'}</button>
       </div>
     </div>
   `;
@@ -193,7 +169,7 @@ function Editor({ caminho, inicial, aoSalvar, aoCancelar }) {
 function Arquivo({ arquivo, href, caminhoApi, podeEditar, aoMudar }) {
   const [verOriginal, setVerOriginal] = useState(false);
   const [editando, setEditando] = useState(false);
-  const [erro, setErro] = useState('');
+  const { rodar, erro } = useAcao();
   const texto = verOriginal && arquivo.editado ? arquivo.original : arquivo.texto;
   const editavel = podeEditar && typeof arquivo.texto === 'string';
 
@@ -204,15 +180,12 @@ function Arquivo({ arquivo, href, caminhoApi, podeEditar, aoMudar }) {
     aoMudar(dados);
   }
 
-  async function desfazer() {
+  function desfazer() {
     if (!confirm(`Voltar ${arquivo.caminho} ao que o aluno enviou? A sua edição se perde.`)) return;
-    try {
+    rodar(async () => {
       aoMudar(await api('DELETE', caminhoApi));
       setVerOriginal(false);
-      setErro('');
-    } catch (e) {
-      setErro(e.message);
-    }
+    });
   }
 
   if (editando) {
@@ -238,7 +211,7 @@ export function Codigo({ avaliacao, aluno, arquivos, aoMudar }) {
   const [escolhido, setEscolhido] = useState(null);
   const atual = lista.find((a) => a.caminho === escolhido) || lista[0];
   if (!atual) return html`<p class="codigo-vazio">Sem arquivos.</p>`;
-  const caminhoApi = (a) => `/avaliacoes/${encodeURIComponent(avaliacao)}/submissoes/${encodeURIComponent(aluno)}/${a.caminho.split('/').map(encodeURIComponent).join('/')}`;
+  const caminhoApi = (a) => rota('avaliacoes', avaliacao, 'submissoes', aluno, ...a.caminho.split('/'));
   return html`
     <div class="codigo">
       ${lista.length > 1 && html`
@@ -312,14 +285,23 @@ export function Checagens({ relatorio, aguardando }) {
   `;
 }
 
+const REFERENCIAS = 'referencias/';
+
+/** Nome do código de referência (do professor), se `id` é um; senão, null. */
+export function referencia(id) {
+  return id.startsWith(REFERENCIAS) ? id.slice(REFERENCIAS.length) : null;
+}
+
+export function nomeAluno(alunos, id) {
+  return alunos.find((a) => a.id === id)?.nome || id;
+}
+
 /** "87% parecido com Bruno Lima" a partir do resumo do pacote. */
 export function textoPlagio(p, alunos) {
   if (!p) return '';
   const pc = Math.round(p.similaridade * 100);
-  const outro = p.com.startsWith('referencias/')
-    ? `a referência ${p.com.slice('referencias/'.length)}`
-    : alunos.find((a) => a.id === p.com)?.nome || p.com;
-  return `${pc}% parecido com ${outro}`;
+  const ref = referencia(p.com);
+  return `${pc}% parecido com ${ref ? `a referência ${ref}` : nomeAluno(alunos, p.com)}`;
 }
 
 /** Avisos do aluno: entrega, mudança depois da correção, plágio, executor. */
@@ -335,9 +317,14 @@ export function avisosEad(ead, aluno, alunos) {
   return avisos;
 }
 
-/** Código e checagens de um aluno, num painel só. */
-/** `semAvisos`: quando a tela já mostra os avisos do aluno em outro lugar. */
-export function PainelCodigo({ avaliacao, aluno, ead, alunos, grande, aoMudar, semAvisos }) {
+/** Os avisos para o alto do painel de código. "Aguardando o executor" fica de fora:
+    as checagens logo abaixo já dizem isso. */
+export function avisosDoCodigo(ead, aluno, alunos) {
+  return avisosEad(ead, aluno, alunos).filter((a) => a.tipo !== 'espera');
+}
+
+/** Código e checagens de um aluno, num painel só, com os `avisos` dados no alto. */
+export function PainelCodigo({ avaliacao, aluno, ead, avisos = [], grande, aoMudar }) {
   const sub = ead?.submissoes[aluno];
   const rel = ead?.relatorios[aluno];
   const versao = `${sub?.alterada_em || 0}:${sub?.edicao?.em || 0}:${rel ? `${rel.atual}:${rel.checagens.map((c) => c.resumo).join('|')}` : ''}`;
@@ -348,7 +335,6 @@ export function PainelCodigo({ avaliacao, aluno, ead, alunos, grande, aoMudar, s
     trocar(d);
     aoMudar();
   });
-  const avisos = semAvisos ? [] : avisosEad(ead, aluno, alunos || []).filter((a) => a.tipo !== 'espera');
   return html`
     <div class=${cls('painel-codigo', grande && 'grande')}>
       ${avisos.length > 0 && html`<ul class="ead-avisos">${avisos.map((a) => html`<li data-tipo=${a.tipo} title=${a.dica}>${a.texto}</li>`)}</ul>`}

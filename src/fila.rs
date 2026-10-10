@@ -12,13 +12,14 @@
 //! trabalho está pendente enquanto não há relatório dessa versão, ou enquanto o
 //! relatório tem erro de execução.
 
-use crate::dados::{Dados, Erro, Res, Tipo, checar_id, gravar, ler_opcional};
+use crate::dados::{Dados, Erro, Res, Tipo, checar_id, gravar, ler_json, ler_opcional, ler_ou};
 use crate::executor::MOTOR;
-use crate::pipeline::{self, Pipeline, Relatorio, Situacao};
-use crate::submissoes::{Arquivos, InfoArquivo, listar, resumo};
+use crate::modelo::Avaliacao;
+use crate::pipeline::{self, Pipeline, Relatorio, Situacao, Sugestao};
+use crate::submissoes::{Arquivos, InfoArquivo, Submissao, Submissoes, listar, resumo};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,12 +65,98 @@ fn versao_checagens(pipeline: &str, codigo: &str) -> String {
     versao(&[MOTOR, pipeline, codigo])
 }
 
-fn ler_json<T: serde::de::DeserializeOwned>(caminho: &Path) -> Res<Option<T>> {
-    match ler_opcional(caminho)? {
-        None => Ok(None),
-        Some(t) => serde_json::from_str(&t).map(Some).map_err(|e| {
-            Erro::Invalido(format!("{}: {e}", caminho.file_name().unwrap_or_default().to_string_lossy()))
-        }),
+/// O pipeline de uma avaliação, como está no disco.
+pub enum EstadoPipeline {
+    Ausente,
+    /// Não vale contra a avaliação (a rubrica mudou depois dele); espera ser corrigido.
+    Invalido(String),
+    Valido(Pipeline),
+}
+
+/// O trabalho de um aluno com submissão.
+pub enum EstadoAluno<'a> {
+    SemRelatorio,
+    Atual(&'a Relatorio),
+    /// O código ou o pipeline mudaram depois do relatório.
+    Desatualizado(&'a Relatorio),
+}
+
+/// Tudo o que decide a fila de uma avaliação, lido do disco uma vez: a fila do
+/// executor, os relatórios da tela e as sugestões saem daqui.
+pub struct Panorama {
+    avaliacao: Avaliacao,
+    pub pipeline: EstadoPipeline,
+    /// Resumo dos arquivos do pipeline; `None` sem `pipeline.toml`.
+    versao_pipeline: Option<String>,
+    pub submissoes: Submissoes,
+    relatorios: BTreeMap<String, Relatorio>,
+    plagio: Option<ResultadoPlagio>,
+    arquivada: bool,
+}
+
+impl Panorama {
+    /// Versão atual do trabalho do aluno; `None` sem pipeline.
+    fn versao(&self, s: &Submissao) -> Option<String> {
+        Some(versao_checagens(self.versao_pipeline.as_deref()?, &s.hash_checagem))
+    }
+
+    /// `None` se o aluno não tem submissão.
+    pub fn estado(&self, aluno: &str) -> Option<EstadoAluno<'_>> {
+        let s = self.submissoes.alunos.get(aluno)?;
+        Some(match self.relatorios.get(aluno) {
+            None => EstadoAluno::SemRelatorio,
+            Some(r) if self.versao(s).as_deref() == Some(r.versao.as_str()) => EstadoAluno::Atual(r),
+            Some(r) => EstadoAluno::Desatualizado(r),
+        })
+    }
+
+    /// Os relatórios de quem tem submissão, cada um com "é da versão atual?".
+    pub fn relatorios(&self) -> impl Iterator<Item = (&str, &Relatorio, bool)> {
+        self.submissoes.alunos.keys().filter_map(|a| match self.estado(a)? {
+            EstadoAluno::SemRelatorio => None,
+            EstadoAluno::Atual(r) => Some((a.as_str(), r, true)),
+            EstadoAluno::Desatualizado(r) => Some((a.as_str(), r, false)),
+        })
+    }
+
+    /// Recalculadas a cada leitura: a cópia da rubrica pode ter mudado depois do
+    /// relatório sem que nada precise rodar de novo. Vazias se ele não é o atual.
+    pub fn sugestoes(&self, aluno: &str) -> Vec<Sugestao> {
+        match (&self.pipeline, self.estado(aluno)) {
+            (EstadoPipeline::Valido(p), Some(EstadoAluno::Atual(r))) => p.sugestoes(&self.avaliacao, &r.checagens),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn plagio(&self) -> Option<&ResultadoPlagio> {
+        self.plagio.as_ref()
+    }
+
+    /// O que falta rodar. Vazia sem pipeline válido ou com a avaliação arquivada.
+    pub fn fila(&self) -> Vec<Tarefa> {
+        let (EstadoPipeline::Valido(p), Some(vp), false) = (&self.pipeline, &self.versao_pipeline, self.arquivada) else {
+            return Vec::new();
+        };
+        let id = &self.avaliacao.id;
+        let mut fila = Vec::new();
+        for (aluno, s) in &self.submissoes.alunos {
+            // Erro de execução não conta como feito.
+            let feito = matches!(self.estado(aluno), Some(EstadoAluno::Atual(r)) if !r.checagens.iter().any(|c| c.situacao == Situacao::Erro));
+            if !feito {
+                fila.push(Tarefa::Checagens { avaliacao: id.clone(), aluno: aluno.clone(), versao: versao_checagens(vp, &s.hash_checagem) });
+            }
+        }
+        if p.plagio.is_some() && self.submissoes.alunos.len() >= 2 {
+            // O plágio compara o que os alunos enviaram, não as edições do professor.
+            let partes: Vec<String> = self.submissoes.alunos.iter().map(|(a, s)| format!("{a}:{}", s.hash)).collect();
+            let mut todas = vec![vp.as_str()];
+            todas.extend(partes.iter().map(String::as_str));
+            let v = versao(&todas);
+            if !self.plagio.as_ref().is_some_and(|r| r.versao == v && r.erro.is_empty()) {
+                fila.push(Tarefa::Plagio { avaliacao: id.clone(), versao: v });
+            }
+        }
+        fila
     }
 }
 
@@ -79,7 +166,7 @@ impl Dados {
         Ok(self.raiz().join("pipelines").join(avaliacao))
     }
 
-    fn pasta_relatorios(&self, avaliacao: &str) -> Res<PathBuf> {
+    pub(crate) fn pasta_relatorios(&self, avaliacao: &str) -> Res<PathBuf> {
         checar_id(avaliacao)?;
         Ok(self.raiz().join("relatorios").join(avaliacao))
     }
@@ -96,15 +183,25 @@ impl Dados {
         pipeline::ler(&texto, &av).map(Some).map_err(|e| Erro::Invalido(format!("pipelines/{avaliacao}/pipeline.toml: {e}")))
     }
 
+    pub fn estado_pipeline(&self, avaliacao: &str) -> EstadoPipeline {
+        match self.ler_pipeline(avaliacao) {
+            Ok(None) => EstadoPipeline::Ausente,
+            Ok(Some(p)) => EstadoPipeline::Valido(p),
+            Err(e) => EstadoPipeline::Invalido(e.to_string()),
+        }
+    }
+
     /// Valida e grava o pipeline. Devolve avisos sobre anexos que faltam.
     pub fn salvar_pipeline_toml(&self, avaliacao: &str, texto: &str) -> Res<(Pipeline, Vec<String>)> {
-        let av = self.ler_avaliacao(avaliacao)?;
-        let p = pipeline::ler(texto, &av).map_err(Erro::Invalido)?;
         let pasta = self.pasta_pipeline(avaliacao)?;
-        {
+        let p = {
+            // Validado sob a trava: a avaliação não muda entre conferir e gravar.
             let _g = self.travar();
+            let p = pipeline::ler(texto, &self.ler_avaliacao(avaliacao)?).map_err(Erro::Invalido)?;
             gravar(&pasta.join("pipeline.toml"), texto.as_bytes())?;
-        }
+            p
+        };
+        self.fila_mudou();
         let mut anexos: Vec<&str> = p.checagens.iter().map(|c| c.testes.as_str()).collect();
         if let Some(pl) = &p.plagio {
             anexos.extend([pl.base.as_str(), pl.referencias.as_str()]);
@@ -130,12 +227,7 @@ impl Dados {
     }
 
     pub fn anexo_pipeline(&self, avaliacao: &str, caminho: &str) -> Res<Vec<u8>> {
-        match fs::read(self.caminho_anexo(avaliacao, caminho)?) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Erro::NaoEncontrado(format!("pipelines/{avaliacao}/{caminho} não existe")))
-            }
-            outro => Ok(outro?),
-        }
+        ler_ou(&self.caminho_anexo(avaliacao, caminho)?, || format!("pipelines/{avaliacao}/{caminho} não existe"))
     }
 
     /// Grava um anexo (testes, esqueleto, referências). O `pipeline.toml` passa
@@ -147,7 +239,9 @@ impl Dados {
         }
         let destino = self.caminho_anexo(avaliacao, caminho)?;
         let _g = self.travar();
-        Ok(gravar(&destino, bytes)?)
+        gravar(&destino, bytes)?;
+        self.fila_mudou();
+        Ok(())
     }
 
     pub fn apagar_anexo_pipeline(&self, avaliacao: &str, caminho: &str) -> Res<()> {
@@ -158,7 +252,11 @@ impl Dados {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Erro::NaoEncontrado(format!("pipelines/{avaliacao}/{caminho} não existe")))
             }
-            outro => Ok(outro?),
+            outro => {
+                outro?;
+                self.fila_mudou();
+                Ok(())
+            }
         }
     }
 
@@ -172,59 +270,44 @@ impl Dados {
         Ok(resumo(&arquivos))
     }
 
+    pub fn panorama(&self, avaliacao: &str) -> Res<Panorama> {
+        let pasta = self.pasta_relatorios(avaliacao)?;
+        let submissoes = self.submissoes(avaliacao)?;
+        let mut relatorios = BTreeMap::new();
+        for aluno in submissoes.alunos.keys() {
+            if let Some(r) = ler_json(&pasta.join(format!("{aluno}.json")))? {
+                relatorios.insert(aluno.clone(), r);
+            }
+        }
+        let versao_pipeline = match self.pipeline_toml(avaliacao)? {
+            Some(_) => Some(self.versao_pipeline(avaliacao)?),
+            None => None,
+        };
+        Ok(Panorama {
+            avaliacao: self.ler_avaliacao(avaliacao)?,
+            pipeline: self.estado_pipeline(avaliacao),
+            versao_pipeline,
+            submissoes,
+            relatorios,
+            plagio: ler_json(&pasta.join(".plagio.json"))?,
+            arquivada: self.arquivadas().contem(Tipo::Avaliacoes, avaliacao),
+        })
+    }
+
     /// Tudo que falta rodar, em todas as avaliações com pipeline.
     pub fn fila(&self) -> Res<Vec<Tarefa>> {
         let mut fila = Vec::new();
         for av in self.listar_avaliacoes()? {
-            // Um pipeline inválido (a rubrica mudou depois dele) espera ser corrigido.
-            let Ok(Some(p)) = self.ler_pipeline(&av.id) else { continue };
-            fila.extend(self.fila_da_avaliacao(&av.id, &p)?);
-        }
-        Ok(fila)
-    }
-
-    /// Vazia se a avaliação está arquivada: o executor não roda mais nada dela.
-    pub fn fila_da_avaliacao(&self, avaliacao: &str, p: &Pipeline) -> Res<Vec<Tarefa>> {
-        if self.arquivadas().contem(Tipo::Avaliacoes, avaliacao) {
-            return Ok(Vec::new());
-        }
-        let vp = self.versao_pipeline(avaliacao)?;
-        let subs = self.submissoes(avaliacao)?;
-        let rel = self.pasta_relatorios(avaliacao)?;
-        let mut fila = Vec::new();
-        for (aluno, s) in &subs.alunos {
-            let v = versao_checagens(&vp, &s.hash_checagem);
-            let feito = ler_json::<Relatorio>(&rel.join(format!("{aluno}.json")))?
-                .is_some_and(|r| r.versao == v && !r.checagens.iter().any(|c| c.situacao == Situacao::Erro));
-            if !feito {
-                fila.push(Tarefa::Checagens { avaliacao: avaliacao.into(), aluno: aluno.clone(), versao: v });
-            }
-        }
-        if p.plagio.is_some() && subs.alunos.len() >= 2 {
-            // O plágio compara o que os alunos enviaram, não as edições do professor.
-            let partes: Vec<String> = subs.alunos.iter().map(|(a, s)| format!("{a}:{}", s.hash)).collect();
-            let mut todas = vec![vp.as_str()];
-            todas.extend(partes.iter().map(String::as_str));
-            let v = versao(&todas);
-            let feito = ler_json::<ResultadoPlagio>(&rel.join(".plagio.json"))?.is_some_and(|r| r.versao == v && r.erro.is_empty());
-            if !feito {
-                fila.push(Tarefa::Plagio { avaliacao: avaliacao.into(), versao: v });
+            if self.pipeline_toml(&av.id)?.is_some() {
+                fila.extend(self.panorama(&av.id)?.fila());
             }
         }
         Ok(fila)
     }
 
-    /// Versão atual do trabalho de um aluno; `None` sem pipeline ou sem submissão.
-    fn versao_trabalho(&self, avaliacao: &str, aluno: &str) -> Res<Option<String>> {
-        if self.pipeline_toml(avaliacao)?.is_none() {
-            return Ok(None);
-        }
-        let Some(s) = self.submissoes(avaliacao)?.alunos.remove(aluno) else { return Ok(None) };
-        Ok(Some(versao_checagens(&self.versao_pipeline(avaliacao)?, &s.hash_checagem)))
-    }
-
-    /// Grava o relatório do executor e calcula as sugestões, se ele é da versão atual.
-    pub fn salvar_relatorio(&self, avaliacao: &str, aluno: &str, mut relatorio: Relatorio, agora: u64) -> Res<Relatorio> {
+    /// Grava o relatório do executor e devolve as sugestões dele. Só aceita o da
+    /// versão atual do trabalho: um executor lento não apaga um relatório mais novo.
+    pub fn salvar_relatorio(&self, avaliacao: &str, aluno: &str, mut relatorio: Relatorio, agora: u64) -> Res<Vec<Sugestao>> {
         checar_id(aluno)?;
         if relatorio.motor != MOTOR {
             return Err(Erro::Conflito(format!(
@@ -232,23 +315,27 @@ impl Dados {
                 relatorio.motor
             )));
         }
-        let p = self.ler_pipeline(avaliacao)?.ok_or_else(|| Erro::NaoEncontrado(format!("A avaliação “{avaliacao}” não tem pipeline")))?;
-        relatorio.sugestoes.clear();
-        if self.versao_trabalho(avaliacao, aluno)?.as_deref() == Some(relatorio.versao.as_str()) {
-            if relatorio.checagens.len() != p.checagens.len() {
-                return Err(Erro::Invalido(format!(
-                    "O relatório tem {} checagens; o pipeline tem {}",
-                    relatorio.checagens.len(),
-                    p.checagens.len()
-                )));
-            }
-            relatorio.sugestoes = p.sugestoes(&self.ler_avaliacao(avaliacao)?, &relatorio.checagens);
+        let _g = self.travar();
+        let panorama = self.panorama(avaliacao)?;
+        let p = match &panorama.pipeline {
+            EstadoPipeline::Valido(p) => p,
+            EstadoPipeline::Ausente => return Err(Erro::NaoEncontrado(format!("A avaliação “{avaliacao}” não tem pipeline"))),
+            EstadoPipeline::Invalido(m) => return Err(Erro::Invalido(m.clone())),
+        };
+        let atual = panorama.submissoes.alunos.get(aluno).and_then(|s| panorama.versao(s));
+        if atual.as_deref() != Some(relatorio.versao.as_str()) {
+            return Err(Erro::Conflito("O trabalho mudou depois que este relatório começou; ele volta para a fila".into()));
+        }
+        if relatorio.checagens.len() != p.checagens.len() {
+            return Err(Erro::Invalido(format!(
+                "O relatório tem {} checagens; o pipeline tem {}",
+                relatorio.checagens.len(),
+                p.checagens.len()
+            )));
         }
         relatorio.gerado_em = agora;
-        let caminho = self.pasta_relatorios(avaliacao)?.join(format!("{aluno}.json"));
-        let _g = self.travar();
-        gravar(&caminho, serde_json::to_string_pretty(&relatorio).unwrap().as_bytes())?;
-        Ok(relatorio)
+        gravar(&self.pasta_relatorios(avaliacao)?.join(format!("{aluno}.json")), serde_json::to_string_pretty(&relatorio).unwrap().as_bytes())?;
+        Ok(p.sugestoes(&panorama.avaliacao, &relatorio.checagens))
     }
 
     pub fn salvar_plagio(&self, avaliacao: &str, mut r: ResultadoPlagio, agora: u64) -> Res<()> {
@@ -263,10 +350,6 @@ impl Dados {
         Ok(gravar(&caminho, serde_json::to_string_pretty(&r).unwrap().as_bytes())?)
     }
 
-    pub fn plagio(&self, avaliacao: &str) -> Res<Option<ResultadoPlagio>> {
-        ler_json(&self.pasta_relatorios(avaliacao)?.join(".plagio.json"))
-    }
-
     /// O `.jplag` para abrir no visualizador oficial.
     pub fn salvar_jplag(&self, avaliacao: &str, bytes: &[u8]) -> Res<()> {
         self.ler_avaliacao(avaliacao)?;
@@ -276,50 +359,7 @@ impl Dados {
     }
 
     pub fn jplag(&self, avaliacao: &str) -> Res<Vec<u8>> {
-        match fs::read(self.pasta_relatorios(avaliacao)?.join(".plagio.jplag")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Erro::NaoEncontrado("O JPlag ainda não rodou nesta avaliação".into())),
-            outro => Ok(outro?),
-        }
-    }
-
-    /// Os relatórios de todos os alunos com submissão, cada um com "é da versão atual?".
-    pub fn relatorios(&self, avaliacao: &str) -> Res<BTreeMap<String, (Relatorio, bool)>> {
-        let vp = match self.pipeline_toml(avaliacao)? {
-            Some(_) => Some(self.versao_pipeline(avaliacao)?),
-            None => None,
-        };
-        let pasta = self.pasta_relatorios(avaliacao)?;
-        let atuais = self.calculo_de_sugestoes(avaliacao);
-        let mut todos = BTreeMap::new();
-        for (aluno, s) in self.submissoes(avaliacao)?.alunos {
-            if let Some(mut r) = ler_json::<Relatorio>(&pasta.join(format!("{aluno}.json")))? {
-                let atual = vp.as_ref().is_some_and(|vp| versao_checagens(vp, &s.hash_checagem) == r.versao);
-                if atual && let Some((p, av)) = &atuais {
-                    r.sugestoes = p.sugestoes(av, &r.checagens);
-                }
-                todos.insert(aluno, (r, atual));
-            }
-        }
-        Ok(todos)
-    }
-
-    /// O relatório do aluno e se ele responde à versão atual do trabalho.
-    pub fn relatorio(&self, avaliacao: &str, aluno: &str) -> Res<Option<(Relatorio, bool)>> {
-        checar_id(aluno)?;
-        let Some(mut r) = ler_json::<Relatorio>(&self.pasta_relatorios(avaliacao)?.join(format!("{aluno}.json")))? else {
-            return Ok(None);
-        };
-        let atual = self.versao_trabalho(avaliacao, aluno)?.as_deref() == Some(r.versao.as_str());
-        if atual && let Some((p, av)) = self.calculo_de_sugestoes(avaliacao) {
-            r.sugestoes = p.sugestoes(&av, &r.checagens);
-        }
-        Ok(Some((r, atual)))
-    }
-
-    /// Pipeline e avaliação atuais, para recalcular sugestões na leitura: a cópia
-    /// da rubrica pode ter mudado depois do relatório sem que nada precise rodar de novo.
-    fn calculo_de_sugestoes(&self, avaliacao: &str) -> Option<(Pipeline, crate::modelo::Avaliacao)> {
-        Some((self.ler_pipeline(avaliacao).ok()??, self.ler_avaliacao(avaliacao).ok()?))
+        ler_ou(&self.pasta_relatorios(avaliacao)?.join(".plagio.jplag"), || "O JPlag ainda não rodou nesta avaliação".into())
     }
 }
 
@@ -362,7 +402,16 @@ saida = "1"
             .unwrap();
         let passaram = u32::from(situacao == Situacao::Passou);
         let r = ResultadoChecagem { nome: "casos".into(), tipo: TipoChecagem::Casos, situacao, passaram, total: 1, resumo: String::new(), casos: vec![], saida: String::new() };
-        Relatorio { versao, motor: crate::executor::MOTOR.into(), gerado_em: 0, checagens: vec![r], sugestoes: vec![] }
+        Relatorio { versao, motor: crate::executor::MOTOR.into(), gerado_em: 0, checagens: vec![r] }
+    }
+
+    /// O relatório do aluno e se ele é o da versão atual.
+    fn atual(d: &Dados, aluno: &str) -> Option<bool> {
+        match d.panorama("ead").unwrap().estado(aluno)? {
+            EstadoAluno::SemRelatorio => None,
+            EstadoAluno::Atual(_) => Some(true),
+            EstadoAluno::Desatualizado(_) => Some(false),
+        }
     }
 
     #[test]
@@ -381,11 +430,12 @@ saida = "1"
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
 
         // o relatório tira o aluno da fila e já vem com a sugestão
-        let r = d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 20).unwrap();
-        assert_eq!(r.sugestoes.len(), 1);
-        assert_eq!(r.gerado_em, 20);
+        let sugestoes = d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 20).unwrap();
+        assert_eq!(sugestoes.len(), 1);
         assert_eq!(pendentes(&d), ["2", "plágio"]);
-        assert!(d.relatorio("ead", "1").unwrap().unwrap().1, "relatório atual");
+        assert_eq!(atual(&d, "1"), Some(true), "relatório atual");
+        let gravado: Relatorio = ler_json(&d.pasta_relatorios("ead").unwrap().join("1.json")).unwrap().unwrap();
+        assert_eq!(gravado.gerado_em, 20);
 
         // a cópia da rubrica muda (binária → nota livre): a sugestão acompanha sem rodar de novo
         std::fs::write(
@@ -394,9 +444,8 @@ saida = "1"
         )
         .unwrap();
         d.salvar_avaliacao(Some("ead"), "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &["codigo".into()]).unwrap();
-        let (r, atual) = d.relatorio("ead", "1").unwrap().unwrap();
-        assert!(atual);
-        assert_eq!(r.sugestoes[0].marcacao, crate::modelo::Marcacao::Nota { nota: 2.0 });
+        assert_eq!(atual(&d, "1"), Some(true));
+        assert_eq!(d.panorama("ead").unwrap().sugestoes("1")[0].marcacao, crate::modelo::Marcacao::Nota { nota: 2.0 });
 
         // um executor com a regra de julgar antiga é recusado, e o aluno segue na fila
         let mut velho = relatorio(&d, "2", Situacao::Passou);
@@ -410,9 +459,13 @@ saida = "1"
         assert_eq!(pendentes(&d), ["2", "plágio"]);
 
         // submissão nova volta para a fila; o relatório antigo fica, marcado como desatualizado
+        let velho: Relatorio = ler_json(&d.pasta_relatorios("ead").unwrap().join("1.json")).unwrap().unwrap();
         d.importar_submissoes("ead", &zip(&[("Ana Souza_1_assignsubmission_file_/main.py", "a2")]), 30).unwrap();
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
-        assert!(!d.relatorio("ead", "1").unwrap().unwrap().1);
+        assert_eq!(atual(&d, "1"), Some(false));
+        assert!(d.panorama("ead").unwrap().sugestoes("1").is_empty(), "sem sugestão de um relatório velho");
+        // o relatório de quem rodou sobre o código antigo chega tarde: é recusado
+        assert!(matches!(d.salvar_relatorio("ead", "1", velho, 31), Err(Erro::Conflito(_))));
 
         // editar o pipeline também
         d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 40).unwrap();
@@ -427,9 +480,9 @@ saida = "1"
         d.editar_arquivo("ead", "1", "main.py", b"a3", "vini", 45).unwrap();
         assert_eq!(pendentes(&d), ["1", "plágio"]);
         assert_eq!(plagio(&d), antes);
-        assert!(!d.relatorio("ead", "1").unwrap().unwrap().1);
+        assert_eq!(atual(&d, "1"), Some(false));
         d.salvar_relatorio("ead", "1", relatorio(&d, "1", Situacao::Passou), 46).unwrap();
-        assert!(d.relatorio("ead", "1").unwrap().unwrap().1, "relatório da versão editada é o atual");
+        assert_eq!(atual(&d, "1"), Some(true), "relatório da versão editada é o atual");
 
         d.salvar_pipeline_toml("ead", &PIPELINE.replace("saida = \"1\"", "saida = \"2\"")).unwrap();
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
@@ -437,8 +490,7 @@ saida = "1"
         // avaliação arquivada não roda mais nada; desarquivada, volta
         d.arquivar(Tipo::Avaliacoes, "ead", true).unwrap();
         assert!(pendentes(&d).is_empty());
-        let p = d.ler_pipeline("ead").unwrap().unwrap();
-        assert!(d.fila_da_avaliacao("ead", &p).unwrap().is_empty(), "nada aguardando o executor");
+        assert!(d.panorama("ead").unwrap().fila().is_empty(), "nada aguardando o executor");
         d.arquivar(Tipo::Avaliacoes, "ead", false).unwrap();
         assert_eq!(pendentes(&d), ["1", "2", "plágio"]);
         std::fs::remove_dir_all(&raiz).unwrap();
@@ -466,7 +518,7 @@ saida = "1"
         let par = Par { a: "1".into(), b: "2".into(), similaridade: 0.87 };
         d.salvar_plagio("ead", ResultadoPlagio { versao, gerado_em: 0, pares: vec![par.clone()], erro: String::new() }, 6).unwrap();
         assert!(!pendentes(&d).contains(&"plágio".to_string()));
-        assert_eq!(d.plagio("ead").unwrap().unwrap().pares, [par]);
+        assert_eq!(d.panorama("ead").unwrap().plagio().unwrap().pares, [par]);
         d.salvar_jplag("ead", b"zip").unwrap();
         assert_eq!(d.jplag("ead").unwrap(), b"zip");
         std::fs::remove_dir_all(&raiz).unwrap();

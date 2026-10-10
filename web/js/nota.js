@@ -91,6 +91,32 @@ export function niveisOrdenados(criterio) {
   return [...criterio.escala.niveis].sort((a, b) => b.pontos - a.pontos);
 }
 
+/**
+ * As opções de marcar com um toque (níveis e sim/não), da melhor para a pior, com
+ * a tecla que escolhe cada uma: a pior é 1. Vazio para nota livre e ponto único,
+ * que pedem um número.
+ */
+export function opcoesDe(criterio) {
+  const e = criterio.escala;
+  if (e.tipo === 'niveis') {
+    const ordem = niveisOrdenados(criterio);
+    return ordem.map((n, i) => {
+      const marcacao = { tipo: 'nivel', nivel: n.id };
+      return { marcacao, rotulo: n.rotulo, pontos: n.pontos, tom: tom(criterio, marcacao), descritor: n.descritor, tecla: ordem.length - i };
+    });
+  }
+  if (e.tipo === 'binaria') {
+    return [true, false].map((atende) => ({
+      marcacao: { tipo: 'binaria', atende },
+      rotulo: atende ? 'Atende' : 'Não atende',
+      pontos: atende ? e.pontos : 0,
+      tom: atende ? 'sim' : 'nao',
+      tecla: atende ? 2 : 1,
+    }));
+  }
+  return [];
+}
+
 /** O que um deslize para a direita (positivo) ou esquerda (negativo) marca. */
 export function marcacaoRapida(criterio, positivo) {
   const e = criterio.escala;

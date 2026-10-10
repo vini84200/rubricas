@@ -81,11 +81,13 @@ pub fn preencher_planilha(
         };
         na_planilha.push(aluno.clone());
         let r = calcular(av, correcoes.get(&aluno));
-        if !r.concluida() {
-            if r.respondidos > 0 {
+        match r.andamento() {
+            Andamento::Concluida => {}
+            Andamento::Parcial => {
                 p.incompletas.push(nome);
+                continue;
             }
-            continue;
+            Andamento::NaoAvaliado => continue,
         }
         if col_alteravel.and_then(|i| l.get(i)).is_some_and(|v| matches!(slug(v).as_str(), "nao" | "no")) {
             p.bloqueadas.push(nome);
@@ -106,7 +108,7 @@ pub fn preencher_planilha(
                 }
                 _ => r.nota,
             };
-            l[col_nota] = crate::api::numero(nota, virgula);
+            l[col_nota] = crate::notas::numero(nota, virgula);
             p.preenchidas += 1;
         }
     }
@@ -133,7 +135,7 @@ fn comentarios(av: &Avaliacao, correcao: &Correcao) -> String {
     let mut partes = Vec::new();
     for ra in &av.rubricas {
         let respostas = correcao.respostas.get(&ra.origem);
-        for c in ra.rubrica.criterios.iter().filter(|c| !c.roteiro()) {
+        for c in ra.rubrica.avaliados() {
             if let Some(x) = respostas.and_then(|m| m.get(&c.id)).filter(|x| !x.comentario.trim().is_empty()) {
                 partes.push(format!("{}: {}", c.nome, x.comentario.trim()));
             }

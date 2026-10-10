@@ -2,6 +2,7 @@
 import { html, render, useState, useEffect, useCallback } from '../vendor/preact-htm.js';
 import { api, fila } from './api.js';
 import { cls, guarda } from './util.js';
+import { CHAVES, ler, escrever, apagar, limparSessao } from './armazem.js';
 import { ListaAvaliacoes, FormAvaliacao, Resultados } from './telas/avaliacoes.js';
 import { ListaRubricas, EditorRubrica } from './telas/rubricas.js';
 import { ListaTurmas, NovaTurma, DetalheTurma } from './telas/turmas.js';
@@ -9,6 +10,7 @@ import { Avaliar } from './telas/avaliar.js';
 import { TelaChecagens, Acompanhar } from './telas/ead.js';
 import { Usuarios, Conta } from './telas/usuarios.js';
 import { sessao } from './sessao.js';
+import { useAcao } from './telas/comum.js';
 
 function lerRota() {
   const partes = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map((p) => {
@@ -72,20 +74,12 @@ function Moldura({ usuario, partes, aoSair }) {
 function Entrar({ aoEntrar, expirou }) {
   const [usuario, setUsuario] = useState('');
   const [senha, setSenha] = useState('');
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro } = useAcao();
 
-  async function enviar(e) {
+  function enviar(e) {
     e.preventDefault();
-    setOcupado(true);
-    setErro('');
-    try {
-      const r = await api('POST', '/entrar', { usuario, senha });
-      aoEntrar(r.usuario);
-    } catch (err) {
-      setErro(err.message);
-      setOcupado(false);
-    }
+    // Segue ocupado até a sessão carregar e esta tela sair.
+    rodar(async () => aoEntrar((await api('POST', '/entrar', { usuario, senha })).usuario));
   }
 
   return html`
@@ -111,8 +105,6 @@ function Entrar({ aoEntrar, expirou }) {
   `;
 }
 
-const SAIDA_PENDENTE = 'rubricas.sair';
-
 function App() {
   // undefined = ainda verificando; null = sem sessão
   const [usuario, setUsuario] = useState(undefined);
@@ -127,7 +119,7 @@ function App() {
     fila.usarUsuario(nome);
     setUsuario(nome);
     if (nome) {
-      localStorage.setItem('rubricas.usuario', nome);
+      escrever(CHAVES.usuario, nome);
       setExpirou(false);
     }
   }
@@ -135,9 +127,9 @@ function App() {
   const verificar = useCallback(async () => {
     try {
       // Um "Sair" feito sem rede termina aqui, antes de qualquer outra coisa.
-      if (localStorage.getItem(SAIDA_PENDENTE)) {
+      if (ler(CHAVES.sairPendente)) {
         await api('POST', '/sair');
-        localStorage.removeItem(SAIDA_PENDENTE);
+        apagar(CHAVES.sairPendente);
       }
       const r = await api('GET', '/sessao');
       setSemRede(false);
@@ -146,7 +138,7 @@ function App() {
       if (e.semRede) {
         // Sem rede, quem já entrou neste aparelho segue com o que está guardado.
         setSemRede(true);
-        definir(localStorage.getItem(SAIDA_PENDENTE) ? null : localStorage.getItem('rubricas.usuario') || null);
+        definir(ler(CHAVES.sairPendente) ? null : ler(CHAVES.usuario) || null);
       } else {
         definir(null);
       }
@@ -193,11 +185,9 @@ function App() {
     } catch (e) {
       // Sem rede não dá para encerrar a sessão no servidor agora: fica anotado e é
       // a primeira coisa feita quando a conexão voltar.
-      if (e.semRede) localStorage.setItem(SAIDA_PENDENTE, '1');
+      if (e.semRede) escrever(CHAVES.sairPendente, '1');
     }
-    for (const k of Object.keys(localStorage)) {
-      if (k.startsWith('rubricas.pacote.') || k === 'rubricas.usuario' || k === 'rubricas.sessao') localStorage.removeItem(k);
-    }
+    limparSessao();
     definir(null);
   }
 
@@ -206,7 +196,12 @@ function App() {
     return html`
       <div class="raiz">
         ${semRede && html`<div class="faixa-aviso">Sem conexão com o servidor.</div>`}
-        <${Entrar} expirou=${expirou} aoEntrar=${() => { localStorage.removeItem(SAIDA_PENDENTE); verificar(); fila.enviarAgora(); }} />
+        <${Entrar} expirou=${expirou} aoEntrar=${() => {
+          apagar(CHAVES.sairPendente);
+          const pronto = verificar();
+          fila.enviarAgora();
+          return pronto;
+        }} />
       </div>
     `;
   }

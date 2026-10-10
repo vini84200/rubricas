@@ -2,10 +2,12 @@
 //! os contêineres está em `executor.rs`.
 
 use crate::fila::Par;
-use crate::pipeline::{Caso, ResultadoCaso, ResultadoChecagem, Situacao, TipoChecagem};
+use crate::pipeline::{Checagem, ResultadoCaso, ResultadoChecagem, Situacao, TipoChecagem};
+use serde::Deserialize;
 
-/// O que uma execução do programa do aluno produziu.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// O que uma execução produziu: o contêiner de uma checagem ou, nos casos, cada
+/// execução do programa do aluno (o script dos casos as devolve neste formato).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Execucao {
     pub saida: String,
     pub erro: String,
@@ -43,15 +45,50 @@ pub fn fim(texto: &str) -> String {
     }
 }
 
-/// Julga os casos de uma checagem `casos`.
-pub fn julgar_casos(nome: &str, casos: &[Caso], execucoes: &[Execucao], ignorar_maiusculas: bool) -> ResultadoChecagem {
+/// Marca que o script dos casos imprime antes do JSON com as execuções.
+pub const MARCA_CASOS: &str = "@@rubricas@@";
+
+/// Linha que o script de estilo imprime quando o `ruff format --check` reprova.
+pub const MARCA_FORMATO: &str = "FORMATO";
+
+/// Julga o que a checagem produziu no contêiner.
+pub fn julgar(ch: &Checagem, s: &Execucao) -> ResultadoChecagem {
+    match ch.tipo {
+        TipoChecagem::Casos => julgar_conteiner_dos_casos(ch, s),
+        TipoChecagem::Pytest => julgar_pytest(ch, s),
+        TipoChecagem::Estilo => julgar_estilo(ch, s),
+        TipoChecagem::Comando => julgar_comando(ch, s),
+    }
+}
+
+/// O que o script dos casos imprimiu depois da marca, se ele chegou ao fim.
+pub fn ler_execucoes(saida: &str) -> Option<Vec<Execucao>> {
+    let (_, json) = saida.rsplit_once(MARCA_CASOS)?;
+    serde_json::from_str(json.trim()).ok()
+}
+
+fn julgar_conteiner_dos_casos(ch: &Checagem, s: &Execucao) -> ResultadoChecagem {
+    match ler_execucoes(&s.saida) {
+        Some(ex) => julgar_casos(ch, &ex),
+        // O contêiner inteiro estourou (memória, tempo total): todos os casos falham.
+        None if s.tempo_esgotado || s.codigo == Some(137) => {
+            let motivo = if s.tempo_esgotado { "tempo esgotado" } else { "memória esgotada" };
+            let ex = vec![Execucao { erro: motivo.into(), tempo_esgotado: s.tempo_esgotado, ..Default::default() }; ch.casos.len()];
+            julgar_casos(ch, &ex)
+        }
+        None => ResultadoChecagem::erro(ch, &format!("o executor de casos não respondeu:\n{}{}", s.saida, s.erro)),
+    }
+}
+
+/// Julga os casos de uma checagem `casos`, uma execução por caso.
+pub fn julgar_casos(ch: &Checagem, execucoes: &[Execucao]) -> ResultadoChecagem {
     let mut resultados = Vec::new();
-    for (caso, ex) in casos.iter().zip(execucoes) {
+    for (caso, ex) in ch.casos.iter().zip(execucoes) {
         let motivo = if ex.tempo_esgotado {
             "tempo esgotado".to_string()
         } else {
             match ex.codigo {
-                Some(0) if confere(&caso.saida, &ex.saida, ignorar_maiusculas) => String::new(),
+                Some(0) if confere(&caso.saida, &ex.saida, ch.ignorar_maiusculas) => String::new(),
                 Some(0) => "saída diferente".into(),
                 Some(c) => format!("terminou com erro (código {c})"),
                 None => "interrompido".into(),
@@ -68,17 +105,53 @@ pub fn julgar_casos(nome: &str, casos: &[Caso], execucoes: &[Execucao], ignorar_
         });
     }
     let passaram = resultados.iter().filter(|r| r.passou).count() as u32;
-    let total = casos.len() as u32;
-    ResultadoChecagem {
-        nome: nome.into(),
-        tipo: TipoChecagem::Casos,
-        situacao: if passaram == total { Situacao::Passou } else { Situacao::Falhou },
-        passaram,
-        total,
-        resumo: format!("{passaram} de {total} {}", if total == 1 { "caso" } else { "casos" }),
-        casos: resultados,
-        saida: String::new(),
+    let total = ch.casos.len() as u32;
+    let resumo = format!("{passaram} de {total} {}", if total == 1 { "caso" } else { "casos" });
+    ResultadoChecagem { casos: resultados, ..ResultadoChecagem::contagem(ch, passaram, total, resumo, String::new()) }
+}
+
+fn julgar_pytest(ch: &Checagem, s: &Execucao) -> ResultadoChecagem {
+    let (passaram, total) = resumo_pytest(&s.saida).unwrap_or((0, 0));
+    let resumo = if s.tempo_esgotado {
+        "tempo esgotado".to_string()
+    } else if total == 0 {
+        "nenhum teste rodou".to_string()
+    } else {
+        format!("{passaram} de {total} {}", if total == 1 { "teste" } else { "testes" })
+    };
+    let r = ResultadoChecagem::contagem(ch, passaram, total, resumo, fim(&format!("{}{}", s.saida, s.erro)));
+    // Estourou o tempo: falha, mesmo que o resumo impresso antes diga que tudo passou.
+    if s.tempo_esgotado { ResultadoChecagem { situacao: Situacao::Falhou, ..r } } else { r }
+}
+
+fn julgar_estilo(ch: &Checagem, s: &Execucao) -> ResultadoChecagem {
+    let Some(mut problemas) = problemas_ruff(&s.saida) else {
+        return ResultadoChecagem::erro(ch, &format!("não entendi a saída do ruff:\n{}{}", s.saida, s.erro));
+    };
+    let formato = s.saida.lines().any(|l| l.trim() == MARCA_FORMATO);
+    if formato {
+        problemas += 1;
     }
+    let resumo = match (problemas, formato) {
+        (0, _) => "sem problemas de estilo".to_string(),
+        (1, true) => "formatação fora do padrão".to_string(),
+        (n, true) => format!("{} problemas de estilo e formatação fora do padrão", n - 1),
+        (1, false) => "1 problema de estilo".to_string(),
+        (n, false) => format!("{n} problemas de estilo"),
+    };
+    let saida = fim(&s.saida.replace(&format!("{MARCA_FORMATO}\n"), ""));
+    ResultadoChecagem::contagem(ch, u32::from(problemas == 0), 1, resumo, saida)
+}
+
+fn julgar_comando(ch: &Checagem, s: &Execucao) -> ResultadoChecagem {
+    let resumo = match (s.tempo_esgotado, s.codigo) {
+        (true, _) => "tempo esgotado".to_string(),
+        (_, Some(0)) => "passou".to_string(),
+        (_, Some(c)) => format!("terminou com código {c}"),
+        (_, None) => "interrompido".to_string(),
+    };
+    let ok = s.codigo == Some(0) && !s.tempo_esgotado;
+    ResultadoChecagem::contagem(ch, u32::from(ok), 1, resumo, fim(&format!("{}{}", s.saida, s.erro)))
 }
 
 /// (passaram, total) a partir da saída do `pytest -q`. Erros de coleta (o
@@ -163,6 +236,7 @@ pub fn pares_jplag(csv: &str) -> Result<Vec<Par>, String> {
 #[cfg(test)]
 mod testes {
     use super::*;
+    use crate::pipeline::Caso;
 
     #[test]
     fn saida_confere_ignorando_espacos_no_fim_e_opcionalmente_maiusculas() {
@@ -178,18 +252,29 @@ mod testes {
         Caso { nome: format!("com {entrada}"), entrada: entrada.into(), saida: saida.into(), argumentos: vec![] }
     }
 
+    fn checagem(tipo: &str) -> Checagem {
+        toml::from_str(&format!("tipo = \"{tipo}\"\nnome = \"{tipo}\"")).unwrap()
+    }
+
+    fn casos(casos: &[Caso]) -> Checagem {
+        Checagem { casos: casos.to_vec(), ..checagem("casos") }
+    }
+
+    fn saiu(saida: &str, codigo: Option<i32>) -> Execucao {
+        Execucao { saida: saida.into(), codigo, ..Default::default() }
+    }
+
     #[test]
     fn casos_que_nao_rodam_reprovam_e_mostram_o_fim_do_erro() {
-        let casos = [caso("2 3", "5"), caso("1 1", "2"), caso("0 0", "0"), caso("9 9", "18")];
-        let rodou = |saida: &str| Execucao { saida: saida.into(), codigo: Some(0), ..Default::default() };
+        let ch = casos(&[caso("2 3", "5"), caso("1 1", "2"), caso("0 0", "0"), caso("9 9", "18")]);
         let longo = format!("{}\nZeroDivisionError: division by zero\n", "Traceback linha\n".repeat(200));
         let execucoes = [
-            rodou("5\n"),
-            rodou("3\n"),
+            saiu("5\n", Some(0)),
+            saiu("3\n", Some(0)),
             Execucao { erro: longo, codigo: Some(1), ..Default::default() },
             Execucao { tempo_esgotado: true, ..Default::default() },
         ];
-        let r = julgar_casos("Exemplos", &casos, &execucoes, false);
+        let r = julgar_casos(&ch, &execucoes);
         assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Falhou, 1, 4, "1 de 4 casos"));
         assert_eq!(r.tipo, TipoChecagem::Casos);
         assert_eq!(r.casos[1].motivo, "saída diferente");
@@ -199,8 +284,89 @@ mod testes {
         assert!(r.casos[2].erro.len() <= 2100, "só o fim do stderr");
         assert_eq!(r.casos[3].motivo, "tempo esgotado");
 
-        let tudo = julgar_casos("Exemplos", &casos[..1], &execucoes[..1], false);
+        let tudo = julgar_casos(&casos(&ch.casos[..1]), &execucoes[..1]);
         assert_eq!((tudo.situacao, tudo.resumo.as_str()), (Situacao::Passou, "1 de 1 caso"));
+    }
+
+    #[test]
+    fn le_os_casos_que_o_conteiner_devolveu() {
+        let ch = casos(&[caso("1", "1"), caso("2", "2")]);
+        let json = r#"[{"saida":"1\n","erro":"","codigo":0,"tempo_esgotado":false},{"saida":"9\n","erro":"","codigo":0,"tempo_esgotado":false}]"#;
+        let r = julgar(&ch, &saiu(&format!("lixo do aluno\n{MARCA_CASOS}{json}\n"), Some(0)));
+        assert_eq!((r.situacao, r.passaram, r.total), (Situacao::Falhou, 1, 2));
+
+        // o contêiner estourou a memória ou o tempo antes do fim: todos os casos falham
+        let r = julgar(&ch, &saiu("", Some(137)));
+        assert_eq!((r.situacao, r.passaram, r.total), (Situacao::Falhou, 0, 2));
+        assert_eq!(r.casos[0].erro, "memória esgotada");
+        let r = julgar(&ch, &Execucao { tempo_esgotado: true, ..Default::default() });
+        assert_eq!(r.casos[1].motivo, "tempo esgotado");
+
+        // terminou sem a marca: falha do executor, não do aluno
+        let r = julgar(&ch, &saiu("Traceback: casos.py quebrou", Some(1)));
+        assert_eq!((r.situacao, r.total), (Situacao::Erro, 0));
+        assert_eq!(r.resumo, "o executor de casos não respondeu:");
+        assert!(r.saida.contains("casos.py quebrou"));
+    }
+
+    #[test]
+    fn julga_o_pytest() {
+        let ch = checagem("pytest");
+        let r = julgar(&ch, &saiu("..F.\n1 failed, 3 passed in 0.12s\n", Some(1)));
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Falhou, 3, 4, "3 de 4 testes"));
+        let r = julgar(&ch, &saiu("1 passed in 0.01s\n", Some(0)));
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Passou, 1, 1, "1 de 1 teste"));
+        // nenhum teste rodou (o arquivo do aluno nem importa): uma falha
+        let r = julgar(&ch, &Execucao { erro: "ImportError".into(), codigo: Some(4), ..Default::default() });
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Falhou, 0, 1, "nenhum teste rodou"));
+        assert_eq!(r.saida, "ImportError");
+        // estourou o tempo: não passa, nem com o resumo todo verde
+        let r = julgar(&ch, &Execucao { saida: "2 passed in 9s".into(), tempo_esgotado: true, ..Default::default() });
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Falhou, 2, 2, "tempo esgotado"));
+    }
+
+    #[test]
+    fn julga_o_estilo() {
+        let ch = checagem("estilo");
+        let r = julgar(&ch, &saiu("All checks passed!\n", Some(0)));
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Passou, 1, 1, "sem problemas de estilo"));
+        let r = julgar(&ch, &saiu("a.py:1:1: F401\nb.py:2:1: E501\nFound 2 errors.\n", Some(1)));
+        assert_eq!((r.situacao, r.passaram, r.resumo.as_str()), (Situacao::Falhou, 0, "2 problemas de estilo"));
+        assert_eq!(julgar(&ch, &saiu("x\nFound 1 error.\n", Some(1))).resumo, "1 problema de estilo");
+
+        // a marca do `ruff format --check` conta como mais um problema e some da saída
+        let formato = format!("All checks passed!\n{MARCA_FORMATO}\n");
+        let r = julgar(&ch, &saiu(&formato, Some(0)));
+        assert_eq!((r.situacao, r.resumo.as_str()), (Situacao::Falhou, "formatação fora do padrão"));
+        assert_eq!(r.saida, "All checks passed!\n");
+        let r = julgar(&ch, &saiu(&format!("x\nFound 3 errors.\n{MARCA_FORMATO}\n"), Some(1)));
+        assert_eq!(r.resumo, "3 problemas de estilo e formatação fora do padrão");
+
+        // saída que não é do ruff: falha do executor
+        let r = julgar(&ch, &Execucao { erro: "sh: ruff: not found".into(), codigo: Some(127), ..Default::default() });
+        assert_eq!((r.situacao, r.resumo.as_str()), (Situacao::Erro, "não entendi a saída do ruff:"));
+    }
+
+    #[test]
+    fn julga_o_comando() {
+        let ch = checagem("comando");
+        let r = julgar(&ch, &saiu("ok\n", Some(0)));
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Passou, 1, 1, "passou"));
+        let r = julgar(&ch, &Execucao { saida: "a".into(), erro: "b".into(), codigo: Some(2), ..Default::default() });
+        assert_eq!((r.situacao, r.passaram, r.resumo.as_str(), r.saida.as_str()), (Situacao::Falhou, 0, "terminou com código 2", "ab"));
+        assert_eq!(julgar(&ch, &saiu("", None)).resumo, "interrompido");
+        let r = julgar(&ch, &Execucao { codigo: Some(0), tempo_esgotado: true, ..Default::default() });
+        assert_eq!((r.situacao, r.resumo.as_str()), (Situacao::Falhou, "tempo esgotado"));
+    }
+
+    #[test]
+    fn codigo_que_nao_rodou_conta_cada_caso_ou_uma_falha() {
+        let r = ResultadoChecagem::nao_rodou(&casos(&[caso("1", "1"), caso("2", "2")]), "sem .py");
+        assert_eq!((r.situacao, r.passaram, r.total, r.resumo.as_str()), (Situacao::Falhou, 0, 2, "não rodou: sem .py"));
+        let r = ResultadoChecagem::nao_rodou(&checagem("pytest"), "sem .py");
+        assert_eq!((r.situacao, r.total), (Situacao::Falhou, 1));
+        let r = ResultadoChecagem::erro(&checagem("estilo"), "podman: sem imagem\ndetalhes");
+        assert_eq!((r.situacao, r.total, r.resumo.as_str()), (Situacao::Erro, 0, "podman: sem imagem"));
     }
 
     #[test]

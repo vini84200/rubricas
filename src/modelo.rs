@@ -3,10 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
-fn um() -> f64 {
+pub(crate) fn um() -> f64 {
     1.0
 }
-fn dez() -> f64 {
+pub(crate) fn dez() -> f64 {
     10.0
 }
 #[allow(clippy::ptr_arg)] // assinatura exigida pelo serde
@@ -169,14 +169,20 @@ pub enum Desempenho {
 
 // ---------- Identificadores ----------
 
+/// O que não pode aparecer num nome de arquivo em nenhum sistema.
+fn proibido(c: char) -> bool {
+    c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+}
+
 /// Um id vira nome de arquivo, então não pode conter separadores de caminho.
 pub fn id_valido(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 100
-        && !id.starts_with('.')
-        && !id.ends_with(' ')
-        && !id.starts_with(' ')
-        && !id.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    !id.is_empty() && id.len() <= 100 && !id.starts_with('.') && !id.ends_with(' ') && !id.starts_with(' ') && !id.chars().any(proibido)
+}
+
+/// Um caminho relativo seguro: partes que valem como nome de arquivo e não
+/// começam com ponto (nem `..`, nem arquivos ocultos).
+pub fn caminho_seguro(caminho: &str) -> bool {
+    !caminho.is_empty() && caminho.split('/').all(id_valido)
 }
 
 /// Transforma um texto livre em id legível: minúsculas, sem acentos, com hífens.
@@ -244,7 +250,7 @@ impl Rubrica {
         if self.titulo.trim().is_empty() {
             return Err("A rubrica precisa de um título".into());
         }
-        if !self.criterios.iter().any(|c| !c.roteiro()) {
+        if self.avaliados().next().is_none() {
             return Err("A rubrica precisa de pelo menos um critério".into());
         }
         let mut ids = HashSet::new();
@@ -369,10 +375,15 @@ impl Rubrica {
         }
     }
 
+    /// Os critérios que entram na nota: tudo menos os passos de roteiro.
+    pub fn avaliados(&self) -> impl Iterator<Item = &Criterio> {
+        self.criterios.iter().filter(|c| !c.roteiro())
+    }
+
     /// (critérios avaliados, passos de roteiro)
     pub fn contagem(&self) -> (usize, usize) {
-        let passos = self.criterios.iter().filter(|c| c.roteiro()).count();
-        (self.criterios.len() - passos, passos)
+        let avaliados = self.avaliados().count();
+        (avaliados, self.criterios.len() - avaliados)
     }
 
     pub fn criterio(&self, id: &str) -> Option<&Criterio> {
@@ -451,7 +462,7 @@ impl Avaliacao {
     }
 
     pub fn total_criterios(&self) -> usize {
-        self.rubricas.iter().map(|r| r.rubrica.criterios.iter().filter(|c| !c.roteiro()).count()).sum()
+        self.rubricas.iter().map(|r| r.rubrica.avaliados().count()).sum()
     }
 }
 
@@ -470,9 +481,28 @@ pub struct Resultado {
     pub total: usize,
 }
 
+/// Onde a correção de um aluno está.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Andamento {
+    NaoAvaliado,
+    /// Algum critério marcado, mas não todos.
+    Parcial,
+    Concluida,
+}
+
 impl Resultado {
+    pub fn andamento(&self) -> Andamento {
+        if self.total > 0 && self.respondidos == self.total {
+            Andamento::Concluida
+        } else if self.respondidos > 0 {
+            Andamento::Parcial
+        } else {
+            Andamento::NaoAvaliado
+        }
+    }
+
     pub fn concluida(&self) -> bool {
-        self.total > 0 && self.respondidos == self.total
+        self.andamento() == Andamento::Concluida
     }
 }
 
@@ -486,7 +516,7 @@ pub fn calcular(av: &Avaliacao, correcao: Option<&Correcao>) -> Resultado {
     for ra in &av.rubricas {
         let respostas = correcao.and_then(|c| c.respostas.get(&ra.origem));
         let (mut pontos, mut maximo) = (0.0, 0.0);
-        for c in ra.rubrica.criterios.iter().filter(|c| !c.roteiro()) {
+        for c in ra.rubrica.avaliados() {
             total += 1;
             maximo += c.peso * c.maximo();
             let p = respostas.and_then(|r| r.get(&c.id)).and_then(|r| c.pontos(&r.marcacao).ok());
@@ -514,7 +544,7 @@ fn parece_id(s: &str) -> bool {
 fn id_seguro(s: &str) -> String {
     let mut limpo = String::new();
     for c in s.trim().chars() {
-        let c = if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c };
+        let c = if proibido(c) { '_' } else { c };
         // o limite de `id_valido` é em bytes, não em caracteres
         if limpo.len() + c.len_utf8() > 100 {
             break;

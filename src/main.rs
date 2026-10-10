@@ -9,6 +9,7 @@ mod executor;
 mod fila;
 mod modelo;
 mod moodle;
+mod notas;
 mod permissoes;
 mod pipeline;
 mod submissoes;
@@ -17,6 +18,10 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Depois do sinal de parar, quanto tempo as requisições em curso têm para terminar.
+const PRAZO_PARA_ENCERRAR: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(name = "rubricas", version, about = "Avaliação por rubricas: pasta de arquivos + aplicação web")]
@@ -119,13 +124,14 @@ fn instalar_skill() -> Result<String, String> {
 }
 
 fn token(nome: &str, dados: &std::path::Path, remover: bool) -> Result<String, String> {
+    let usuarios = auth::Usuarios::abrir(dados);
     if remover {
-        return match auth::remover_token(dados, nome)? {
+        return match usuarios.remover_token(nome).map_err(|e| e.to_string())? {
             true => Ok(format!("Token de {nome} removido.")),
             false => Err(format!("{nome} não tem token.")),
         };
     }
-    let t = auth::criar_token(dados, nome)?;
+    let t = usuarios.criar_token(nome).map_err(|e| e.to_string())?;
     Ok(format!("{t}\n\nToken de {nome} criado (o anterior, se havia, deixou de valer). Ele não será mostrado de novo."))
 }
 
@@ -142,45 +148,48 @@ fn pedir_senha() -> Result<String, String> {
 fn usuario(nome: &str, dados: &PathBuf, remover: bool, papel: Option<String>) -> Result<String, String> {
     std::fs::create_dir_all(dados).map_err(|e| format!("{}: {e}", dados.display()))?;
     let permissoes = permissoes::Permissoes::abrir(dados)?;
+    let usuarios = auth::Usuarios::abrir(dados);
+    let texto = |e: dados::Erro| e.to_string();
     if remover {
-        return match auth::remover_usuario(dados, nome)? {
-            true => {
-                permissoes.esquecer_usuario(nome)?;
-                Ok(format!("Usuário {nome} removido."))
-            }
-            false => Err(format!("Não existe usuário {nome}.")),
-        };
+        contas::remover(&usuarios, &permissoes, nome).map_err(texto)?;
+        return Ok(format!("Usuário {nome} removido."));
     }
     if let Some(p) = &papel
         && !permissoes.papeis_globais().contains(p)
     {
         return Err(format!("Papel desconhecido: {p}. Use um de: {}", permissoes.papeis_globais().join(", ")));
     }
-    if let (Some(gravado), Some(p)) = (auth::nome_gravado(dados, nome), &papel) {
-        auth::definir_papel(dados, &gravado, p)?;
-        return Ok(format!("{gravado} agora é {p}."));
+    if let Some(gravado) = usuarios.nome_gravado(nome) {
+        if let Some(p) = &papel {
+            usuarios.definir_papel(&gravado, p, |p| permissoes.gere_usuarios(p)).map_err(texto)?;
+            return Ok(format!("{gravado} agora é {p}."));
+        }
+        usuarios.trocar_senha(&gravado, &pedir_senha()?).map_err(texto)?;
+        return Ok(format!("Senha de {gravado} atualizada."));
     }
-    let primeiro = auth::listar(dados)?.is_empty();
-    let papel = papel.unwrap_or_else(|| if primeiro { "admin".into() } else { "monitor".into() });
-    let senha = pedir_senha()?;
-    Ok(match auth::definir_senha(dados, nome, &senha, &papel)? {
-        true => format!("Usuário {nome} criado ({papel})."),
-        false => format!("Senha de {nome} atualizada."),
-    })
+    // O primeiro usuário precisa poder gerir os outros.
+    let primeiro = usuarios.listar().map_err(texto)?.is_empty();
+    let padrao = match primeiro {
+        true => permissoes.papeis_globais().iter().find(|p| permissoes.gere_usuarios(p)).map(String::as_str),
+        false => permissoes.papel_global_padrao(),
+    };
+    let papel = papel.or(padrao.map(String::from)).ok_or("Diga o papel com --papel.")?;
+    usuarios.criar(nome, &pedir_senha()?, &papel).map_err(texto)?;
+    Ok(format!("Usuário {nome} criado ({papel})."))
 }
 
 fn compartilhar(tipo: &str, id: &str, usuario: &str, papel: Option<String>, dados: &std::path::Path, remover: bool) -> Result<String, String> {
-    let t = permissoes::tipo_por_nome(tipo).ok_or(format!("Tipo desconhecido: {tipo}. Use avaliacao, rubrica ou turma."))?;
+    let t = dados::Tipo::por_nome(tipo).ok_or(format!("Tipo desconhecido: {tipo}. Use avaliacao, rubrica ou turma."))?;
     let permissoes = permissoes::Permissoes::abrir(dados)?;
-    let usuario = auth::nome_gravado(dados, usuario).ok_or(format!("Não existe usuário {usuario}."))?;
+    let usuario = auth::Usuarios::abrir(dados).nome_gravado(usuario).ok_or(format!("Não existe usuário {usuario}."))?;
     if remover {
-        return match permissoes.revogar(t, id, &usuario)? {
+        return match permissoes.revogar(t, id, &usuario).map_err(|e| e.to_string())? {
             true => Ok(format!("{usuario} não tem mais acesso a {tipo} {id}.")),
             false => Err(format!("{usuario} não tinha acesso a {tipo} {id}.")),
         };
     }
     let papel = papel.ok_or("Diga o papel (ou use --remover).")?;
-    permissoes.conceder(t, id, &usuario, &papel, "terminal", auth::agora())?;
+    permissoes.conceder(t, id, &usuario, &papel, "terminal", auth::agora()).map_err(|e| e.to_string())?;
     Ok(format!("{usuario} agora é {papel} em {tipo} {id}."))
 }
 
@@ -207,12 +216,47 @@ async fn servir(dados: PathBuf, endereco: String, web: Option<PathBuf>) -> Resul
     let escuta = tokio::net::TcpListener::bind(&endereco).await.map_err(|e| format!("{endereco}: {e}"))?;
     println!("Dados em {}", dados.display());
     println!("Servindo em http://{}", escuta.local_addr().map_err(|e| e.to_string())?);
-    axum::serve(escuta, api::rotas(estado))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .map_err(|e| e.to_string())
+    let avisos = estado.avisos.clone();
+    let encerrando = avisos.encerramento();
+    let servidor = axum::serve(escuta, api::rotas(estado)).with_graceful_shutdown(async move {
+        sinal_para_parar().await;
+        println!("Encerrando… (Ctrl+C de novo para sair já)");
+        // As conexões de eventos (SSE) terminam; as demais têm o prazo para acabar.
+        avisos.encerrar();
+    });
+    let a_forca = async {
+        encerrando.await;
+        tokio::select! {
+            _ = sinal_para_parar() => {}
+            _ = tokio::time::sleep(PRAZO_PARA_ENCERRAR) => {}
+        }
+    };
+    tokio::select! {
+        r = servidor => r.map_err(|e| e.to_string()),
+        _ = a_forca => Err("encerrado sem esperar as requisições em curso".into()),
+    }
+}
+
+/// Ctrl+C no terminal ou SIGTERM (`docker stop`).
+async fn sinal_para_parar() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }
 
 #[tokio::main]

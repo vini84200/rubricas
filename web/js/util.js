@@ -70,20 +70,3 @@ export function ir(caminho, substituir = false) {
 export function rota(...partes) {
   return `/${partes.map(encodeURIComponent).join('/')}`;
 }
-
-export function guardar(nome, valor) {
-  try {
-    localStorage.setItem(nome, JSON.stringify(valor));
-  } catch {
-    /* armazenamento cheio ou bloqueado: segue só em memória */
-  }
-}
-
-export function recuperar(nome, padrao = null) {
-  try {
-    const bruto = localStorage.getItem(nome);
-    return bruto === null ? padrao : JSON.parse(bruto);
-  } catch {
-    return padrao;
-  }
-}

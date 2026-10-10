@@ -1,0 +1,36 @@
+codemirror.js: CodeMirror 6 empacotado num módulo ES só (esbuild 0.25.10, --bundle --format=esm --minify).
+Versões: @codemirror/view 6.43.14, state 6.7.6, commands 6.11.1, language 6.13.1, lang-python 6.2.1,
+lint 6.9.7, autocomplete 6.20.3, search 6.7.2, @lezer/highlight 1.2.5. Entrada usada:
+
+export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, highlightSpecialChars } from '@codemirror/view';
+export { EditorState } from '@codemirror/state';
+export { defaultKeymap, history, historyKeymap, indentWithTab, indentMore, indentLess } from '@codemirror/commands';
+export { python } from '@codemirror/lang-python';
+export { linter, lintGutter, forceLinting } from '@codemirror/lint';
+export { syntaxHighlighting, HighlightStyle, indentUnit, bracketMatching, indentOnInput } from '@codemirror/language';
+export { tags } from '@lezer/highlight';
+export { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
+export { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
+
+----- Licença (MIT, a mesma para todos os pacotes @codemirror e @lezer) -----
+MIT License
+
+Copyright (C) 2018-2021 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

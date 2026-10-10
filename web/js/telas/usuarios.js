@@ -2,30 +2,24 @@
 import { html, useState } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { sessao, descreverPapel } from '../sessao.js';
-import { useDados, Estado, Titulo } from './comum.js';
+import { rota } from '../util.js';
+import { useDados, useAcao, Estado, Titulo } from './comum.js';
 
 function NovoUsuario({ aoCriar }) {
   const papeis = sessao.get().papeis_globais;
   const [nome, setNome] = useState('');
   const [senha, setSenha] = useState('');
   const [papel, setPapel] = useState(papeis.includes('monitor') ? 'monitor' : papeis[0]);
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro } = useAcao();
 
-  async function enviar(e) {
+  function enviar(e) {
     e.preventDefault();
-    setOcupado(true);
-    setErro('');
-    try {
+    rodar(async () => {
       await api('POST', '/usuarios', { nome: nome.trim(), senha, papel });
       setNome('');
       setSenha('');
       aoCriar();
-    } catch (err) {
-      setErro(err.message);
-    } finally {
-      setOcupado(false);
-    }
+    });
   }
 
   return html`
@@ -55,19 +49,13 @@ function NovoUsuario({ aoCriar }) {
 }
 
 function LinhaUsuario({ u, aoMudar }) {
-  const [erro, setErro] = useState('');
+  const { rodar, erro } = useAcao();
   const eu = sessao.get().usuario === u.nome;
-  const caminho = `/usuarios/${encodeURIComponent(u.nome)}`;
 
-  async function fazer(metodo, corpo) {
-    setErro('');
-    try {
-      await api(metodo, caminho, corpo);
-      aoMudar();
-    } catch (e) {
-      setErro(e.message);
-    }
-  }
+  const fazer = (metodo, corpo) => rodar(async () => {
+    await api(metodo, rota('usuarios', u.nome), corpo);
+    aoMudar();
+  });
 
   function novaSenha() {
     const senha = prompt(`Nova senha para ${u.nome} (pelo menos 8 caracteres). As sessões abertas dele terminam.`);
@@ -114,25 +102,19 @@ export function Conta() {
   const [atual, setAtual] = useState('');
   const [nova, setNova] = useState('');
   const [repetida, setRepetida] = useState('');
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro, setErro } = useAcao();
 
-  async function enviar(e) {
+  function enviar(e) {
     e.preventDefault();
     if (nova !== repetida) {
       setErro('As senhas novas não conferem.');
       return;
     }
-    setOcupado(true);
-    setErro('');
-    try {
+    rodar(async () => {
       await api('PUT', '/senha', { atual, nova });
       // Senha nova encerra todas as sessões, inclusive esta.
       window.dispatchEvent(new Event('sessao-expirada'));
-    } catch (err) {
-      setErro(err.message);
-      setOcupado(false);
-    }
+    });
   }
 
   return html`

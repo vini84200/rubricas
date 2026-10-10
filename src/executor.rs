@@ -4,11 +4,12 @@
 //! no notebook ou numa máquina à parte.
 
 use crate::conferir::{self, Execucao};
+use crate::ead::{RespostaPipeline, RespostaSubmissao};
 use crate::fila::{ResultadoPlagio, Tarefa};
+use crate::submissoes::Submissoes;
 use crate::pipeline::{Checagem, Pipeline, Relatorio, ResultadoChecagem, Situacao, TipoChecagem};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +22,7 @@ use std::{fs, thread};
 pub const MOTOR: &str = "2";
 
 /// Roda os casos dentro do contêiner, cada um com seu limite de tempo, e
-/// imprime o que cada execução produziu. Sem `considerar_prompts`, o programa
+/// imprime o que cada execução produziu depois de `conferir::MARCA_CASOS`. Sem `considerar_prompts`, o programa
 /// roda com um `input()` que lê a linha sem imprimir o prompt: cada aluno
 /// escreve o seu ("Digite os votos: "), e isso não pode reprovar a saída.
 const EXECUTA_CASOS: &str = r#"
@@ -65,6 +66,9 @@ print('\n@@rubricas@@' + json.dumps(saida))
 const JPLAG: &str = "localhost/rubricas-jplag:6.3.0-java25";
 const RECEITA_JPLAG: &str = "FROM docker.io/library/eclipse-temurin:25-jre\n\
 ADD https://github.com/jplag/JPlag/releases/download/v6.3.0/jplag-6.3.0-jar-with-dependencies.jar /opt/jplag.jar\n";
+
+/// No modo contínuo, quanto esperar para tentar de novo depois de perder o servidor.
+const ESPERA_APOS_FALHA: Duration = Duration::from_secs(10);
 
 pub struct Opcoes {
     pub servidor: String,
@@ -160,31 +164,6 @@ struct Fila {
     tarefas: Vec<Tarefa>,
 }
 
-#[derive(Deserialize)]
-struct InfoPipeline {
-    pipeline: Option<Pipeline>,
-    #[serde(default)]
-    erro: Option<String>,
-    #[serde(default)]
-    anexos: Vec<InfoArquivo>,
-}
-
-#[derive(Deserialize)]
-struct InfoArquivo {
-    caminho: String,
-}
-
-#[derive(Deserialize)]
-struct SubmissaoAluno {
-    #[serde(default)]
-    arquivos: Vec<InfoArquivo>,
-}
-
-#[derive(Deserialize)]
-struct TodasSubmissoes {
-    alunos: std::collections::BTreeMap<String, SubmissaoAluno>,
-}
-
 // ---------------------------------------------------------------------------
 // Laço principal
 // ---------------------------------------------------------------------------
@@ -194,10 +173,19 @@ pub fn rodar(op: Opcoes) -> Result<(), String> {
     let cliente = Cliente::novo(&op.servidor, &op.token);
     // Tarefas que já foram tentadas nesta rodada e voltaram com erro de execução:
     // não adianta repetir até algo mudar.
-    let mut tentadas: HashSet<String> = HashSet::new();
+    let mut tentadas: Vec<Tarefa> = Vec::new();
     loop {
-        let fila: Fila = cliente.json("/executor/fila")?;
-        let novas: Vec<Tarefa> = fila.tarefas.into_iter().filter(|t| !tentadas.contains(&chave(t))).collect();
+        let fila: Fila = match cliente.json("/executor/fila") {
+            Ok(f) => f,
+            // No modo contínuo, o servidor fora do ar é só uma espera a mais.
+            Err(e) if op.continuo => {
+                eprintln!("{e}. Tentando de novo em 10 s.");
+                thread::sleep(ESPERA_APOS_FALHA);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let novas: Vec<Tarefa> = fila.tarefas.into_iter().filter(|t| !tentadas.contains(t)).collect();
         if novas.is_empty() {
             if !op.continuo {
                 println!("Fila vazia.");
@@ -206,13 +194,12 @@ pub fn rodar(op: Opcoes) -> Result<(), String> {
             println!("Fila vazia. Esperando novidades do servidor…");
             while let Err(e) = cliente.esperar_evento(Duration::from_secs(600)) {
                 eprintln!("{e}. Tentando de novo em 10 s.");
-                thread::sleep(Duration::from_secs(10));
+                thread::sleep(ESPERA_APOS_FALHA);
             }
             tentadas.clear();
             continue;
         }
         for t in novas {
-            tentadas.insert(chave(&t));
             let r = match &t {
                 Tarefa::Checagens { avaliacao, aluno, versao } => checagens(&cliente, avaliacao, aluno, versao),
                 Tarefa::Plagio { avaliacao, versao } => plagio(&cliente, avaliacao, versao),
@@ -220,14 +207,8 @@ pub fn rodar(op: Opcoes) -> Result<(), String> {
             if let Err(e) = r {
                 eprintln!("  erro: {e}");
             }
+            tentadas.push(t);
         }
-    }
-}
-
-fn chave(t: &Tarefa) -> String {
-    match t {
-        Tarefa::Checagens { avaliacao, aluno, versao } => format!("{avaliacao}\n{aluno}\n{versao}"),
-        Tarefa::Plagio { avaliacao, versao } => format!("{avaliacao}\n\n{versao}"),
     }
 }
 
@@ -260,7 +241,7 @@ fn gravar(caminho: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn baixar_pipeline(cliente: &Cliente, avaliacao: &str, destino: &Path) -> Result<Pipeline, String> {
-    let info: InfoPipeline = cliente.json(&rota(&["pipelines", avaliacao]))?;
+    let info: RespostaPipeline = cliente.json(&rota(&["pipelines", avaliacao]))?;
     let p = info.pipeline.ok_or_else(|| info.erro.unwrap_or_else(|| "a avaliação não tem pipeline".into()))?;
     for a in &info.anexos {
         gravar(&destino.join(&a.caminho), &cliente.bytes(&rota(&["pipelines", avaliacao, &a.caminho]))?)?;
@@ -273,16 +254,16 @@ fn baixar_submissao(
     cliente: &Cliente,
     avaliacao: &str,
     aluno: &str,
-    arquivos: &[InfoArquivo],
+    arquivos: &[&str],
     destino: &Path,
     original: bool,
 ) -> Result<Vec<String>, String> {
     let mut nomes = Vec::new();
     for a in arquivos {
-        let caminho = rota(&["avaliacoes", avaliacao, "submissoes", aluno, &a.caminho]);
+        let caminho = rota(&["avaliacoes", avaliacao, "submissoes", aluno, a]);
         let bytes = cliente.bytes(&if original { format!("{caminho}?original=1") } else { caminho })?;
-        gravar(&destino.join(&a.caminho), &bytes)?;
-        nomes.push(a.caminho.clone());
+        gravar(&destino.join(a), &bytes)?;
+        nomes.push(a.to_string());
     }
     Ok(nomes)
 }
@@ -296,8 +277,9 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
     let tmp = Temporaria::nova("checagem")?;
     let (anexos, trabalho, meta) = (tmp.0.join("pipeline"), tmp.0.join("trabalho"), tmp.0.join("meta"));
     let p = baixar_pipeline(cliente, avaliacao, &anexos)?;
-    let sub: SubmissaoAluno = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes", aluno]))?;
-    let arquivos = baixar_submissao(cliente, avaliacao, aluno, &sub.arquivos, &trabalho, false)?;
+    let sub: RespostaSubmissao = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes", aluno]))?;
+    let caminhos: Vec<&str> = sub.arquivos.iter().map(|a| a.caminho.as_str()).collect();
+    let arquivos = baixar_submissao(cliente, avaliacao, aluno, &caminhos, &trabalho, false)?;
     // Os anexos (testes, esqueleto) ficam junto do código do aluno.
     copiar_pasta(&anexos, &trabalho)?;
     let _ = fs::remove_file(trabalho.join("pipeline.toml"));
@@ -311,30 +293,14 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
         Ok(p.arquivo.clone())
     });
 
-    let imagem = match imagem_ferramentas(&p.imagem) {
-        Ok(i) => i,
-        Err(e) => {
-            // Sem imagem não há como rodar: o relatório diz isso, e o aluno continua pendente.
-            let resultados = p.checagens.iter().map(|ch| erro_execucao(ch, e.clone())).collect();
-            let relatorio = Relatorio { versao: versao.into(), motor: MOTOR.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
-            cliente.put_json(&rota(&["executor", "relatorios", avaliacao, aluno]), &relatorio)?;
-            return Err(e);
-        }
-    };
+    let imagem = imagem_ferramentas(&p.imagem);
     let mut resultados = Vec::new();
     for ch in &p.checagens {
-        let r = match &programa {
-            Err(motivo) => ResultadoChecagem {
-                nome: ch.nome.clone(),
-                tipo: ch.tipo,
-                situacao: Situacao::Falhou,
-                passaram: 0,
-                total: if ch.tipo == TipoChecagem::Casos { ch.casos.len() as u32 } else { 1 },
-                resumo: format!("não rodou: {motivo}"),
-                casos: vec![],
-                saida: String::new(),
-            },
-            Ok(programa) => {
+        let r = match (&imagem, &programa) {
+            // Sem imagem não há como rodar: o relatório diz isso, e o aluno continua pendente.
+            (Err(e), _) => ResultadoChecagem::erro(ch, e),
+            (_, Err(motivo)) => ResultadoChecagem::nao_rodou(ch, motivo),
+            (Ok(imagem), Ok(programa)) => {
                 let ambiente = Ambiente {
                     imagem: ch.imagem.clone().map(nome_completo).unwrap_or_else(|| imagem.clone()),
                     memoria: ch.memoria.clone().unwrap_or_else(|| p.memoria.clone()),
@@ -342,14 +308,18 @@ fn checagens(cliente: &Cliente, avaliacao: &str, aluno: &str, versao: &str) -> R
                     trabalho: &trabalho,
                     meta: &meta,
                 };
-                rodar_checagem(ch, &p, programa, &ambiente)
+                match conteiner(&ambiente, &invocacao(ch, &p, programa)) {
+                    Ok(s) => conferir::julgar(ch, &s),
+                    Err(e) => ResultadoChecagem::erro(ch, &e),
+                }
             }
         };
         println!("  {}: {}", r.nome, if r.situacao == Situacao::Erro { format!("erro de execução: {}", r.resumo) } else { r.resumo.clone() });
         resultados.push(r);
     }
-    let relatorio = Relatorio { versao: versao.into(), motor: MOTOR.into(), gerado_em: 0, checagens: resultados, sugestoes: vec![] };
-    cliente.put_json(&rota(&["executor", "relatorios", avaliacao, aluno]), &relatorio)
+    let relatorio = Relatorio { versao: versao.into(), motor: MOTOR.into(), gerado_em: 0, checagens: resultados };
+    cliente.put_json(&rota(&["executor", "relatorios", avaliacao, aluno]), &relatorio)?;
+    imagem.map(|_| ())
 }
 
 fn copiar_pasta(de: &Path, para: &Path) -> Result<(), String> {
@@ -373,77 +343,39 @@ struct Ambiente<'a> {
     meta: &'a Path,
 }
 
-fn erro_execucao(ch: &Checagem, msg: String) -> ResultadoChecagem {
-    ResultadoChecagem {
-        nome: ch.nome.clone(),
-        tipo: ch.tipo,
-        situacao: Situacao::Erro,
-        passaram: 0,
-        total: 0,
-        resumo: msg.lines().next().unwrap_or("").chars().take(200).collect(),
-        casos: vec![],
-        saida: conferir::fim(&msg),
-    }
+/// O que rodar no contêiner: o comando, o ambiente, o tempo máximo e os
+/// arquivos que ele lê em `/meta`.
+struct Invocacao {
+    cmd: Vec<String>,
+    env: Vec<(&'static str, String)>,
+    limite: Duration,
+    meta: Vec<(&'static str, String)>,
 }
 
-fn rodar_checagem(ch: &Checagem, p: &Pipeline, programa: &str, amb: &Ambiente) -> ResultadoChecagem {
+fn invocacao(ch: &Checagem, p: &Pipeline, programa: &str) -> Invocacao {
     // Nos casos, o tempo vale por execução; nas outras checagens, para a checagem
     // inteira, mais uma folga para o contêiner subir.
     let tempo = ch.tempo.unwrap_or(p.tempo);
     let limite = Duration::from_secs_f64(tempo + 10.0);
-    let (passou, falhou) = (Situacao::Passou, Situacao::Falhou);
+    let cmd = |partes: &[&str]| partes.iter().map(|s| s.to_string()).collect();
+    let com_programa = vec![("PROGRAMA", programa.to_string())];
     match ch.tipo {
         TipoChecagem::Casos => {
             let casos: Vec<Value> = ch.casos.iter().map(|c| json!({ "entrada": c.entrada, "argumentos": c.argumentos })).collect();
-            if let Err(e) = gravar(&amb.meta.join("casos.json"), serde_json::to_string(&casos).unwrap().as_bytes()) {
-                return erro_execucao(ch, e);
-            }
-            let limite_casos = Duration::from_secs_f64(tempo * ch.casos.len() as f64 + 30.0);
             let prompts = if ch.considerar_prompts { "1" } else { "0" };
-            let cmd = ["python3", "/meta/casos.py", programa, &tempo.to_string(), "/meta/casos.json", "/trabalho", prompts];
-            let saida = match conteiner(amb, &cmd, limite_casos, &[]) {
-                Ok(s) => s,
-                Err(e) => return erro_execucao(ch, e),
-            };
-            match ler_execucoes(&saida.saida) {
-                Some(ex) => conferir::julgar_casos(&ch.nome, &ch.casos, &ex, ch.ignorar_maiusculas),
-                // O contêiner inteiro estourou (memória, tempo total): todos os casos falham.
-                None if saida.tempo_esgotado || saida.codigo == Some(137) => {
-                    let motivo = if saida.tempo_esgotado { "tempo esgotado" } else { "memória esgotada" };
-                    let ex = vec![Execucao { erro: motivo.into(), tempo_esgotado: saida.tempo_esgotado, ..Default::default() }; ch.casos.len()];
-                    conferir::julgar_casos(&ch.nome, &ch.casos, &ex, ch.ignorar_maiusculas)
-                }
-                None => erro_execucao(ch, format!("o executor de casos não respondeu:\n{}{}", saida.saida, saida.erro)),
+            Invocacao {
+                cmd: cmd(&["python3", "/meta/casos.py", programa, &tempo.to_string(), "/meta/casos.json", "/trabalho", prompts]),
+                env: vec![],
+                limite: Duration::from_secs_f64(tempo * ch.casos.len() as f64 + 30.0),
+                meta: vec![("casos.json", serde_json::to_string(&casos).unwrap())],
             }
         }
-        TipoChecagem::Pytest => {
-            let cmd = ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "--tb=short", &ch.testes];
-            let s = match conteiner(amb, &cmd, limite, &[("PROGRAMA", programa)]) {
-                Ok(s) => s,
-                Err(e) => return erro_execucao(ch, e),
-            };
-            let texto = format!("{}{}", s.saida, s.erro);
-            let (passaram, total) = conferir::resumo_pytest(&s.saida).unwrap_or((0, 0));
-            let resumo = if s.tempo_esgotado {
-                "tempo esgotado".to_string()
-            } else if total == 0 {
-                "nenhum teste rodou".to_string()
-            } else {
-                format!("{passaram} de {total} {}", if total == 1 { "teste" } else { "testes" })
-            };
-            let ok = total > 0 && passaram == total && !s.tempo_esgotado;
-            ResultadoChecagem {
-                nome: ch.nome.clone(),
-                tipo: ch.tipo,
-                situacao: if ok { passou } else { falhou },
-                passaram,
-                // Sem nenhum teste rodado (o arquivo do aluno nem importa), conta como uma falha.
-                total: total.max(1),
-                resumo,
-                casos: vec![],
-                saida: conferir::fim(&texto),
-            }
-        }
+        TipoChecagem::Pytest => Invocacao {
+            cmd: cmd(&["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rfE", "--tb=short", &ch.testes]),
+            env: com_programa,
+            limite,
+            meta: vec![],
+        },
         TipoChecagem::Estilo => {
             let mut script = String::from("ruff check --no-cache --output-format=concise");
             if !ch.regras.is_empty() {
@@ -454,81 +386,12 @@ fn rodar_checagem(ch: &Checagem, p: &Pipeline, programa: &str, amb: &Ambiente) -
             }
             script += &format!(" {}", aspas(programa));
             if ch.formato {
-                script += &format!("; ruff format --no-cache --check --diff {} >/meta/formato 2>&1 || echo FORMATO", aspas(programa));
+                let marca = conferir::MARCA_FORMATO;
+                script += &format!("; ruff format --no-cache --check --diff {} >/meta/formato 2>&1 || echo {marca}", aspas(programa));
             }
-            let s = match conteiner(amb, &["sh", "-c", &script], limite, &[]) {
-                Ok(s) => s,
-                Err(e) => return erro_execucao(ch, e),
-            };
-            let Some(mut problemas) = conferir::problemas_ruff(&s.saida) else {
-                return erro_execucao(ch, format!("não entendi a saída do ruff:\n{}{}", s.saida, s.erro));
-            };
-            let formato = s.saida.lines().any(|l| l.trim() == "FORMATO");
-            if formato {
-                problemas += 1;
-            }
-            let resumo = match (problemas, formato) {
-                (0, _) => "sem problemas de estilo".to_string(),
-                (1, true) => "formatação fora do padrão".to_string(),
-                (n, true) => format!("{} problemas de estilo e formatação fora do padrão", n - 1),
-                (1, false) => "1 problema de estilo".to_string(),
-                (n, false) => format!("{n} problemas de estilo"),
-            };
-            ResultadoChecagem {
-                nome: ch.nome.clone(),
-                tipo: ch.tipo,
-                situacao: if problemas == 0 { passou } else { falhou },
-                passaram: u32::from(problemas == 0),
-                total: 1,
-                resumo,
-                casos: vec![],
-                saida: conferir::fim(&s.saida.replace("FORMATO\n", "")),
-            }
+            Invocacao { cmd: cmd(&["sh", "-c", &script]), env: vec![], limite, meta: vec![] }
         }
-        TipoChecagem::Comando => {
-            let s = match conteiner(amb, &["sh", "-c", &ch.comando], limite, &[("PROGRAMA", programa)]) {
-                Ok(s) => s,
-                Err(e) => return erro_execucao(ch, e),
-            };
-            let ok = s.codigo == Some(0) && !s.tempo_esgotado;
-            let resumo = match (s.tempo_esgotado, s.codigo) {
-                (true, _) => "tempo esgotado".to_string(),
-                (_, Some(0)) => "passou".to_string(),
-                (_, Some(c)) => format!("terminou com código {c}"),
-                (_, None) => "interrompido".to_string(),
-            };
-            ResultadoChecagem {
-                nome: ch.nome.clone(),
-                tipo: ch.tipo,
-                situacao: if ok { passou } else { falhou },
-                passaram: u32::from(ok),
-                total: 1,
-                resumo,
-                casos: vec![],
-                saida: conferir::fim(&format!("{}{}", s.saida, s.erro)),
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct ExecucaoJson {
-    saida: String,
-    erro: String,
-    codigo: Option<i32>,
-    tempo_esgotado: bool,
-}
-
-/// O que o script dos casos imprimiu depois da marca, se ele chegou ao fim.
-fn ler_execucoes(saida: &str) -> Option<Vec<Execucao>> {
-    let (_, json) = saida.rsplit_once("@@rubricas@@")?;
-    let lidas: Vec<ExecucaoJson> = serde_json::from_str(json.trim()).ok()?;
-    Some(lidas.into_iter().map(Into::into).collect())
-}
-
-impl From<ExecucaoJson> for Execucao {
-    fn from(e: ExecucaoJson) -> Self {
-        Execucao { saida: e.saida, erro: e.erro, codigo: e.codigo, tempo_esgotado: e.tempo_esgotado }
+        TipoChecagem::Comando => Invocacao { cmd: cmd(&["sh", "-c", &ch.comando]), env: com_programa, limite, meta: vec![] },
     }
 }
 
@@ -546,9 +409,10 @@ fn plagio(cliente: &Cliente, avaliacao: &str, versao: &str) -> Result<(), String
     let (anexos, trabalho) = (tmp.0.join("pipeline"), tmp.0.join("trabalho"));
     let p = baixar_pipeline(cliente, avaliacao, &anexos)?;
     let cfg = p.plagio.clone().ok_or("o pipeline não pede plágio")?;
-    let todas: TodasSubmissoes = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes"]))?;
+    let todas: Submissoes = cliente.json(&rota(&["avaliacoes", avaliacao, "submissoes"]))?;
     for (aluno, s) in &todas.alunos {
-        baixar_submissao(cliente, avaliacao, aluno, &s.arquivos, &trabalho.join("alunos").join(aluno), true)?;
+        let caminhos: Vec<&str> = s.arquivos.iter().map(|a| a.caminho.as_str()).collect();
+        baixar_submissao(cliente, avaliacao, aluno, &caminhos, &trabalho.join("alunos").join(aluno), true)?;
     }
     fs::create_dir_all(trabalho.join("saida")).map_err(|e| e.to_string())?;
     let mut cmd: Vec<String> =
@@ -575,8 +439,8 @@ fn plagio(cliente: &Cliente, avaliacao: &str, versao: &str) -> Result<(), String
     let resultado = (|| {
         garantir_imagem(JPLAG, RECEITA_JPLAG)?;
         let amb = Ambiente { imagem: JPLAG.into(), memoria: "1g".into(), cpus: p.cpus.max(1.0), trabalho: &trabalho, meta: &tmp.0 };
-        let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        let s = conteiner(&amb, &cmd, Duration::from_secs(600), &[("JAVA_TOOL_OPTIONS", "-Xmx768m")])?;
+        let inv = Invocacao { cmd, env: vec![("JAVA_TOOL_OPTIONS", "-Xmx768m".into())], limite: Duration::from_secs(600), meta: vec![] };
+        let s = conteiner(&amb, &inv)?;
         let csv = fs::read_to_string(trabalho.join("saida/resultado/results.csv"))
             .map_err(|_| format!("o JPlag não gerou resultado:\n{}", conferir::fim(&format!("{}{}", s.saida, s.erro))))?;
         let pares = conferir::pares_jplag(&csv)?;
@@ -633,16 +497,12 @@ fn garantir_imagem(nome: &str, containerfile: &str) -> Result<(), String> {
     if s.success() { Ok(()) } else { Err(format!("não foi possível construir a imagem {nome}")) }
 }
 
-struct Saida {
-    saida: String,
-    erro: String,
-    codigo: Option<i32>,
-    tempo_esgotado: bool,
-}
-
 /// Roda um comando num contêiner sem rede, com memória, CPU e tempo limitados.
 /// `Err` é falha do próprio executor (podman, imagem), nunca do código do aluno.
-fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)]) -> Result<Saida, String> {
+fn conteiner(amb: &Ambiente, inv: &Invocacao) -> Result<Execucao, String> {
+    for (nome, conteudo) in &inv.meta {
+        gravar(&amb.meta.join(nome), conteudo.as_bytes())?;
+    }
     let nome = format!("rubricas-{}", unico());
     let vol = |p: &Path, destino: &str, modo: &str| format!("{}:{destino}:{modo}", p.display());
     let mut args: Vec<String> = [
@@ -653,11 +513,11 @@ fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)
     .into();
     args.extend([format!("--memory={}", amb.memoria), format!("--memory-swap={}", amb.memoria), format!("--cpus={}", amb.cpus)]);
     args.extend(["-v".into(), vol(amb.trabalho, "/trabalho", "Z"), "-v".into(), vol(amb.meta, "/meta", "z")]);
-    for (k, v) in env {
+    for (k, v) in &inv.env {
         args.extend(["-e".into(), format!("{k}={v}")]);
     }
     args.push(amb.imagem.clone());
-    args.extend(cmd.iter().map(|s| s.to_string()));
+    args.extend(inv.cmd.iter().cloned());
 
     let mut filho = Command::new("podman")
         .args(&args)
@@ -684,7 +544,7 @@ fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)
         if let Some(s) = filho.try_wait().map_err(|e| e.to_string())? {
             break s;
         }
-        if inicio.elapsed() > limite {
+        if inicio.elapsed() > inv.limite {
             tempo_esgotado = true;
             let _ = podman(&["rm", "-f", "-t", "0", &nome]);
             let _ = filho.kill();
@@ -697,7 +557,7 @@ fn conteiner(amb: &Ambiente, cmd: &[&str], limite: Duration, env: &[(&str, &str)
     if !tempo_esgotado && matches!(status.code(), Some(125..=127)) && erro.contains("Error") {
         return Err(format!("podman: {}", erro.trim()));
     }
-    Ok(Saida { saida, erro, codigo: status.code(), tempo_esgotado })
+    Ok(Execucao { saida, erro, codigo: status.code(), tempo_esgotado })
 }
 
 #[cfg(test)]
@@ -720,7 +580,7 @@ mod testes {
             .args([&format!("{pasta}/casos.py"), "main.py", "5", &format!("{pasta}/casos.json"), &pasta, prompts])
             .output()
             .expect("python3 na máquina");
-        let mut ex = ler_execucoes(&String::from_utf8_lossy(&saida.stdout)).expect("o script imprimiu os resultados");
+        let mut ex = conferir::ler_execucoes(&String::from_utf8_lossy(&saida.stdout)).expect("o script imprimiu os resultados");
         // Cada rodada tem sua pasta; no contêiner ela é sempre /trabalho.
         for e in &mut ex {
             e.erro = e.erro.replace(&pasta, "/trabalho");

@@ -2,8 +2,8 @@
 import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api } from '../api.js';
 import { TIPOS, maximo, maximoRubrica, ehRoteiro, contarCriterios, resumoItens } from '../nota.js';
-import { ir, rota, num, campo, lerNum, chave, cls, pts, guarda } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { ir, rota, campo, lerNum, chave, cls, pts, guarda } from '../util.js';
+import { useDados, useAcao, useGuarda, Estado, Titulo, Vazio, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
 import { sessao, pode } from '../sessao.js';
 
 function LinhaRubrica(r) {
@@ -295,23 +295,18 @@ function EditorPasso({ c, i, total, aberto, alternar, aoMudar, aoMover, aoRemove
 }
 
 export function EditorRubrica({ id }) {
-  const { dados, erro: erroCarga, carregando, recarregar } = useDados(id ? `/rubricas/${encodeURIComponent(id)}` : null);
+  const caminho = id ? rota('rubricas', id) : null;
+  const { dados, erro: erroCarga, carregando, recarregar } = useDados(caminho);
   const [r, setR] = useState(() => (id ? null : { titulo: '', descricao: '', criterios: [criterioNovo()] }));
   const [abertos, setAbertos] = useState(() => new Set());
   const [sujo, setSujo] = useState(false);
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro, setErro } = useAcao();
   const [salvo, setSalvo] = useState(false);
   // À parte do rascunho: arquivar não mexe nas alterações por salvar.
   const [arquivada, setArquivada] = useState(false);
 
   // A navegação pergunta antes de sair enquanto houver alterações não salvas.
-  useEffect(() => {
-    guarda.ativa = sujo;
-    return () => {
-      guarda.ativa = false;
-    };
-  }, [sujo]);
+  useGuarda(sujo);
 
   /** Troca o rascunho pelo que veio do servidor, mantendo abertos os mesmos critérios. */
   function receber(rubrica) {
@@ -330,16 +325,6 @@ export function EditorRubrica({ id }) {
       setAbertos(new Set([r.criterios[0]._k]));
     }
   }, [dados]);
-
-  useEffect(() => {
-    if (!sujo) return undefined;
-    const avisar = (e) => {
-      e.preventDefault();
-      e.returnValue = '';
-    };
-    window.addEventListener('beforeunload', avisar);
-    return () => window.removeEventListener('beforeunload', avisar);
-  }, [sujo]);
 
   function mudar(novo) {
     guarda.ativa = true; // já, sem esperar o próximo desenho da tela
@@ -375,7 +360,7 @@ export function EditorRubrica({ id }) {
     setAbertos(new Set([...abertos, copia._k]));
   }
 
-  async function salvar(e) {
+  function salvar(e) {
     e?.preventDefault();
     const corpo = doRascunho(r);
     const problema = numeroInvalido(corpo);
@@ -383,53 +368,37 @@ export function EditorRubrica({ id }) {
       setErro(problema);
       return;
     }
-    setOcupado(true);
-    setErro('');
-    try {
-      const gravada = id ? await api('PUT', `/rubricas/${encodeURIComponent(id)}`, corpo) : await api('POST', '/rubricas', corpo);
+    rodar(async () => {
+      const gravada = await (id ? api('PUT', caminho, corpo) : api('POST', '/rubricas', corpo));
       guarda.ativa = false;
       setSujo(false);
       setSalvo(true);
       if (!id) ir(rota('rubricas', gravada.id), true);
       else receber(gravada);
-    } catch (err) {
-      setErro(err.message);
-    }
-    setOcupado(false);
+    });
   }
 
-  async function apagar() {
+  function apagar() {
     if (!confirm(`Apagar a rubrica “${r.titulo}”? Avaliações que já a usam mantêm a cópia delas.`)) return;
-    try {
-      await api('DELETE', `/rubricas/${encodeURIComponent(id)}`);
+    rodar(async () => {
+      await api('DELETE', caminho);
       guarda.ativa = false;
       setSujo(false);
       ir('/rubricas');
-    } catch (err) {
-      setErro(err.message);
-    }
+    });
   }
 
-  async function alternarArquivada() {
-    setErro('');
-    try {
-      await arquivar(`/rubricas/${encodeURIComponent(id)}`, !arquivada);
-      setArquivada(!arquivada);
-    } catch (err) {
-      setErro(err.message);
-    }
-  }
+  const alternarArquivada = () => rodar(async () => {
+    await arquivar(caminho, !arquivada);
+    setArquivada(!arquivada);
+  });
 
-  async function copiar() {
-    try {
-      const corpo = doRascunho(r);
-      corpo.titulo = `${corpo.titulo} (cópia)`;
-      const nova = await api('POST', '/rubricas', corpo);
-      ir(rota('rubricas', nova.id));
-    } catch (err) {
-      setErro(err.message);
-    }
-  }
+  const copiar = () => rodar(async () => {
+    const corpo = doRascunho(r);
+    corpo.titulo = `${corpo.titulo} (cópia)`;
+    const nova = await api('POST', '/rubricas', corpo);
+    ir(rota('rubricas', nova.id));
+  });
 
   if (id && (carregando || erroCarga)) {
     return html`
@@ -497,7 +466,7 @@ export function EditorRubrica({ id }) {
         <button class="botao primario" disabled=${ocupado || (!sujo && !!id)}>${ocupado ? 'Salvando…' : id ? 'Salvar' : 'Criar rubrica'}</button>
       </div>`}
     </form>
-    ${id && pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${`/rubricas/${encodeURIComponent(id)}`} pasta="rubricas" />`}
+    ${id && pode(dados, 'compartilhar') && html`<${Compartilhar} caminho=${caminho} pasta="rubricas" />`}
     </div>
   `;
 }

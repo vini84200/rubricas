@@ -218,6 +218,36 @@ pub struct ResultadoChecagem {
     pub saida: String,
 }
 
+impl ResultadoChecagem {
+    /// `passaram` de `total`: passa só com todos. Sem nada contado (nenhum teste
+    /// rodou, o arquivo do aluno nem importa), conta como uma falha.
+    pub fn contagem(ch: &Checagem, passaram: u32, total: u32, resumo: String, saida: String) -> Self {
+        let total = total.max(1);
+        let situacao = if passaram == total { Situacao::Passou } else { Situacao::Falhou };
+        ResultadoChecagem { nome: ch.nome.clone(), tipo: ch.tipo, situacao, passaram, total, resumo, casos: vec![], saida }
+    }
+
+    /// O código do aluno não chegou a rodar: tudo falha. Os casos contam um a um;
+    /// as outras checagens, que não têm casos, contam como uma.
+    pub fn nao_rodou(ch: &Checagem, motivo: &str) -> Self {
+        Self::contagem(ch, 0, ch.casos.len() as u32, format!("não rodou: {motivo}"), String::new())
+    }
+
+    /// Falha do próprio executor: não reprova, e o aluno continua pendente.
+    pub fn erro(ch: &Checagem, msg: &str) -> Self {
+        ResultadoChecagem {
+            nome: ch.nome.clone(),
+            tipo: ch.tipo,
+            situacao: Situacao::Erro,
+            passaram: 0,
+            total: 0,
+            resumo: msg.lines().next().unwrap_or("").chars().take(200).collect(),
+            casos: vec![],
+            saida: crate::conferir::fim(msg),
+        }
+    }
+}
+
 /// Sugestão de marcação para um critério. Quem decide é sempre o avaliador.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sugestao {
@@ -229,6 +259,8 @@ pub struct Sugestao {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// O que o executor manda de um aluno. As sugestões não ficam aqui: saem das
+/// checagens e da rubrica atual a cada leitura (`fila::Panorama::sugestoes`).
 pub struct Relatorio {
     /// Versão do trabalho (pipeline + submissão) a que o relatório responde.
     pub versao: String,
@@ -238,8 +270,6 @@ pub struct Relatorio {
     #[serde(default)]
     pub gerado_em: u64,
     pub checagens: Vec<ResultadoChecagem>,
-    #[serde(default)]
-    pub sugestoes: Vec<Sugestao>,
 }
 
 /// Um caminho relativo dentro da pasta do pipeline ou do trabalho.

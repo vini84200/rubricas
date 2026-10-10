@@ -1,0 +1,1 @@
+ruff_wasm.js e ruff_wasm_bg.wasm: @astral-sh/ruff-wasm-web 0.17.0 (alvo web do wasm-pack), sem alterações.

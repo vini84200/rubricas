@@ -8,8 +8,8 @@
 //! dados/apelidos/<turma>.json                     nome no Moodle → aluno (associação manual)
 //! ```
 
-use crate::dados::{Dados, Erro, Res, checar_id, gravar, ler_opcional};
-use crate::modelo::{Turma, slug};
+use crate::dados::{Dados, Erro, Res, checar_id, gravar, ler_json, ler_ou};
+use crate::modelo::{Turma, caminho_seguro, slug};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,13 +30,13 @@ pub struct Importacao {
     pub edicoes_descartadas: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InfoArquivo {
     pub caminho: String,
     pub tamanho: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Submissao {
     pub nome_moodle: String,
     pub hash: String,
@@ -59,14 +59,15 @@ pub struct Edicao {
     pub arquivos: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemDono {
     pub chave: String,
     pub nome_moodle: String,
     pub arquivos: Vec<InfoArquivo>,
 }
 
-#[derive(Debug, Default, Serialize)]
+/// Também o que o executor recebe de `GET /avaliacoes/{id}/submissoes`.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Submissoes {
     pub alunos: BTreeMap<String, Submissao>,
     pub sem_dono: Vec<SemDono>,
@@ -105,12 +106,6 @@ struct Registro {
     nome_moodle: String,
     hash: String,
     alterada_em: u64,
-}
-
-/// Um caminho relativo seguro: partes que valem como nome de arquivo e não
-/// começam com ponto (nem `..`, nem arquivos ocultos).
-fn caminho_seguro(caminho: &str) -> bool {
-    !caminho.is_empty() && caminho.split('/').all(crate::modelo::id_valido)
 }
 
 /// `Nome Sobrenome_12345_assignsubmission_file_/pasta/a.py` → ("Nome Sobrenome", "pasta/a.py").
@@ -225,25 +220,56 @@ fn substituir_pasta(destino: &Path, arquivos: &Arquivos) -> io::Result<()> {
     trocar_pasta(&tmp, destino)
 }
 
+/// Para onde vai a pasta de um nome do ZIP.
+enum Destino {
+    Aluno(String),
+    /// Não casou com ninguém da turma; a chave sai do nome.
+    SemDono(String),
+}
+
+impl Destino {
+    fn chave(&self) -> &str {
+        match self {
+            Destino::Aluno(c) | Destino::SemDono(c) => c,
+        }
+    }
+
+    fn pasta(&self, base: &Path) -> PathBuf {
+        match self {
+            Destino::Aluno(aluno) => base.join(aluno),
+            Destino::SemDono(chave) => base.join(SEM_DONO).join(chave),
+        }
+    }
+
+    fn registros<'a>(&self, indice: &'a mut Indice) -> &'a mut BTreeMap<String, Registro> {
+        match self {
+            Destino::Aluno(_) => &mut indice.alunos,
+            Destino::SemDono(_) => &mut indice.sem_dono,
+        }
+    }
+}
+
 impl Dados {
-    fn pasta_submissoes(&self, avaliacao: &str) -> Res<PathBuf> {
+    pub(crate) fn pasta_submissoes(&self, avaliacao: &str) -> Res<PathBuf> {
         checar_id(avaliacao)?;
         Ok(self.raiz().join("submissoes").join(avaliacao))
     }
 
     fn ler_indice(&self, pasta: &Path) -> Res<Indice> {
-        match ler_opcional(&pasta.join(INDICE))? {
-            None => Ok(Indice::default()),
-            Some(t) => serde_json::from_str(&t).map_err(|e| Erro::Invalido(format!("{INDICE}: {e}"))),
-        }
+        Ok(ler_json(&pasta.join(INDICE))?.unwrap_or_default())
+    }
+
+    fn gravar_indice(&self, pasta: &Path, indice: &Indice) -> Res<()> {
+        Ok(gravar(&pasta.join(INDICE), serde_json::to_string_pretty(indice).unwrap().as_bytes())?)
+    }
+
+    fn arquivo_apelidos(&self, turma: &str) -> Res<PathBuf> {
+        checar_id(turma)?;
+        Ok(self.raiz().join("apelidos").join(format!("{turma}.json")))
     }
 
     pub(crate) fn apelidos(&self, turma: &str) -> Res<BTreeMap<String, String>> {
-        checar_id(turma)?;
-        match ler_opcional(&self.raiz().join("apelidos").join(format!("{turma}.json")))? {
-            None => Ok(BTreeMap::new()),
-            Some(t) => serde_json::from_str(&t).map_err(|e| Erro::Invalido(format!("apelidos/{turma}.json: {e}"))),
-        }
+        Ok(ler_json(&self.arquivo_apelidos(turma)?)?.unwrap_or_default())
     }
 
     /// Guarda as submissões do ZIP. Quem está no ZIP tem a submissão substituída;
@@ -259,39 +285,50 @@ impl Dados {
         let _g = self.travar();
         let mut indice = self.ler_indice(&pasta)?;
         let mut r = Importacao { ignorados, ..Default::default() };
+        // O índice é gravado a cada pasta trocada: um erro no meio não deixa código
+        // novo com o resumo antigo (que faria um relatório velho valer para ele).
         for (nome, arquivos) in entregas {
             let hash = resumo(&arquivos);
-            let dono = dono(&nome);
-            let associado = dono.is_some();
-            // Quem ficou sem dono num ZIP anterior e agora casa sai da lista.
-            if associado && indice.sem_dono.remove(&chave_sem_dono(&nome)).is_some() {
-                remover_pasta(&pasta.join(SEM_DONO).join(chave_sem_dono(&nome)))?;
-            }
-            let (lugar, mapa, chave) = match dono {
-                Some(aluno) => (pasta.join(&aluno), &mut indice.alunos, aluno),
+            let destino = match dono(&nome) {
+                Some(aluno) => {
+                    // Quem ficou sem dono num ZIP anterior e agora casa sai da lista.
+                    let chave = chave_sem_dono(&nome);
+                    if indice.sem_dono.remove(&chave).is_some() {
+                        self.gravar_indice(&pasta, &indice)?;
+                        remover_pasta(&pasta.join(SEM_DONO).join(chave))?;
+                    }
+                    Destino::Aluno(aluno)
+                }
                 None => {
                     r.sem_dono.push(nome.clone());
-                    let chave = chave_sem_dono(&nome);
-                    (pasta.join(SEM_DONO).join(&chave), &mut indice.sem_dono, chave)
+                    Destino::SemDono(chave_sem_dono(&nome))
                 }
             };
-            let igual = mapa.get(&chave).is_some_and(|reg| reg.hash == hash) && lugar.is_dir();
+            let lugar = destino.pasta(&pasta);
+            let igual = destino.registros(&mut indice).get(destino.chave()).is_some_and(|reg| reg.hash == hash) && lugar.is_dir();
             if !igual {
                 substituir_pasta(&lugar, &arquivos)?;
-                mapa.insert(chave.clone(), Registro { nome_moodle: nome, hash, alterada_em: agora });
+                destino.registros(&mut indice).insert(destino.chave().to_string(), Registro { nome_moodle: nome, hash, alterada_em: agora });
                 // Edições feitas sobre o código antigo não valem para o novo.
-                if associado && indice.edicoes.remove(&chave).is_some() {
-                    remover_pasta(&pasta.join(EDICOES).join(&chave))?;
-                    r.edicoes_descartadas.push(chave);
+                let descartada = match &destino {
+                    Destino::Aluno(aluno) => indice.edicoes.remove(aluno).map(|_| aluno.clone()),
+                    Destino::SemDono(_) => None,
+                };
+                self.gravar_indice(&pasta, &indice)?;
+                if let Some(aluno) = descartada {
+                    remover_pasta(&pasta.join(EDICOES).join(&aluno))?;
+                    r.edicoes_descartadas.push(aluno);
                 }
             }
-            if associado && igual {
-                r.iguais += 1;
-            } else if associado {
-                r.recebidas += 1;
+            if let Destino::Aluno(_) = destino {
+                if igual {
+                    r.iguais += 1;
+                } else {
+                    r.recebidas += 1;
+                }
             }
         }
-        gravar(&pasta.join(INDICE), serde_json::to_string_pretty(&indice).unwrap().as_bytes())?;
+        self.fila_mudou();
         Ok(r)
     }
 
@@ -350,11 +387,11 @@ impl Dados {
         }
         let mut apelidos = self.apelidos(&turma.id)?;
         apelidos.insert(slug(&reg.nome_moodle), aluno.to_string());
-        let arquivo = self.raiz().join("apelidos").join(format!("{}.json", turma.id));
-        gravar(&arquivo, serde_json::to_string_pretty(&apelidos).unwrap().as_bytes())?;
+        gravar(&self.arquivo_apelidos(&turma.id)?, serde_json::to_string_pretty(&apelidos).unwrap().as_bytes())?;
         reg.alterada_em = agora;
         indice.alunos.insert(aluno.to_string(), reg);
-        gravar(&pasta.join(INDICE), serde_json::to_string_pretty(&indice).unwrap().as_bytes())?;
+        self.gravar_indice(&pasta, &indice)?;
+        self.fila_mudou();
         Ok(())
     }
 
@@ -392,7 +429,8 @@ impl Dados {
             let reg = RegistroEdicao { por: por.into(), em: agora, hash: resumo(&efetivos) };
             indice.edicoes.insert(aluno.into(), reg);
         }
-        gravar(&pasta.join(INDICE), serde_json::to_string_pretty(&indice).unwrap().as_bytes())?;
+        self.gravar_indice(&pasta, &indice)?;
+        self.fila_mudou();
         Ok(())
     }
 
@@ -406,10 +444,7 @@ impl Dados {
 
     /// O arquivo como o aluno enviou.
     pub fn arquivo_original(&self, avaliacao: &str, aluno: &str, caminho: &str) -> Res<Vec<u8>> {
-        match fs::read(self.caminho_enviado(avaliacao, aluno, caminho)?) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("{aluno} não enviou {caminho}"))),
-            outro => Ok(outro?),
-        }
+        ler_ou(&self.caminho_enviado(avaliacao, aluno, caminho)?, || format!("{aluno} não enviou {caminho}"))
     }
 
     /// O arquivo que as checagens e o visualizador usam: a edição do professor, se há.
@@ -478,7 +513,7 @@ pub(crate) mod testes {
             "titulo = \"Código\"\n[[criterios]]\nnome = \"Funciona\"\nescala = { tipo = \"binaria\", pontos = 1.0 }\n",
         )
         .unwrap();
-        d.salvar_turma("d", "matricula,nome\n1,Ana Souza\n2,Bruno Lima\n3,João Prado\n", true).unwrap();
+        d.criar_turma("d", "matricula,nome\n1,Ana Souza\n2,Bruno Lima\n3,João Prado\n").unwrap();
         d.salvar_avaliacao(None, "EAD".into(), "d".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
         (raiz, d)
     }
@@ -584,7 +619,7 @@ pub(crate) mod testes {
         // um nome sem dono que passa a casar (a turma foi corrigida) sai da lista
         d.importar_submissoes("ead", &zip(&[("Zé Ninguém_8_assignsubmission_file_/main.py", "z")]), 30).unwrap();
         assert_eq!(d.submissoes("ead").unwrap().sem_dono.len(), 1);
-        d.salvar_turma("d", "matricula,nome\n1,Ana Souza\n2,Bruno Lima\n3,João Prado\n5,Zé Ninguém\n", false).unwrap();
+        d.substituir_turma("d", "matricula,nome\n1,Ana Souza\n2,Bruno Lima\n3,João Prado\n5,Zé Ninguém\n").unwrap();
         d.importar_submissoes("ead", &zip(&[("Zé Ninguém_8_assignsubmission_file_/main.py", "z")]), 40).unwrap();
         let s = d.submissoes("ead").unwrap();
         assert!(s.sem_dono.is_empty(), "{:?}", s.sem_dono);

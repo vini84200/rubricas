@@ -1,29 +1,18 @@
 // Quem está dentro e o que pode fazer. Vem de GET /sessao; fica guardado para
 // funcionar sem rede. Cada item das listas traz as próprias `acoes`.
+import { CHAVES, guardar, recuperar, apagar } from './armazem.js';
 
-const CHAVE = 'rubricas.sessao';
 const VAZIA = { usuario: null, papel: null, acoes: [], papeis: {}, papeis_globais: [] };
 
-let atual = ler();
-
-function ler() {
-  try {
-    return { ...VAZIA, ...JSON.parse(localStorage.getItem(CHAVE) || '{}') };
-  } catch {
-    return { ...VAZIA };
-  }
-}
+let atual = { ...VAZIA, ...recuperar(CHAVES.sessao, {}) };
 
 export const sessao = {
   get: () => atual,
   definir(s) {
     atual = { ...VAZIA, ...(s || {}) };
-    try {
-      if (s) localStorage.setItem(CHAVE, JSON.stringify(atual));
-      else localStorage.removeItem(CHAVE);
-    } catch {
-      /* sem armazenamento: vale só nesta aba */
-    }
+    // Sem armazenamento, vale só nesta aba.
+    if (s) guardar(CHAVES.sessao, atual);
+    else apagar(CHAVES.sessao);
   },
   /** Ação sobre o sistema: criar, gerir_usuarios, executar. */
   pode: (acao) => atual.acoes.includes(acao),

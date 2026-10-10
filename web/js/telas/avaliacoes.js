@@ -3,7 +3,7 @@ import { html, useState, useEffect } from '../../vendor/preact-htm.js';
 import { api, carregarPacote } from '../api.js';
 import { calcular, maximoRubrica, resumoItens } from '../nota.js';
 import { ir, rota, num, campo, lerNum, plural, cls, pts } from '../util.js';
-import { useDados, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, arquivar, Compartilhar } from './comum.js';
+import { useDados, useAcao, Estado, Titulo, Vazio, Progresso, ListaArquivadas, AvisoArquivada, BotaoArquivo, arquivar, Compartilhar } from './comum.js';
 import { sessao, pode } from '../sessao.js';
 import { textoPlagio } from '../codigo.js';
 
@@ -48,10 +48,9 @@ export function ListaAvaliacoes() {
 export function FormAvaliacao({ id }) {
   const rubricas = useDados('/rubricas');
   const turmas = useDados('/turmas');
-  const atual = useDados(id ? `/avaliacoes/${encodeURIComponent(id)}` : null);
+  const atual = useDados(id ? rota('avaliacoes', id) : null);
   const [f, setF] = useState(id ? null : { titulo: '', turma: '', nota_maxima: '10', escolhidas: {} });
-  const [erro, setErro] = useState('');
-  const [ocupado, setOcupado] = useState(false);
+  const { rodar, ocupado, erro, setErro } = useAcao();
 
   useEffect(() => {
     if (atual.dados) {
@@ -95,7 +94,7 @@ export function FormAvaliacao({ id }) {
     setF({ ...f, escolhidas });
   }
 
-  async function salvar(e) {
+  function salvar(e) {
     e.preventDefault();
     const corpo = {
       titulo: f.titulo,
@@ -107,15 +106,10 @@ export function FormAvaliacao({ id }) {
       setErro('Preencha a nota máxima e os pesos com números');
       return;
     }
-    setOcupado(true);
-    setErro('');
-    try {
-      const a = id ? await api('PUT', `/avaliacoes/${encodeURIComponent(id)}`, corpo) : await api('POST', '/avaliacoes', corpo);
+    rodar(async () => {
+      const a = await (id ? api('PUT', rota('avaliacoes', id), corpo) : api('POST', '/avaliacoes', corpo));
       ir(rota('avaliacoes', a.id));
-    } catch (err) {
-      setErro(err.message);
-      setOcupado(false);
-    }
+    });
   }
 
   return html`
@@ -183,7 +177,7 @@ export function FormAvaliacao({ id }) {
 export function Resultados({ id }) {
   const [pacote, setPacote] = useState(null);
   const [erro, setErro] = useState(null);
-  const [aviso, setAviso] = useState('');
+  const { rodar, erro: aviso } = useAcao();
 
   async function carregar() {
     try {
@@ -208,10 +202,12 @@ export function Resultados({ id }) {
   const media = notas.length ? notas.reduce((s, n) => s + n, 0) / notas.length : null;
   const varias = a.rubricas.length > 1;
 
-  async function atualizarCopias() {
+  const caminho = rota('avaliacoes', id);
+
+  function atualizarCopias() {
     if (!confirm('Atualizar a cópia das rubricas a partir da pasta? Marcações em critérios ou níveis que deixaram de existir são desconsideradas.')) return;
-    try {
-      await api('PUT', `/avaliacoes/${encodeURIComponent(id)}`, {
+    rodar(async () => {
+      await api('PUT', caminho, {
         titulo: a.titulo,
         turma: a.turma,
         nota_maxima: a.nota_maxima,
@@ -219,31 +215,23 @@ export function Resultados({ id }) {
         atualizar: desatualizadas,
       });
       carregar();
-    } catch (e) {
-      setAviso(e.message);
-    }
+    });
   }
 
-  async function alternarArquivada() {
-    try {
-      await arquivar(`/avaliacoes/${encodeURIComponent(id)}`, !pacote.arquivada);
-      carregar();
-    } catch (e) {
-      setAviso(e.message);
-    }
-  }
+  const alternarArquivada = () => rodar(async () => {
+    await arquivar(caminho, !pacote.arquivada);
+    carregar();
+  });
 
-  async function apagar() {
+  function apagar() {
     if (!confirm(`Apagar a avaliação “${a.titulo}” e todas as correções dela?`)) return;
-    try {
-      await api('DELETE', `/avaliacoes/${encodeURIComponent(id)}`);
+    rodar(async () => {
+      await api('DELETE', caminho);
       ir('/avaliacoes');
-    } catch (e) {
-      setAviso(e.message);
-    }
+    });
   }
 
-  const csv = `api/avaliacoes/${encodeURIComponent(id)}/notas.csv`;
+  const csv = `api${caminho}/notas.csv`;
   return html`
     <div class="tela">
     <${Titulo} titulo=${a.titulo} voltar=${{ href: '#/avaliacoes', texto: 'Avaliações' }}>
@@ -307,7 +295,7 @@ export function Resultados({ id }) {
         </tbody>
       </table>
     </div>
-    ${pode(pacote, 'compartilhar') && !pacote.offline && html`<${Compartilhar} caminho=${`/avaliacoes/${encodeURIComponent(id)}`} pasta="avaliacoes" />`}
+    ${pode(pacote, 'compartilhar') && !pacote.offline && html`<${Compartilhar} caminho=${caminho} pasta="avaliacoes" />`}
     </div>
   `;
 }
@@ -317,17 +305,12 @@ export function Resultados({ id }) {
  * planilha preenchida, pronta para "Carregar planilha de notas".
  */
 function PlanilhaMoodle({ id }) {
-  const [enviando, setEnviando] = useState(false);
   const [msg, setMsg] = useState(null);
 
-  async function enviar(e) {
-    const arquivo = e.target.files?.[0];
-    e.target.value = '';
-    if (!arquivo) return;
-    setEnviando(true);
+  async function enviar(arquivo) {
     setMsg(null);
     try {
-      const r = await api('POST', `/avaliacoes/${encodeURIComponent(id)}/planilha-moodle`, arquivo);
+      const r = await api('POST', rota('avaliacoes', id, 'planilha-moodle'), arquivo);
       const link = document.createElement('a');
       link.href = URL.createObjectURL(new Blob([r.csv], { type: 'text/csv;charset=utf-8' }));
       link.download = `${arquivo.name.replace(/\.csv$/i, '')}-com-notas.csv`;
@@ -347,14 +330,11 @@ function PlanilhaMoodle({ id }) {
     } catch (err) {
       setMsg({ ok: false, texto: err.message, avisos: [] });
     }
-    setEnviando(false);
   }
 
   return html`
-    <label class=${cls('botao', 'pequeno', enviando && 'ocupado')} title="A planilha que a tarefa do Moodle baixa em “Baixar planilha de notas”">
-      <input type="file" accept=".csv,text/csv" class="escondido" disabled=${enviando} onChange=${enviar} />
-      ${enviando ? 'Preenchendo…' : 'Preencher planilha do Moodle'}
-    </label>
+    <${BotaoArquivo} accept=".csv,text/csv" rotulo="Preencher planilha do Moodle" rotuloOcupado="Preenchendo…" aoEscolher=${enviar}
+      title="A planilha que a tarefa do Moodle baixa em “Baixar planilha de notas”" />
     ${msg && html`
       <div class="planilha-moodle" role="status">
         <p class=${msg.ok ? 'ok' : 'erro'}>${msg.texto}</p>
@@ -390,18 +370,12 @@ function quando(segundos) {
 
 /** Envio do ZIP do Moodle, quem ficou sem dono e a fila do executor. */
 function Entregas({ id, ead, alunos, aoMudar, editar }) {
-  const [enviando, setEnviando] = useState(false);
   const [msg, setMsg] = useState(null);
-  const base = `/avaliacoes/${encodeURIComponent(id)}`;
 
-  async function enviar(e) {
-    const arquivo = e.target.files?.[0];
-    e.target.value = '';
-    if (!arquivo) return;
-    setEnviando(true);
+  async function enviar(arquivo) {
     setMsg(null);
     try {
-      const r = await api('POST', `${base}/submissoes`, arquivo);
+      const r = await api('POST', rota('avaliacoes', id, 'submissoes'), arquivo);
       const partes = [`${plural(r.recebidas, 'submissão nova ou alterada', 'submissões novas ou alteradas')}`];
       if (r.iguais) partes.push(`${plural(r.iguais, 'igual à anterior', 'iguais às anteriores')}`);
       if (r.sem_dono.length) partes.push(`${plural(r.sem_dono.length, 'nome sem dono', 'nomes sem dono')}`);
@@ -412,13 +386,12 @@ function Entregas({ id, ead, alunos, aoMudar, editar }) {
     } catch (err) {
       setMsg({ ok: false, texto: err.message });
     }
-    setEnviando(false);
   }
 
   async function associar(chave, aluno) {
     if (!aluno) return;
     try {
-      await api('POST', `${base}/submissoes/sem-dono/${encodeURIComponent(chave)}`, { aluno });
+      await api('POST', rota('avaliacoes', id, 'submissoes', 'sem-dono', chave), { aluno });
       aoMudar();
     } catch (err) {
       setMsg({ ok: false, texto: err.message });
@@ -426,10 +399,7 @@ function Entregas({ id, ead, alunos, aoMudar, editar }) {
   }
 
   const botao = editar && html`
-    <label class=${cls('botao', 'pequeno', enviando && 'ocupado')}>
-      <input type="file" accept=".zip,application/zip" class="escondido" disabled=${enviando} onChange=${enviar} />
-      ${enviando ? 'Enviando…' : ead ? 'Enviar novo ZIP' : 'Enviar submissões do Moodle (ZIP)'}
-    </label>
+    <${BotaoArquivo} accept=".zip,application/zip" rotulo=${ead ? 'Enviar novo ZIP' : 'Enviar submissões do Moodle (ZIP)'} rotuloOcupado="Enviando…" aoEscolher=${enviar} />
   `;
   if (!ead) {
     return html`

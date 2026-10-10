@@ -1,11 +1,16 @@
 //! A aplicação web: embutida no binário ou, com `--web`, lida do disco a cada pedido.
 
+use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/embutidos.rs"));
+
+/// Pastas com este nome não entram no cache offline: só baixam quando usadas
+/// (o editor de código, com o CodeMirror e o Ruff, tem 11 MB).
+const SOB_DEMANDA: &str = "sob-demanda";
 
 pub struct Web {
     disco: Option<PathBuf>,
@@ -23,6 +28,7 @@ fn tipo(caminho: &str) -> &'static str {
         "png" => "image/png",
         "ico" => "image/x-icon",
         "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -69,15 +75,16 @@ impl Web {
         nomes
     }
 
-    fn ler(&self, nome: &str) -> Option<Vec<u8>> {
+    /// Embutido, sem cópia: o Ruff em WebAssembly tem megabytes.
+    fn ler(&self, nome: &str) -> Option<Bytes> {
         match &self.disco {
             Some(raiz) => {
                 if nome.split('/').any(|parte| parte.is_empty() || parte.starts_with('.')) {
                     return None;
                 }
-                std::fs::read(raiz.join(nome)).ok()
+                std::fs::read(raiz.join(nome)).ok().map(Bytes::from)
             }
-            None => ARQUIVOS.iter().find(|(n, _)| *n == nome).map(|(_, b)| b.to_vec()),
+            None => ARQUIVOS.iter().find(|(n, _)| *n == nome).map(|(_, b)| Bytes::from_static(b)),
         }
     }
 
@@ -97,13 +104,13 @@ impl Web {
             let guardar: Vec<String> = self
                 .nomes()
                 .into_iter()
-                .filter(|n| n != "sw.js" && !n.ends_with(".txt"))
+                .filter(|n| n != "sw.js" && !n.ends_with(".txt") && !n.split('/').any(|parte| parte == SOB_DEMANDA))
                 .map(|n| if n == "index.html" { "./".to_string() } else { n })
                 .collect();
             let texto = String::from_utf8_lossy(&corpo)
                 .replace("__VERSAO__", &self.versao)
                 .replace("\"__ARQUIVOS__\"", &serde_json::to_string(&guardar).unwrap());
-            corpo = texto.into_bytes();
+            corpo = Bytes::from(texto);
         }
         let mut resposta = corpo.into_response();
         let h = resposta.headers_mut();

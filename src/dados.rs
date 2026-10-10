@@ -14,6 +14,7 @@ use crate::modelo::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tokio::sync::watch;
 use std::{fs, io};
 
 #[derive(Debug)]
@@ -22,6 +23,15 @@ pub enum Erro {
     Invalido(String),
     Conflito(String),
     Io(io::Error),
+}
+
+impl std::fmt::Display for Erro {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Erro::NaoEncontrado(m) | Erro::Invalido(m) | Erro::Conflito(m) => f.write_str(m),
+            Erro::Io(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 impl From<io::Error> for Erro {
@@ -36,6 +46,8 @@ pub struct Dados {
     raiz: PathBuf,
     /// Uma escrita por vez: ler–alterar–gravar precisa ser atômico entre requisições.
     trava: Mutex<()>,
+    /// Muda a cada gravação que pode dar trabalho ao executor (o contador não importa).
+    fila: watch::Sender<u64>,
 }
 
 /// Grava num temporário e renomeia, para nunca deixar um arquivo pela metade.
@@ -71,6 +83,24 @@ pub(crate) fn ler_opcional(caminho: &Path) -> Res<Option<String>> {
     }
 }
 
+/// Lê um JSON. `None` se o arquivo não existe.
+pub(crate) fn ler_json<T: serde::de::DeserializeOwned>(caminho: &Path) -> Res<Option<T>> {
+    match ler_opcional(caminho)? {
+        None => Ok(None),
+        Some(t) => serde_json::from_str(&t).map(Some).map_err(|e| {
+            Erro::Invalido(format!("{}: {e}", caminho.file_name().unwrap_or_default().to_string_lossy()))
+        }),
+    }
+}
+
+/// Lê os bytes de um arquivo; se não existe, `NaoEncontrado` com a frase dada.
+pub(crate) fn ler_ou(caminho: &Path, nao_existe: impl FnOnce() -> String) -> Res<Vec<u8>> {
+    match fs::read(caminho) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(nao_existe())),
+        outro => Ok(outro?),
+    }
+}
+
 /// Erro de leitura de TOML com linha e coluna, para quem escreveu o arquivo achar.
 pub(crate) fn erro_toml(texto: &str, e: &toml::de::Error) -> String {
     let onde = e.span().map(|s| {
@@ -90,7 +120,8 @@ pub struct Recusada {
     pub motivo: String,
 }
 
-/// O que se arquiva. Cada um é um arquivo `<pasta>/<id>.<ext>`.
+/// Os itens que se criam, compartilham, arquivam e apagam. Cada um é um
+/// arquivo `<pasta>/<id>.<ext>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tipo {
     Rubricas,
@@ -99,7 +130,7 @@ pub enum Tipo {
 }
 
 impl Tipo {
-    fn pasta(self) -> &'static str {
+    pub fn pasta(self) -> &'static str {
         match self {
             Tipo::Rubricas => "rubricas",
             Tipo::Turmas => "turmas",
@@ -113,6 +144,38 @@ impl Tipo {
             Tipo::Turmas => "csv",
             Tipo::Avaliacoes => "json",
         }
+    }
+
+    /// No singular, como a política e o terminal o chamam.
+    pub fn nome(self) -> &'static str {
+        match self {
+            Tipo::Rubricas => "rubrica",
+            Tipo::Turmas => "turma",
+            Tipo::Avaliacoes => "avaliacao",
+        }
+    }
+
+    /// Aceita o nome no singular ou a pasta.
+    pub fn por_nome(nome: &str) -> Option<Tipo> {
+        [Tipo::Avaliacoes, Tipo::Rubricas, Tipo::Turmas].into_iter().find(|t| t.nome() == nome || t.pasta() == nome)
+    }
+
+    /// Para frases: "Você não tem acesso a esta avaliação".
+    pub fn este(self) -> &'static str {
+        match self {
+            Tipo::Rubricas => "esta rubrica",
+            Tipo::Turmas => "esta turma",
+            Tipo::Avaliacoes => "esta avaliação",
+        }
+    }
+
+    fn nao_existe(self, id: &str) -> Erro {
+        let nome = match self {
+            Tipo::Rubricas => "Rubrica",
+            Tipo::Turmas => "Turma",
+            Tipo::Avaliacoes => "Avaliação",
+        };
+        Erro::NaoEncontrado(format!("{nome} “{id}” não existe"))
     }
 }
 
@@ -139,12 +202,8 @@ impl Arquivadas {
     }
 
     pub fn contem(&self, tipo: Tipo, id: &str) -> bool {
-        let ids = match tipo {
-            Tipo::Rubricas => &self.rubricas,
-            Tipo::Turmas => &self.turmas,
-            Tipo::Avaliacoes => &self.avaliacoes,
-        };
-        ids.contains(id)
+        let todas = [(Tipo::Rubricas, &self.rubricas), (Tipo::Turmas, &self.turmas), (Tipo::Avaliacoes, &self.avaliacoes)];
+        todas.iter().any(|(t, ids)| *t == tipo && ids.contains(id))
     }
 }
 
@@ -154,7 +213,7 @@ impl Dados {
         for sub in ["rubricas", "turmas", "avaliacoes", "correcoes"] {
             fs::create_dir_all(raiz.join(sub))?;
         }
-        Ok(Dados { raiz, trava: Mutex::new(()) })
+        Ok(Dados { raiz, trava: Mutex::new(()), fila: watch::Sender::new(0) })
     }
 
     pub fn raiz(&self) -> &Path {
@@ -166,15 +225,78 @@ impl Dados {
         self.trava.lock().unwrap()
     }
 
-    fn caminho(&self, sub: &str, id: &str, ext: &str) -> Res<PathBuf> {
+    /// Avisa quem espera a fila (o executor). Chame depois de gravar.
+    pub(crate) fn fila_mudou(&self) {
+        self.fila.send_modify(|n| *n += 1);
+    }
+
+    pub fn ouvir_fila(&self) -> watch::Receiver<u64> {
+        self.fila.subscribe()
+    }
+
+    fn caminho(&self, tipo: Tipo, id: &str) -> Res<PathBuf> {
         checar_id(id)?;
-        Ok(self.raiz.join(sub).join(format!("{id}.{ext}")))
+        Ok(self.raiz.join(tipo.pasta()).join(format!("{id}.{}", tipo.extensao())))
+    }
+
+    pub fn existe(&self, tipo: Tipo, id: &str) -> Res<bool> {
+        Ok(self.caminho(tipo, id)?.is_file())
+    }
+
+    /// Um id ainda não usado, derivado do título.
+    fn id_livre(&self, tipo: Tipo, titulo: &str) -> String {
+        id_livre(&slug(titulo), |c| self.caminho(tipo, c).is_ok_and(|p| p.exists()))
+    }
+
+    /// Apaga o arquivo do item e o tira das arquivadas. Precisa da trava já tomada.
+    fn apagar_arquivo(&self, tipo: Tipo, id: &str) -> Res<()> {
+        match fs::remove_file(self.caminho(tipo, id)?) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(tipo.nao_existe(id)),
+            outro => {
+                outro?;
+                self.esquecer_arquivada(tipo, id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Apaga o item: o arquivo, e numa avaliação também o que é dela (correções,
+    /// submissões, pipeline, relatórios). As pastas vão antes, para uma falha no
+    /// meio deixar a avaliação ainda lá, e o apagar poder ser repetido.
+    pub fn apagar(&self, tipo: Tipo, id: &str) -> Res<()> {
+        let _g = self.travar();
+        match tipo {
+            Tipo::Rubricas => {}
+            Tipo::Turmas => {
+                let em_uso: Vec<String> = self.listar_avaliacoes()?.into_iter().filter(|a| a.turma == id).map(|a| a.titulo).collect();
+                if !em_uso.is_empty() {
+                    return Err(Erro::Conflito(format!("A turma está em uso por: {}", em_uso.join(", "))));
+                }
+            }
+            Tipo::Avaliacoes => {
+                if !self.existe(tipo, id)? {
+                    return Err(tipo.nao_existe(id));
+                }
+                let pastas = [self.pasta_correcoes(id)?, self.pasta_submissoes(id)?, self.pasta_pipeline(id)?, self.pasta_relatorios(id)?];
+                for pasta in pastas {
+                    match fs::remove_dir_all(pasta) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.apagar_arquivo(tipo, id)?;
+        if tipo == Tipo::Avaliacoes {
+            self.fila_mudou();
+        }
+        Ok(())
     }
 
     /// Ids (nomes de arquivo sem extensão) de uma subpasta, em ordem alfabética.
-    fn ids(&self, sub: &str, ext: &str) -> Res<Vec<String>> {
+    fn ids(&self, dir: &Path, ext: &str) -> Res<Vec<String>> {
         let mut ids = Vec::new();
-        let dir = match fs::read_dir(self.raiz.join(sub)) {
+        let dir = match fs::read_dir(dir) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ids),
             Err(e) => return Err(e.into()),
@@ -213,13 +335,16 @@ impl Dados {
 
     /// Arquiva (`true`) ou devolve às listas (`false`).
     pub fn arquivar(&self, tipo: Tipo, id: &str, arquivada: bool) -> Res<()> {
-        let _g = self.trava.lock().unwrap();
-        let caminho = self.caminho(tipo.pasta(), id, tipo.extensao())?;
+        let _g = self.travar();
         // Desarquivar não exige o arquivo: limpa um id que sumiu por fora.
-        if arquivada && !caminho.is_file() {
+        if arquivada && !self.existe(tipo, id)? {
             return Err(Erro::NaoEncontrado(format!("“{id}” não existe em {}/", tipo.pasta())));
         }
-        self.marcar_arquivada(tipo, id, arquivada)
+        self.marcar_arquivada(tipo, id, arquivada)?;
+        if tipo == Tipo::Avaliacoes {
+            self.fila_mudou();
+        }
+        Ok(())
     }
 
     /// Ao apagar: o item já se foi, e um `arquivadas.toml` ruim não deve virar erro do apagar.
@@ -244,8 +369,7 @@ impl Dados {
     // ----- rubricas -----
 
     pub fn ler_rubrica(&self, id: &str) -> Res<Rubrica> {
-        let caminho = self.caminho("rubricas", id, "toml")?;
-        let texto = ler_opcional(&caminho)?.ok_or_else(|| Erro::NaoEncontrado(format!("Rubrica “{id}” não existe")))?;
+        let texto = ler_opcional(&self.caminho(Tipo::Rubricas, id)?)?.ok_or_else(|| Tipo::Rubricas.nao_existe(id))?;
         let mut r: Rubrica =
             toml::from_str(&texto).map_err(|e| Erro::Invalido(format!("rubricas/{id}.toml: {}", e.message())))?;
         r.id = id.to_string();
@@ -257,7 +381,7 @@ impl Dados {
     /// Rubricas legíveis e, à parte, os arquivos com problema (para avisar na tela).
     pub fn listar_rubricas(&self) -> Res<(Vec<Rubrica>, Vec<String>)> {
         let (mut boas, mut problemas) = (Vec::new(), Vec::new());
-        for id in self.ids("rubricas", "toml")? {
+        for id in self.ids(&self.raiz.join("rubricas"), "toml")? {
             // Um arquivo ruim vira aviso; nunca derruba a lista inteira.
             match self.ler_rubrica(&id) {
                 Ok(r) => boas.push(r),
@@ -271,14 +395,14 @@ impl Dados {
 
     /// Grava a rubrica. Sem `id`, cria um arquivo novo com nome derivado do título.
     pub fn salvar_rubrica(&self, id: Option<&str>, mut r: Rubrica) -> Res<Rubrica> {
-        let _g = self.trava.lock().unwrap();
+        let _g = self.travar();
         r.normalizar();
         r.validar().map_err(Erro::Invalido)?;
         let id = match id {
             Some(id) => id.to_string(),
-            None => id_livre(&slug(&r.titulo), |c| self.raiz.join("rubricas").join(format!("{c}.toml")).exists()),
+            None => self.id_livre(Tipo::Rubricas, &r.titulo),
         };
-        let caminho = self.caminho("rubricas", &id, "toml")?;
+        let caminho = self.caminho(Tipo::Rubricas, &id)?;
         r.id.clear();
         let texto = toml::to_string_pretty(&r).map_err(|e| Erro::Invalido(e.to_string()))?;
         gravar(&caminho, texto.as_bytes())?;
@@ -304,24 +428,11 @@ impl Dados {
         self.salvar_rubrica(Some(id), r)
     }
 
-    pub fn apagar_rubrica(&self, id: &str) -> Res<()> {
-        let _g = self.trava.lock().unwrap();
-        let caminho = self.caminho("rubricas", id, "toml")?;
-        match fs::remove_file(caminho) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("Rubrica “{id}” não existe"))),
-            outro => {
-                outro?;
-                self.esquecer_arquivada(Tipo::Rubricas, id);
-                Ok(())
-            }
-        }
-    }
-
     // ----- turmas -----
 
     pub fn listar_turmas(&self) -> Res<Vec<Turma>> {
         let mut turmas = Vec::new();
-        for id in self.ids("turmas", "csv")? {
+        for id in self.ids(&self.raiz.join("turmas"), "csv")? {
             match self.ler_turma(&id) {
                 Ok(t) => turmas.push(t),
                 Err(Erro::Invalido(_) | Erro::Io(_)) => turmas.push(Turma { id, alunos: Vec::new() }),
@@ -332,12 +443,9 @@ impl Dados {
     }
 
     pub fn ler_turma(&self, id: &str) -> Res<Turma> {
-        let caminho = self.caminho("turmas", id, "csv")?;
-        let bytes = match fs::read(&caminho) {
+        let bytes = match fs::read(self.caminho(Tipo::Turmas, id)?) {
             Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(Erro::NaoEncontrado(format!("Turma “{id}” não existe")));
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Tipo::Turmas.nao_existe(id)),
             Err(e) => return Err(e.into()),
         };
         // Planilhas antigas exportam em Latin-1; cada byte vira o caractere de mesmo código.
@@ -346,39 +454,34 @@ impl Dados {
         Ok(Turma { id: id.to_string(), alunos })
     }
 
-    pub fn salvar_turma(&self, id: &str, csv: &str, nova: bool) -> Res<Turma> {
-        let _g = self.trava.lock().unwrap();
-        let caminho = self.caminho("turmas", id, "csv")?;
-        if nova && caminho.exists() {
+    /// Cria a turma; recusa se o nome já existe.
+    pub fn criar_turma(&self, id: &str, csv: &str) -> Res<Turma> {
+        let _g = self.travar();
+        if self.existe(Tipo::Turmas, id)? {
             return Err(Erro::Conflito(format!("Já existe uma turma chamada “{id}”")));
         }
-        let alunos = ler_alunos(csv).map_err(Erro::Invalido)?;
-        gravar(&caminho, escrever_alunos(&alunos).as_bytes())?;
-        Ok(Turma { id: id.to_string(), alunos })
+        self.gravar_turma(id, csv)
     }
 
-    pub fn apagar_turma(&self, id: &str) -> Res<()> {
-        let em_uso: Vec<String> = self.listar_avaliacoes()?.into_iter().filter(|a| a.turma == id).map(|a| a.titulo).collect();
-        if !em_uso.is_empty() {
-            return Err(Erro::Conflito(format!("A turma está em uso por: {}", em_uso.join(", "))));
+    /// Troca a lista de alunos de uma turma que existe.
+    pub fn substituir_turma(&self, id: &str, csv: &str) -> Res<Turma> {
+        let _g = self.travar();
+        if !self.existe(Tipo::Turmas, id)? {
+            return Err(Tipo::Turmas.nao_existe(id));
         }
-        let _g = self.trava.lock().unwrap();
-        let caminho = self.caminho("turmas", id, "csv")?;
-        match fs::remove_file(caminho) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Erro::NaoEncontrado(format!("Turma “{id}” não existe"))),
-            outro => {
-                outro?;
-                self.esquecer_arquivada(Tipo::Turmas, id);
-                Ok(())
-            }
-        }
+        self.gravar_turma(id, csv)
+    }
+
+    fn gravar_turma(&self, id: &str, csv: &str) -> Res<Turma> {
+        let alunos = ler_alunos(csv).map_err(Erro::Invalido)?;
+        gravar(&self.caminho(Tipo::Turmas, id)?, escrever_alunos(&alunos).as_bytes())?;
+        Ok(Turma { id: id.to_string(), alunos })
     }
 
     // ----- avaliações -----
 
     pub fn ler_avaliacao(&self, id: &str) -> Res<Avaliacao> {
-        let caminho = self.caminho("avaliacoes", id, "json")?;
-        let texto = ler_opcional(&caminho)?.ok_or_else(|| Erro::NaoEncontrado(format!("Avaliação “{id}” não existe")))?;
+        let texto = ler_opcional(&self.caminho(Tipo::Avaliacoes, id)?)?.ok_or_else(|| Tipo::Avaliacoes.nao_existe(id))?;
         let mut a: Avaliacao =
             serde_json::from_str(&texto).map_err(|e| Erro::Invalido(format!("avaliacoes/{id}.json: {e}")))?;
         a.id = id.to_string();
@@ -387,7 +490,7 @@ impl Dados {
 
     pub fn listar_avaliacoes(&self) -> Res<Vec<Avaliacao>> {
         let mut todas = Vec::new();
-        for id in self.ids("avaliacoes", "json")? {
+        for id in self.ids(&self.raiz.join("avaliacoes"), "json")? {
             match self.ler_avaliacao(&id) {
                 Ok(a) => todas.push(a),
                 Err(Erro::Invalido(_) | Erro::Io(_)) => {}
@@ -408,10 +511,14 @@ impl Dados {
         rubricas: Vec<(String, f64)>,
         atualizar: &[String],
     ) -> Res<Avaliacao> {
-        self.ler_turma(&turma).map_err(|e| match e {
+        // Tudo sob a trava: a turma e as rubricas lidas não somem antes de gravar.
+        let _g = self.travar();
+        // O que a avaliação cita e não existe é erro do pedido, não da rota.
+        let citado = |e| match e {
             Erro::NaoEncontrado(m) => Erro::Invalido(m),
             e => e,
-        })?;
+        };
+        self.ler_turma(&turma).map_err(citado)?;
         let anterior = match id {
             Some(id) => Some(self.ler_avaliacao(id)?),
             None => None,
@@ -425,44 +532,22 @@ impl Dados {
                 .map(|r| r.rubrica.clone());
             let rubrica = match copia {
                 Some(r) => r,
-                None => self.ler_rubrica(&origem).map_err(|e| match e {
-                    Erro::NaoEncontrado(m) => Erro::Invalido(m),
-                    e => e,
-                })?,
+                None => self.ler_rubrica(&origem).map_err(citado)?,
             };
             aplicadas.push(RubricaAplicada { origem, peso, rubrica });
         }
         let mut a = Avaliacao { id: String::new(), titulo, turma, nota_maxima, rubricas: aplicadas };
         a.validar().map_err(Erro::Invalido)?;
 
-        let _g = self.trava.lock().unwrap();
         let id = match id {
             Some(id) => id.to_string(),
-            None => id_livre(&slug(&a.titulo), |c| self.raiz.join("avaliacoes").join(format!("{c}.json")).exists()),
+            None => self.id_livre(Tipo::Avaliacoes, &a.titulo),
         };
-        let caminho = self.caminho("avaliacoes", &id, "json")?;
-        gravar(&caminho, serde_json::to_string_pretty(&a).unwrap().as_bytes())?;
+        gravar(&self.caminho(Tipo::Avaliacoes, &id)?, serde_json::to_string_pretty(&a).unwrap().as_bytes())?;
         a.id = id;
+        // Rubricas atualizadas podem mudar as sugestões do pipeline.
+        self.fila_mudou();
         Ok(a)
-    }
-
-    pub fn apagar_avaliacao(&self, id: &str) -> Res<()> {
-        let _g = self.trava.lock().unwrap();
-        let caminho = self.caminho("avaliacoes", id, "json")?;
-        match fs::remove_file(caminho) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(Erro::NaoEncontrado(format!("Avaliação “{id}” não existe")));
-            }
-            outro => outro?,
-        }
-        for sub in ["correcoes", "submissoes", "pipelines", "relatorios"] {
-            match fs::remove_dir_all(self.raiz.join(sub).join(id)) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
-        self.esquecer_arquivada(Tipo::Avaliacoes, id);
-        Ok(())
     }
 
     /// Origens cuja rubrica na pasta difere da cópia guardada na avaliação.
@@ -476,10 +561,14 @@ impl Dados {
 
     // ----- correções -----
 
-    fn caminho_correcao(&self, avaliacao: &str, aluno: &str) -> Res<PathBuf> {
+    fn pasta_correcoes(&self, avaliacao: &str) -> Res<PathBuf> {
         checar_id(avaliacao)?;
+        Ok(self.raiz.join("correcoes").join(avaliacao))
+    }
+
+    fn caminho_correcao(&self, avaliacao: &str, aluno: &str) -> Res<PathBuf> {
         checar_id(aluno)?;
-        Ok(self.raiz.join("correcoes").join(avaliacao).join(format!("{aluno}.json")))
+        Ok(self.pasta_correcoes(avaliacao)?.join(format!("{aluno}.json")))
     }
 
     pub fn ler_correcao(&self, avaliacao: &str, aluno: &str) -> Res<Option<Correcao>> {
@@ -493,10 +582,8 @@ impl Dados {
     }
 
     pub fn ler_correcoes(&self, avaliacao: &str) -> Res<BTreeMap<String, Correcao>> {
-        checar_id(avaliacao)?;
-        let sub = format!("correcoes/{avaliacao}");
         let mut todas = BTreeMap::new();
-        for aluno in self.ids(&sub, "json")? {
+        for aluno in self.ids(&self.pasta_correcoes(avaliacao)?, "json")? {
             if let Some(c) = self.ler_correcao(avaliacao, &aluno)? {
                 todas.insert(aluno, c);
             }
@@ -535,7 +622,7 @@ impl Dados {
             }
         }
 
-        let _g = self.trava.lock().unwrap();
+        let _g = self.travar();
         let mut c = self.ler_correcao(avaliacao, aluno)?.unwrap_or_default();
         if aceitas.is_empty() && comentario_geral.is_none() {
             return Ok((c, recusadas));
@@ -630,7 +717,7 @@ pontos = 1.0
         let raiz = pasta("arquivar");
         let d = Dados::abrir(&raiz).unwrap();
         fs::write(raiz.join("rubricas/codigo.toml"), RUBRICA).unwrap();
-        d.salvar_turma("Turma D", "1,Ana\n", true).unwrap();
+        d.criar_turma("Turma D", "1,Ana\n").unwrap();
         d.salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[]).unwrap();
 
         d.arquivar(Tipo::Rubricas, "codigo", true).unwrap();
@@ -653,9 +740,9 @@ pontos = 1.0
 
         // apagar tira do arquivo: recriar com o mesmo nome não nasce arquivado
         d.arquivar(Tipo::Turmas, "Turma D", true).unwrap();
-        d.apagar_avaliacao("tf").unwrap();
-        d.apagar_turma("Turma D").unwrap();
-        d.apagar_rubrica("codigo").unwrap();
+        d.apagar(Tipo::Avaliacoes, "tf").unwrap();
+        d.apagar(Tipo::Turmas, "Turma D").unwrap();
+        d.apagar(Tipo::Rubricas, "codigo").unwrap();
         let a = d.arquivadas();
         assert!(!a.contem(Tipo::Rubricas, "codigo") && !a.contem(Tipo::Turmas, "Turma D") && !a.contem(Tipo::Avaliacoes, "tf"));
 
@@ -666,11 +753,11 @@ pontos = 1.0
 
         // o arquivo estragado à mão não derruba a leitura (nada arquivado) nem o apagar;
         // só gravar por cima dele é recusado, para não perder o que estava lá
-        d.salvar_turma("Turma E", "1,Ana\n", true).unwrap();
+        d.criar_turma("Turma E", "1,Ana\n").unwrap();
         fs::write(raiz.join("arquivadas.toml"), "turmas = [").unwrap();
         assert!(!d.arquivadas().contem(Tipo::Turmas, "Turma E"));
         assert!(matches!(d.arquivar(Tipo::Turmas, "Turma E", true), Err(Erro::Invalido(_))));
-        d.apagar_turma("Turma E").unwrap();
+        d.apagar(Tipo::Turmas, "Turma E").unwrap();
         assert_eq!(fs::read_to_string(raiz.join("arquivadas.toml")).unwrap(), "turmas = [");
         fs::remove_dir_all(&raiz).unwrap();
     }
@@ -698,15 +785,15 @@ pontos = 1.0
         assert_eq!(nova.id, "codigo-2");
         assert_eq!(d.ler_rubrica("codigo-2").unwrap(), nova);
 
-        d.salvar_turma("Turma D", "matricula;nome\n1;Ana\n2;Bruno\n", true).unwrap();
-        assert!(matches!(d.salvar_turma("Turma D", "x", true), Err(Erro::Conflito(_))));
+        d.criar_turma("Turma D", "matricula;nome\n1;Ana\n2;Bruno\n").unwrap();
+        assert!(matches!(d.criar_turma("Turma D", "x"), Err(Erro::Conflito(_))));
         assert_eq!(fs::read_to_string(raiz.join("turmas/Turma D.csv")).unwrap(), "matricula,nome\n1,Ana\n2,Bruno\n");
 
         let av = d
             .salvar_avaliacao(None, "TF".into(), "Turma D".into(), 10.0, vec![("codigo".into(), 1.0)], &[])
             .unwrap();
         assert_eq!(av.id, "tf");
-        assert!(matches!(d.apagar_turma("Turma D"), Err(Erro::Conflito(_))));
+        assert!(matches!(d.apagar(Tipo::Turmas, "Turma D"), Err(Erro::Conflito(_))));
 
         // editar a rubrica na pasta não muda a cópia da avaliação, só a marca como desatualizada
         let mut editada = d.ler_rubrica("codigo").unwrap();
@@ -775,9 +862,9 @@ pontos = 1.0
         assert_eq!(av.rubricas[0].rubrica.criterios.len(), 1);
         assert!(d.rubricas_desatualizadas(&av).is_empty());
 
-        d.apagar_avaliacao("tf").unwrap();
+        d.apagar(Tipo::Avaliacoes, "tf").unwrap();
         assert!(!raiz.join("correcoes/tf").exists());
-        d.apagar_turma("Turma D").unwrap();
+        d.apagar(Tipo::Turmas, "Turma D").unwrap();
         fs::remove_dir_all(&raiz).unwrap();
     }
 }

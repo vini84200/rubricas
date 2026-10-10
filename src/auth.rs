@@ -2,7 +2,7 @@
 //! tokens de API (para scripts e para o Claude: `Authorization: Bearer …`).
 //! Cada usuário tem um papel global; o que ele pode fazer fica em `permissoes`.
 
-use crate::dados::gravar;
+use crate::dados::{Erro, Res, gravar, ler_opcional};
 use crate::permissoes::Quem;
 use argon2::{
     Argon2,
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io};
+use std::fs;
 
 pub const COOKIE: &str = "rubricas_sessao";
 pub const DURACAO_SESSAO: u64 = 30 * 24 * 3600;
@@ -69,7 +69,7 @@ pub enum ErroLogin {
 }
 
 pub struct Auth {
-    usuarios: PathBuf,
+    pub usuarios: Usuarios,
     arquivo_sessoes: PathBuf,
     /// SHA-256 do token → sessão. O token em si só existe no cookie.
     sessoes: Mutex<HashMap<String, Sessao>>,
@@ -109,113 +109,141 @@ fn confere(senha: &str, hash: &str) -> bool {
     PasswordHash::new(hash).map(|h| Argon2::default().verify_password(senha.as_bytes(), &h).is_ok()).unwrap_or(false)
 }
 
-fn ler_usuarios(caminho: &Path) -> io::Result<ArquivoUsuarios> {
-    match fs::read_to_string(caminho) {
-        Ok(t) => toml::from_str(&t).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ArquivoUsuarios::default()),
-        Err(e) => Err(e),
-    }
-}
-
-fn escrever_usuarios(caminho: &Path, arq: &ArquivoUsuarios) -> Result<(), String> {
-    gravar(caminho, toml::to_string_pretty(arq).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
-    restringir(caminho);
-    Ok(())
-}
-
 pub fn nome_valido(nome: &str) -> bool {
     !nome.is_empty() && nome.len() <= 40 && nome.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Cria o usuário (com o papel dado) ou troca a senha de um existente (e o papel
-/// fica como está). Devolve se criou.
-pub fn definir_senha(raiz: &Path, nome: &str, senha: &str, papel_se_novo: &str) -> Result<bool, String> {
-    if !nome_valido(nome) {
-        return Err("Use só letras sem acento, números, ponto, hífen ou sublinhado no nome".into());
-    }
+fn hash_de_senha(senha: &str) -> Res<String> {
     if senha.chars().count() < 8 {
-        return Err("A senha precisa ter pelo menos 8 caracteres".into());
+        return Err(Erro::Invalido("A senha precisa ter pelo menos 8 caracteres".into()));
     }
-    let caminho = raiz.join("usuarios.toml");
-    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
-    let hash = gerar_hash(senha)?;
-    let existente = arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome));
-    let novo = existente.is_none();
-    match existente {
-        // Senha nova derruba também o token de API.
-        Some(u) => {
+    gerar_hash(senha).map_err(Erro::Invalido)
+}
+
+fn nao_existe(nome: &str) -> Erro {
+    Erro::NaoEncontrado(format!("Não existe usuário {nome}."))
+}
+
+impl ArquivoUsuarios {
+    /// Nomes valem sem distinguir maiúsculas: `Vini` é `vini`.
+    fn achar(&mut self, nome: &str) -> Res<&mut Usuario> {
+        self.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome)).ok_or_else(|| nao_existe(nome))
+    }
+}
+
+/// O arquivo `usuarios.toml`. Toda mudança passa por `alterar`: ler, mudar e
+/// gravar sob a trava, para duas mudanças ao mesmo tempo não se sobrescreverem.
+pub struct Usuarios {
+    arquivo: PathBuf,
+    trava: Mutex<()>,
+}
+
+impl Usuarios {
+    pub fn abrir(raiz: &Path) -> Self {
+        Usuarios { arquivo: raiz.join("usuarios.toml"), trava: Mutex::new(()) }
+    }
+
+    fn ler(&self) -> Res<ArquivoUsuarios> {
+        match ler_opcional(&self.arquivo)? {
+            None => Ok(ArquivoUsuarios::default()),
+            Some(t) => toml::from_str(&t).map_err(|e| Erro::Invalido(format!("usuarios.toml: {}", e.message()))),
+        }
+    }
+
+    /// `gere` diz se um papel gere usuários: a mudança é recusada se deixaria o
+    /// sistema sem ninguém que gere (havendo alguém antes).
+    fn alterar<T>(&self, gere: impl Fn(&str) -> bool, f: impl FnOnce(&mut ArquivoUsuarios) -> Res<T>) -> Res<T> {
+        let _g = self.trava.lock().unwrap_or_else(|e| e.into_inner());
+        let mut arq = self.ler()?;
+        let alguem_gere = |a: &ArquivoUsuarios| a.usuarios.iter().any(|u| gere(&u.papel));
+        let antes = alguem_gere(&arq);
+        let r = f(&mut arq)?;
+        if antes && !alguem_gere(&arq) {
+            return Err(Erro::Conflito("É preciso ficar pelo menos um usuário que gere os demais (admin).".into()));
+        }
+        gravar(&self.arquivo, toml::to_string_pretty(&arq).map_err(|e| Erro::Invalido(e.to_string()))?.as_bytes())?;
+        restringir(&self.arquivo);
+        Ok(r)
+    }
+
+    pub fn listar(&self) -> Res<Vec<Resumo>> {
+        let mut v: Vec<Resumo> =
+            self.ler()?.usuarios.into_iter().map(|u| Resumo { tem_token: !u.token.is_empty(), nome: u.nome, papel: u.papel }).collect();
+        v.sort_by_key(|u| u.nome.to_lowercase());
+        Ok(v)
+    }
+
+    /// O nome como está gravado (`Vini` → `vini`), se o usuário existe.
+    pub fn nome_gravado(&self, nome: &str) -> Option<String> {
+        self.ler().ok()?.achar(nome).ok().map(|u| u.nome.clone())
+    }
+
+    /// Cria o usuário; recusa se o nome já existe. Lento (Argon2).
+    pub fn criar(&self, nome: &str, senha: &str, papel: &str) -> Res<()> {
+        if !nome_valido(nome) {
+            return Err(Erro::Invalido("Use só letras sem acento, números, ponto, hífen ou sublinhado no nome".into()));
+        }
+        let hash = hash_de_senha(senha)?;
+        self.alterar(|_| false, |arq| {
+            if arq.achar(nome).is_ok() {
+                return Err(Erro::Conflito(format!("Já existe o usuário {nome}.")));
+            }
+            arq.usuarios.push(Usuario { nome: nome.to_string(), hash, token: String::new(), papel: papel.into() });
+            Ok(())
+        })
+    }
+
+    /// Troca a senha de quem existe. A senha nova derruba as sessões e o token de API. Lento (Argon2).
+    pub fn trocar_senha(&self, nome: &str, senha: &str) -> Res<()> {
+        let hash = hash_de_senha(senha)?;
+        self.alterar(|_| false, |arq| {
+            let u = arq.achar(nome)?;
             u.hash = hash;
             u.token.clear();
-        }
-        None => arq.usuarios.push(Usuario { nome: nome.to_string(), hash, token: String::new(), papel: papel_se_novo.into() }),
+            Ok(())
+        })
     }
-    escrever_usuarios(&caminho, &arq)?;
-    Ok(novo)
-}
 
-pub fn listar(raiz: &Path) -> Result<Vec<Resumo>, String> {
-    let arq = ler_usuarios(&raiz.join("usuarios.toml")).map_err(|e| e.to_string())?;
-    let mut v: Vec<Resumo> =
-        arq.usuarios.into_iter().map(|u| Resumo { tem_token: !u.token.is_empty(), nome: u.nome, papel: u.papel }).collect();
-    v.sort_by_key(|u| u.nome.to_lowercase());
-    Ok(v)
-}
-
-/// O nome como está gravado (`Vini` → `vini`), se o usuário existe.
-pub fn nome_gravado(raiz: &Path, nome: &str) -> Option<String> {
-    listar(raiz).ok()?.into_iter().find(|u| u.nome.eq_ignore_ascii_case(nome)).map(|u| u.nome)
-}
-
-/// Troca o papel global. Quem valida o papel é a política.
-pub fn definir_papel(raiz: &Path, nome: &str, papel: &str) -> Result<(), String> {
-    let caminho = raiz.join("usuarios.toml");
-    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
-    let u = arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome)).ok_or(format!("Não existe usuário {nome}."))?;
-    u.papel = papel.into();
-    escrever_usuarios(&caminho, &arq)
-}
-
-/// Confere a senha atual de alguém (para trocar a própria senha). Lento (Argon2).
-pub fn senha_confere(raiz: &Path, nome: &str, senha: &str) -> bool {
-    ler_usuarios(&raiz.join("usuarios.toml"))
-        .ok()
-        .and_then(|a| a.usuarios.into_iter().find(|u| u.nome == nome))
-        .is_some_and(|u| confere(senha, &u.hash))
-}
-
-pub fn remover_usuario(raiz: &Path, nome: &str) -> Result<bool, String> {
-    let caminho = raiz.join("usuarios.toml");
-    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
-    let antes = arq.usuarios.len();
-    arq.usuarios.retain(|u| !u.nome.eq_ignore_ascii_case(nome));
-    if arq.usuarios.len() == antes {
-        return Ok(false);
+    /// Troca o papel global. Quem valida o papel é a política.
+    pub fn definir_papel(&self, nome: &str, papel: &str, gere: impl Fn(&str) -> bool) -> Res<()> {
+        self.alterar(gere, |arq| {
+            arq.achar(nome)?.papel = papel.into();
+            Ok(())
+        })
     }
-    escrever_usuarios(&caminho, &arq)?;
-    Ok(true)
-}
 
-/// Cria o token de API do usuário, substituindo o anterior. Devolve o token, que
-/// não fica gravado em lugar nenhum.
-pub fn criar_token(raiz: &Path, nome: &str) -> Result<String, String> {
-    let caminho = raiz.join("usuarios.toml");
-    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
-    let u = arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome)).ok_or(format!("Não existe usuário {nome}."))?;
-    let token = aleatorio();
-    u.token = resumo(&token);
-    escrever_usuarios(&caminho, &arq)?;
-    Ok(token)
-}
-
-pub fn remover_token(raiz: &Path, nome: &str) -> Result<bool, String> {
-    let caminho = raiz.join("usuarios.toml");
-    let mut arq = ler_usuarios(&caminho).map_err(|e| e.to_string())?;
-    match arq.usuarios.iter_mut().find(|u| u.nome.eq_ignore_ascii_case(nome) && !u.token.is_empty()) {
-        Some(u) => u.token.clear(),
-        None => return Ok(false),
+    /// Confere a senha atual de alguém (para trocar a própria senha). Lento (Argon2).
+    pub fn senha_confere(&self, nome: &str, senha: &str) -> bool {
+        self.ler().ok().and_then(|mut a| a.achar(nome).ok().map(|u| confere(senha, &u.hash))).unwrap_or(false)
     }
-    escrever_usuarios(&caminho, &arq)?;
-    Ok(true)
+
+    pub fn remover(&self, nome: &str, gere: impl Fn(&str) -> bool) -> Res<()> {
+        self.alterar(gere, |arq| {
+            let antes = arq.usuarios.len();
+            arq.usuarios.retain(|u| !u.nome.eq_ignore_ascii_case(nome));
+            if arq.usuarios.len() == antes { Err(nao_existe(nome)) } else { Ok(()) }
+        })
+    }
+
+    /// Cria o token de API do usuário, substituindo o anterior. Devolve o token, que
+    /// não fica gravado em lugar nenhum.
+    pub fn criar_token(&self, nome: &str) -> Res<String> {
+        let token = aleatorio();
+        self.alterar(|_| false, |arq| {
+            arq.achar(nome)?.token = resumo(&token);
+            Ok(())
+        })?;
+        Ok(token)
+    }
+
+    /// `false` se o usuário não tinha token.
+    pub fn remover_token(&self, nome: &str) -> Res<bool> {
+        self.alterar(|_| false, |arq| Ok(!std::mem::take(&mut arq.achar(nome)?.token).is_empty()))
+    }
+
+    fn todos(&self) -> Vec<Usuario> {
+        self.ler().map(|a| a.usuarios).unwrap_or_default()
+    }
 }
 
 /// Só o dono lê arquivos com hashes de senha ou sessões.
@@ -237,7 +265,7 @@ impl Auth {
         let t = agora();
         sessoes.retain(|_, s| s.expira > t);
         Auth {
-            usuarios: raiz.join("usuarios.toml"),
+            usuarios: Usuarios::abrir(raiz),
             arquivo_sessoes,
             sessoes: Mutex::new(sessoes),
             falhas: Mutex::new(HashMap::new()),
@@ -245,7 +273,7 @@ impl Auth {
     }
 
     pub fn total_usuarios(&self) -> usize {
-        ler_usuarios(&self.usuarios).map(|a| a.usuarios.len()).unwrap_or(0)
+        self.usuarios.todos().len()
     }
 
     fn persistir(&self, sessoes: &HashMap<String, Sessao>) {
@@ -267,8 +295,8 @@ impl Auth {
                     return Err(ErroLogin::Bloqueado(inicio + JANELA_FALHAS - t));
                 }
         }
-        let arq = ler_usuarios(&self.usuarios).unwrap_or_default();
-        let conta = arq.usuarios.iter().find(|u| u.nome.to_ascii_lowercase() == chave);
+        let todos = self.usuarios.todos();
+        let conta = todos.iter().find(|u| u.nome.eq_ignore_ascii_case(&chave));
         // Sem conta, confere contra um hash qualquer para o tempo de resposta não
         // revelar se o usuário existe.
         static FALSO: OnceLock<String> = OnceLock::new();
@@ -304,9 +332,8 @@ impl Auth {
             return None;
         }
         // Usuário removido, recriado ou com senha trocada pelo terminal perde o acesso na hora.
-        ler_usuarios(&self.usuarios)
-            .ok()?
-            .usuarios
+        self.usuarios
+            .todos()
             .into_iter()
             .find(|u| u.nome == s.usuario && resumo(&u.hash) == s.marca)
             .map(|u| Quem { nome: u.nome, papel: u.papel })
@@ -319,7 +346,7 @@ impl Auth {
             return None;
         }
         let r = resumo(token);
-        ler_usuarios(&self.usuarios).ok()?.usuarios.into_iter().find(|u| u.token == r).map(|u| Quem { nome: u.nome, papel: u.papel })
+        self.usuarios.todos().into_iter().find(|u| u.token == r).map(|u| Quem { nome: u.nome, papel: u.papel })
     }
 
     pub fn sair(&self, token: &str) {
@@ -334,16 +361,28 @@ impl Auth {
 mod testes {
     use super::*;
 
-    #[test]
-    fn login_sessao_e_bloqueio() {
-        let raiz = std::env::temp_dir().join(format!("rubricas-auth-{}", std::process::id()));
+    fn pasta(nome: &str) -> PathBuf {
+        let raiz = std::env::temp_dir().join(format!("rubricas-{nome}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&raiz);
         fs::create_dir_all(&raiz).unwrap();
+        raiz
+    }
 
-        assert!(definir_senha(&raiz, "vini", "curta", "admin").is_err());
-        assert!(definir_senha(&raiz, "nome com espaço", "senha-longa", "admin").is_err());
-        assert_eq!(definir_senha(&raiz, "vini", "senha-longa", "admin"), Ok(true));
-        assert_eq!(definir_senha(&raiz, "Vini", "outra-senha-longa", "admin"), Ok(false));
+    fn gere(papel: &str) -> bool {
+        papel == "admin"
+    }
+
+    #[test]
+    fn login_sessao_e_bloqueio() {
+        let raiz = pasta("auth");
+        let u = Usuarios::abrir(&raiz);
+
+        assert!(matches!(u.criar("vini", "curta", "admin"), Err(Erro::Invalido(_))));
+        assert!(matches!(u.criar("nome com espaço", "senha-longa", "admin"), Err(Erro::Invalido(_))));
+        u.criar("vini", "senha-longa", "admin").unwrap();
+        assert!(matches!(u.criar("Vini", "senha-longa", "admin"), Err(Erro::Conflito(_))));
+        u.trocar_senha("Vini", "outra-senha-longa").unwrap();
+        assert!(matches!(u.trocar_senha("ninguem", "outra-senha-longa"), Err(Erro::NaoEncontrado(_))));
         let texto = fs::read_to_string(raiz.join("usuarios.toml")).unwrap();
         assert!(texto.contains("$argon2id$") && !texto.contains("outra-senha-longa"));
 
@@ -370,74 +409,95 @@ mod testes {
         // trocar a senha derruba as sessões abertas com a antiga
         let outro = Auth::abrir(&raiz);
         let (token, _) = outro.entrar("vini", "outra-senha-longa").unwrap();
-        assert_eq!(definir_senha(&raiz, "vini", "terceira-senha-longa", "admin"), Ok(false));
+        u.trocar_senha("vini", "terceira-senha-longa").unwrap();
         assert_eq!(outro.usuario(&token), None);
         // remover o usuário também, e recriá-lo não as ressuscita
         let (token, _) = outro.entrar("vini", "terceira-senha-longa").unwrap();
-        assert_eq!(remover_usuario(&raiz, "vini"), Ok(true));
+        u.remover("vini", |_| false).unwrap();
         assert_eq!(outro.usuario(&token), None);
-        assert_eq!(definir_senha(&raiz, "vini", "terceira-senha-longa", "admin"), Ok(true));
+        u.criar("vini", "terceira-senha-longa", "admin").unwrap();
         assert_eq!(outro.usuario(&token), None);
         fs::remove_dir_all(&raiz).unwrap();
     }
 
     #[test]
     fn tokens_de_api() {
-        let raiz = std::env::temp_dir().join(format!("rubricas-token-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&raiz);
-        fs::create_dir_all(&raiz).unwrap();
+        let raiz = pasta("token");
         let auth = Auth::abrir(&raiz);
+        let u = &auth.usuarios;
 
-        assert!(criar_token(&raiz, "ninguem").is_err());
-        definir_senha(&raiz, "vini", "senha-longa", "admin").unwrap();
-        let token = criar_token(&raiz, "VINI").unwrap();
+        assert!(u.criar_token("ninguem").is_err());
+        u.criar("vini", "senha-longa", "admin").unwrap();
+        let token = u.criar_token("VINI").unwrap();
         assert_eq!(auth.usuario_por_token(&token).map(|q| q.nome).as_deref(), Some("vini"));
         assert_eq!(auth.usuario_por_token("inventado"), None);
         assert_eq!(auth.usuario_por_token(""), None);
         assert!(!fs::read_to_string(raiz.join("usuarios.toml")).unwrap().contains(&token));
 
         // um token novo substitui o anterior
-        let novo = criar_token(&raiz, "vini").unwrap();
+        let novo = u.criar_token("vini").unwrap();
         assert_eq!(auth.usuario_por_token(&token), None);
         assert_eq!(auth.usuario_por_token(&novo).map(|q| q.nome).as_deref(), Some("vini"));
 
-        assert_eq!(remover_token(&raiz, "vini"), Ok(true));
-        assert_eq!(remover_token(&raiz, "vini"), Ok(false));
+        assert!(u.remover_token("vini").unwrap());
+        assert!(!u.remover_token("vini").unwrap());
         assert_eq!(auth.usuario_por_token(&novo), None);
 
         // trocar a senha ou remover o usuário também derruba o token
-        let t = criar_token(&raiz, "vini").unwrap();
-        definir_senha(&raiz, "vini", "outra-senha-longa", "admin").unwrap();
+        let t = u.criar_token("vini").unwrap();
+        u.trocar_senha("vini", "outra-senha-longa").unwrap();
         assert_eq!(auth.usuario_por_token(&t), None);
-        let t = criar_token(&raiz, "vini").unwrap();
-        remover_usuario(&raiz, "vini").unwrap();
+        let t = u.criar_token("vini").unwrap();
+        u.remover("vini", |_| false).unwrap();
         assert_eq!(auth.usuario_por_token(&t), None);
         fs::remove_dir_all(&raiz).unwrap();
     }
 
     #[test]
     fn papel_global() {
-        let raiz = std::env::temp_dir().join(format!("rubricas-papel-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&raiz);
-        fs::create_dir_all(&raiz).unwrap();
+        let raiz = pasta("papel");
+        let u = Usuarios::abrir(&raiz);
         // gravado antes das permissões, sem papel: continua podendo tudo
-        definir_senha(&raiz, "vini", "senha-longa", "admin").unwrap();
+        u.criar("vini", "senha-longa", "admin").unwrap();
         let texto = fs::read_to_string(raiz.join("usuarios.toml")).unwrap().replace("papel = \"admin\"\n", "");
         assert!(!texto.contains("papel"));
         fs::write(raiz.join("usuarios.toml"), texto).unwrap();
-        let t = criar_token(&raiz, "vini").unwrap();
         let auth = Auth::abrir(&raiz);
+        let t = auth.usuarios.criar_token("vini").unwrap();
         assert_eq!(auth.usuario_por_token(&t).unwrap().papel, "admin");
 
         // trocar o papel vale na hora, sem derrubar a sessão
-        definir_senha(&raiz, "ana", "senha-longa", "monitor").unwrap();
+        u.criar("ana", "senha-longa", "monitor").unwrap();
         let (sessao, _) = auth.entrar("ana", "senha-longa").unwrap();
         assert_eq!(auth.usuario(&sessao).unwrap().papel, "monitor");
-        definir_papel(&raiz, "ANA", "professor").unwrap();
+        u.definir_papel("ANA", "professor", gere).unwrap();
         assert_eq!(auth.usuario(&sessao).unwrap().papel, "professor");
-        assert_eq!(listar(&raiz).unwrap().iter().map(|u| (u.nome.as_str(), u.papel.as_str())).collect::<Vec<_>>(), [("ana", "professor"), ("vini", "admin")]);
-        assert!(senha_confere(&raiz, "ana", "senha-longa"));
-        assert!(!senha_confere(&raiz, "ana", "errada"));
+        assert_eq!(u.listar().unwrap().iter().map(|u| (u.nome.as_str(), u.papel.as_str())).collect::<Vec<_>>(), [("ana", "professor"), ("vini", "admin")]);
+        assert!(u.senha_confere("ana", "senha-longa"));
+        assert!(!u.senha_confere("ana", "errada"));
+
+        // o último que gere usuários não perde o papel nem é removido
+        assert!(matches!(u.definir_papel("vini", "professor", gere), Err(Erro::Conflito(_))));
+        assert!(matches!(u.remover("vini", gere), Err(Erro::Conflito(_))));
+        u.definir_papel("ana", "admin", gere).unwrap();
+        u.remover("vini", gere).unwrap();
+        assert_eq!(u.nome_gravado("ANA").as_deref(), Some("ana"));
+        assert_eq!(u.nome_gravado("vini"), None);
+        fs::remove_dir_all(&raiz).unwrap();
+    }
+
+    #[test]
+    fn mudancas_ao_mesmo_tempo_nao_se_perdem() {
+        let raiz = pasta("concorrencia");
+        let u = std::sync::Arc::new(Usuarios::abrir(&raiz));
+        let fios: Vec<_> = (0..8)
+            .map(|i| {
+                let u = u.clone();
+                std::thread::spawn(move || u.criar(&format!("u{i}"), "senha-longa", "monitor").unwrap())
+            })
+            .collect();
+        fios.into_iter().for_each(|f| f.join().unwrap());
+        assert_eq!(u.listar().unwrap().len(), 8);
         fs::remove_dir_all(&raiz).unwrap();
     }
 }

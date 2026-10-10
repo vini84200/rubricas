@@ -23,30 +23,45 @@ papeis := {
 
 papeis_globais := ["admin", "professor", "monitor", "executor"]
 
-# Cada papel inclui as ações dos anteriores.
+# Papel de quem é criado pelo terminal sem --papel (o primeiro usuário recebe
+# um papel que pode gerir_usuarios). Opcional: sem ele, o terminal pede o papel.
+papel_global_padrao := "monitor"
+
+# O que cada papel acrescenta aos anteriores (na ordem de `papeis`); cada um
+# pode tudo o que os de antes podem.
 #   ver            abrir, listar, ler arquivos e relatórios
 #   exportar       baixar as notas (CSV, planilha do Moodle)
 #   corrigir       marcar a rubrica e editar o código do aluno
 #   editar         mudar a avaliação, importar submissões, mudar as checagens
 #   arquivar, apagar, compartilhar
 #   ler_checagens  baixar pipeline e código para rodar as checagens (o executor)
-acoes_do_papel := {
+# O último papel de cada lista é o de quem cria o item, e todo item precisa
+# de pelo menos um.
+acrescenta := {
 	"avaliacao": {
 		"leitor": {"ver", "exportar", "ler_checagens"},
-		"avaliador": {"ver", "exportar", "ler_checagens", "corrigir"},
-		"editor": {"ver", "exportar", "ler_checagens", "corrigir", "editar", "arquivar"},
-		"dono": {"ver", "exportar", "ler_checagens", "corrigir", "editar", "arquivar", "apagar", "compartilhar"},
+		"avaliador": {"corrigir"},
+		"editor": {"editar", "arquivar"},
+		"dono": {"apagar", "compartilhar"},
 	},
 	"rubrica": {
 		"leitor": {"ver"},
-		"editor": {"ver", "editar", "arquivar"},
-		"dono": {"ver", "editar", "arquivar", "apagar", "compartilhar"},
+		"editor": {"editar", "arquivar"},
+		"dono": {"apagar", "compartilhar"},
 	},
 	"turma": {
 		"leitor": {"ver"},
-		"editor": {"ver", "editar", "arquivar"},
-		"dono": {"ver", "editar", "arquivar", "apagar", "compartilhar"},
+		"editor": {"editar", "arquivar"},
+		"dono": {"apagar", "compartilhar"},
 	},
+}
+
+acoes_do_papel := {tipo: por_papel |
+	some tipo, lista in papeis
+	por_papel := {papel: acoes |
+		some i, papel in lista
+		acoes := {a | some anterior in array.slice(lista, 0, i + 1); some a in acrescenta[tipo][anterior]}
+	}
 }
 
 # Ações sobre o sistema como um todo.
@@ -54,6 +69,7 @@ acoes_do_papel := {
 #   gerir_usuarios  criar, remover e mudar o papel de usuários
 #   executar        pegar tarefas da fila de checagens e enviar resultados
 #   ver_tudo        enxergar e mexer em tudo, mesmo sem acesso concedido
+# Ao menos um usuário precisa poder gerir_usuarios.
 acoes_globais := {
 	"admin": {"criar", "gerir_usuarios", "executar", "ver_tudo"},
 	"professor": {"criar"},
@@ -67,15 +83,19 @@ acoes := acoes_globais[input.usuario.papel] if input.recurso.tipo == "sistema"
 
 acoes := todas if {
 	input.recurso.tipo != "sistema"
-	input.usuario.papel == "admin"
+	ve_tudo
 }
 
 acoes := concedidas | do_executor if {
 	input.recurso.tipo != "sistema"
-	input.usuario.papel != "admin"
+	not ve_tudo
 }
 
-todas := acoes_do_papel[input.recurso.tipo].dono
+ve_tudo if "ver_tudo" in acoes_globais[input.usuario.papel]
+
+maior := papeis[input.recurso.tipo][count(papeis[input.recurso.tipo]) - 1]
+
+todas := acoes_do_papel[input.recurso.tipo][maior]
 
 concedidas := acoes_do_papel[input.recurso.tipo][input.acesso] if input.acesso != null
 
