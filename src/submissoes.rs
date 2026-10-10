@@ -9,7 +9,7 @@
 //! ```
 
 use crate::dados::{Dados, Erro, Res, checar_id, gravar, ler_opcional};
-use crate::modelo::slug;
+use crate::modelo::{Turma, slug};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -238,7 +238,7 @@ impl Dados {
         }
     }
 
-    fn apelidos(&self, turma: &str) -> Res<BTreeMap<String, String>> {
+    pub(crate) fn apelidos(&self, turma: &str) -> Res<BTreeMap<String, String>> {
         checar_id(turma)?;
         match ler_opcional(&self.raiz().join("apelidos").join(format!("{turma}.json")))? {
             None => Ok(BTreeMap::new()),
@@ -253,20 +253,7 @@ impl Dados {
         let turma = self.ler_turma(&av.turma)?;
         let apelidos = self.apelidos(&turma.id)?;
         let (entregas, ignorados) = ler_zip(zip)?;
-        let mut por_nome: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-        for a in &turma.alunos {
-            por_nome.entry(slug(&a.nome)).or_default().push(&a.id);
-        }
-        let dono = |nome: &str| -> Option<String> {
-            let chave = slug(nome);
-            if let Some(id) = apelidos.get(&chave).filter(|id| turma.alunos.iter().any(|a| &a.id == *id)) {
-                return Some(id.clone());
-            }
-            match por_nome.get(&chave).map(|v| v.as_slice()) {
-                Some([id]) => Some(id.to_string()),
-                _ => None,
-            }
-        };
+        let dono = dono_pelo_nome(&turma, &apelidos);
 
         let pasta = self.pasta_submissoes(avaliacao)?;
         let _g = self.travar();
@@ -436,6 +423,25 @@ impl Dados {
 }
 
 /// A chave de um nome sem dono vira nome de pasta.
+/// O aluno da turma de um nome do Moodle: o associado à mão (`apelidos`) ou,
+/// sem associação, o único aluno de mesmo nome.
+pub(crate) fn dono_pelo_nome<'a>(turma: &'a Turma, apelidos: &'a BTreeMap<String, String>) -> impl Fn(&str) -> Option<String> + 'a {
+    let mut por_nome: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for a in &turma.alunos {
+        por_nome.entry(slug(&a.nome)).or_default().push(&a.id);
+    }
+    move |nome| {
+        let chave = slug(nome);
+        if let Some(id) = apelidos.get(&chave).filter(|id| turma.alunos.iter().any(|a| &a.id == *id)) {
+            return Some(id.clone());
+        }
+        match por_nome.get(&chave).map(|v| v.as_slice()) {
+            Some([id]) => Some(id.to_string()),
+            _ => None,
+        }
+    }
+}
+
 fn chave_sem_dono(nome: &str) -> String {
     let s = slug(nome);
     if s.is_empty() { "sem-nome".into() } else { s }

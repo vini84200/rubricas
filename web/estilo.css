@@ -197,6 +197,8 @@ input[type='file'] { font-size: 15px; }
 
 .acoes { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .acoes-notas { margin-bottom: 16px; }
+.planilha-moodle { flex-basis: 100%; order: 1; }
+.planilha-moodle p { margin: 0 0 4px; }
 
 .segmentos { display: flex; flex-wrap: wrap; gap: 6px; }
 .segmento {

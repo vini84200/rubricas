@@ -405,7 +405,7 @@ struct OpcoesCsv {
     br: Option<String>,
 }
 
-fn numero(v: f64, br: bool) -> String {
+pub(crate) fn numero(v: f64, br: bool) -> String {
     let s = format!("{:.2}", arredondar(v));
     let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
     let s = if s == "-0" { "0".to_string() } else { s };

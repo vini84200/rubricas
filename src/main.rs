@@ -7,6 +7,7 @@ mod estatico;
 mod executor;
 mod fila;
 mod modelo;
+mod moodle;
 mod pipeline;
 mod submissoes;
 

@@ -5,6 +5,7 @@ use crate::api::{Erro, Estado, Res, Usuario, texto_puro};
 use crate::auth;
 use crate::dados::Dados;
 use crate::fila::{ResultadoPlagio, Tarefa};
+use crate::moodle;
 use crate::pipeline::Relatorio;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -66,6 +67,7 @@ pub fn rotas() -> Router<Estado> {
             get(listar_submissoes).post(importar).layer(DefaultBodyLimit::max(MAX_ZIP)),
         )
         .route("/avaliacoes/{id}/submissoes/sem-dono/{chave}", post(associar))
+        .route("/avaliacoes/{id}/planilha-moodle", post(planilha_moodle))
         .route("/avaliacoes/{id}/submissoes/{aluno}", get(submissao))
         .route(
             "/avaliacoes/{id}/submissoes/{aluno}/{*caminho}",
@@ -181,6 +183,22 @@ async fn importar(State(e): State<Estado>, Path(id): Path<String>, corpo: Bytes)
     let r = bloqueante(move || Ok(dados.importar_submissoes(&id, &corpo, auth::agora())?)).await?;
     e.avisos.fila_mudou();
     Ok(Json(json!(r)))
+}
+
+/// Recebe a planilha de notas da tarefa do Moodle e a devolve preenchida, com o
+/// resumo do que ficou de fora; a tela baixa o `csv` como arquivo.
+async fn planilha_moodle(State(e): State<Estado>, Path(id): Path<String>, corpo: Bytes) -> Res<Json<Value>> {
+    let dados = e.dados.clone();
+    let p = bloqueante(move || {
+        let av = dados.ler_avaliacao(&id)?;
+        let turma = dados.ler_turma(&av.turma)?;
+        let correcoes = dados.ler_correcoes(&id)?;
+        let apelidos = dados.apelidos(&turma.id)?;
+        let texto = como_texto(&corpo).ok_or(Erro(StatusCode::UNPROCESSABLE_ENTITY, "Isto não parece a planilha de notas do Moodle".into()))?;
+        moodle::preencher_planilha(&texto, &av, &turma, &correcoes, &apelidos).map_err(|m| Erro(StatusCode::UNPROCESSABLE_ENTITY, m))
+    })
+    .await?;
+    Ok(Json(json!(p)))
 }
 
 async fn listar_submissoes(State(e): State<Estado>, Path(id): Path<String>) -> Res<Json<Value>> {

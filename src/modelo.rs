@@ -524,22 +524,26 @@ fn id_seguro(s: &str) -> String {
     limpo.trim_start_matches('.').trim().to_string()
 }
 
-/// Lê uma lista de alunos. Aceita `,`, `;` ou tabulação, com ou sem cabeçalho,
-/// com colunas de matrícula e nome em qualquer ordem — inclusive a exportação
-/// de participantes do Moodle (Nome, Sobrenome, Número de identificação).
-pub fn ler_alunos(texto: &str) -> Result<Vec<Aluno>, String> {
-    let texto = texto.trim_start_matches('\u{feff}');
+/// `,`, `;` (Excel em português) ou tabulação, o que mais aparece na primeira linha.
+pub fn separador(texto: &str) -> u8 {
     let primeira = texto.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let conta = |c: char| primeira.matches(c).count();
-    let sep = if conta('\t') > 0 && conta('\t') >= conta(';').max(conta(',')) {
+    if conta('\t') > 0 && conta('\t') >= conta(';').max(conta(',')) {
         b'\t'
     } else if conta(';') > conta(',') {
         b';'
     } else {
         b','
-    };
+    }
+}
+
+/// Lê uma lista de alunos. Aceita `,`, `;` ou tabulação, com ou sem cabeçalho,
+/// com colunas de matrícula e nome em qualquer ordem — inclusive a exportação
+/// de participantes do Moodle (Nome, Sobrenome, Número de identificação).
+pub fn ler_alunos(texto: &str) -> Result<Vec<Aluno>, String> {
+    let texto = texto.trim_start_matches('\u{feff}');
     let mut leitor = csv::ReaderBuilder::new()
-        .delimiter(sep)
+        .delimiter(separador(texto))
         .has_headers(false)
         .flexible(true)
         .trim(csv::Trim::All)

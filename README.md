@@ -212,6 +212,17 @@ editado direto na pasta é notado em até 10 minutos.
 Além da sessão por cookie, a API aceita `Authorization: Bearer <token>`. O token é criado no
 servidor com `rubricas token NOME`, mostrado uma vez só e guardado como SHA-256. Ele tem os mesmos
 poderes do usuário e deixa de valer quando o usuário troca a senha ou é removido.
+**Notas de volta ao Moodle.** Na tarefa, com o feedback "Planilha de notas offline" ligado, baixe
+"Planilha de notas" e mande o arquivo em "Preencher planilha do Moodle" na tela da avaliação: a
+mesma planilha volta preenchida, pronta para "Carregar planilha de notas" na tarefa. Cada linha
+casa pelo "Número de identificação" (se a planilha o traz), pelas associações feitas no ZIP ou
+pelo nome. Só vai nota de correção concluída; os comentários dos critérios e o geral vão para
+"Comentários de feedback", se a coluna existir e houver algum. O resto da linha volta como veio:
+quem não foi avaliado ou está incompleto mantém o que o Moodle tinha, e linha com "A nota pode ser
+alterada: Não" não é mexida. O separador decimal segue o da planilha (o Moodle em inglês leria
+"7,5" como 75), a planilha sai sempre separada por vírgula (o padrão do envio), e se a nota máxima da tarefa difere da avaliação a nota é convertida. A tela lista
+quem ficou de fora e por quê. Código em `src/moodle.rs`.
+
 
 Para gastar poucos tokens, as rubricas também são lidas e gravadas em texto:
 
@@ -262,7 +273,7 @@ docker compose run --rm rubricas token vini --dados /dados
 ## Desenvolver
 
 ```sh
-cargo test                                             # modelo, pasta de dados, autenticação, ZIP, pipeline, fila
+cargo test                                             # modelo, pasta de dados, autenticação, ZIP, pipeline, fila, planilha do Moodle
 cargo run -- servir --dados dados --web web            # front-end do disco, sem recompilar
 ```
 
@@ -274,8 +285,8 @@ Atkinson Hyperlegible em `web/fontes` (de `@fontsource/atkinson-hyperlegible@5.3
 ## O que não faz
 
 - Avaliar em dupla ou grupo: a correção é por aluno.
-- Conversar com o Moodle: as submissões entram pelo ZIP baixado à mão e as notas saem em CSV (um
-  normal e um para o Excel em português).
+- Conversar com o Moodle: as submissões entram pelo ZIP baixado à mão e as notas saem pela
+  planilha de notas da tarefa (ou em CSV, um normal e um para o Excel em português).
 - Comentários por linha no código: o comentário continua sendo por critério.
 - Edição simultânea da mesma rubrica: a última gravação vence, sem aviso.
 - Histórico de alterações das correções: o arquivo guarda só o estado atual, quem alterou por

@@ -245,6 +245,7 @@ export function Resultados({ id }) {
     <div class="acoes acoes-notas">
       <a class="botao pequeno" href=${csv} download>Baixar notas (CSV)</a>
       <a class="botao pequeno" href=${`${csv}?br=1`} download>CSV para Excel em português</a>
+      <${PlanilhaMoodle} id=${id} />
       <a class="botao pequeno" href=${`#${rota('avaliacoes', id, 'editar')}`}>Editar</a>
       <button class="botao pequeno perigo" onClick=${apagar}>Apagar</button>
     </div>
@@ -281,6 +282,58 @@ export function Resultados({ id }) {
       </table>
     </div>
     </div>
+  `;
+}
+
+/**
+ * Recebe a planilha de notas baixada da tarefa do Moodle e baixa de volta a mesma
+ * planilha preenchida, pronta para "Carregar planilha de notas".
+ */
+function PlanilhaMoodle({ id }) {
+  const [enviando, setEnviando] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  async function enviar(e) {
+    const arquivo = e.target.files?.[0];
+    e.target.value = '';
+    if (!arquivo) return;
+    setEnviando(true);
+    setMsg(null);
+    try {
+      const r = await api('POST', `/avaliacoes/${encodeURIComponent(id)}/planilha-moodle`, arquivo);
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(new Blob([r.csv], { type: 'text/csv;charset=utf-8' }));
+      link.download = `${arquivo.name.replace(/\.csv$/i, '')}-com-notas.csv`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+      const avisos = [];
+      if (r.incompletas.length) avisos.push(`Correção incompleta, nota não preenchida (fica a que estiver no Moodle): ${r.incompletas.join(', ')}.`);
+      if (r.fora_da_planilha.length) avisos.push(`Avaliados que não estão na planilha: ${r.fora_da_planilha.join(', ')}.`);
+      if (r.sem_aluno.length) avisos.push(`Nomes do Moodle que não casaram com ninguém da turma: ${r.sem_aluno.join(', ')}.`);
+      if (r.bloqueadas.length) avisos.push(`Nota travada no Moodle, não mexida: ${r.bloqueadas.join(', ')}.`);
+      const convertidas = r.convertida_para ? ` (convertidas para a nota máxima do Moodle, ${num(r.convertida_para)})` : '';
+      setMsg({
+        ok: true,
+        texto: `${plural(r.preenchidas, 'nota preenchida', 'notas preenchidas')}${convertidas}. No Moodle, envie o arquivo baixado em “Carregar planilha de notas” da tarefa.`,
+        avisos,
+      });
+    } catch (err) {
+      setMsg({ ok: false, texto: err.message, avisos: [] });
+    }
+    setEnviando(false);
+  }
+
+  return html`
+    <label class=${cls('botao', 'pequeno', enviando && 'ocupado')} title="A planilha que a tarefa do Moodle baixa em “Baixar planilha de notas”">
+      <input type="file" accept=".csv,text/csv" class="escondido" disabled=${enviando} onChange=${enviar} />
+      ${enviando ? 'Preenchendo…' : 'Preencher planilha do Moodle'}
+    </label>
+    ${msg && html`
+      <div class="planilha-moodle" role="status">
+        <p class=${msg.ok ? 'ok' : 'erro'}>${msg.texto}</p>
+        ${msg.avisos.map((t) => html`<p class="pendente">${t}</p>`)}
+      </div>
+    `}
   `;
 }
 
