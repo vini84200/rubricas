@@ -291,6 +291,7 @@ docker compose run --rm rubricas token vini --dados /dados
 
 ```sh
 cargo test                                             # modelo, pasta de dados, autenticação, ZIP, pipeline, fila, planilha do Moodle
+node --test testes/*.test.mjs                          # diff colorido entre a saída esperada e a obtida (fora de web/, que vai inteiro no binário)
 cargo run -- servir --dados dados --web web            # front-end do disco, sem recompilar
 ```
 

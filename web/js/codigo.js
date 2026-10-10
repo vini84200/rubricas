@@ -3,6 +3,7 @@
 import { html, useState, useEffect, useRef } from '../vendor/preact-htm.js';
 import Prism from '../vendor/prism.js';
 import { api } from './api.js';
+import { diferencas } from './diff.js';
 import { cls, plural, guarda } from './util.js';
 
 const cache = new Map();
@@ -256,15 +257,24 @@ export function Codigo({ avaliacao, aluno, arquivos, aoMudar }) {
 
 const SINAL = { passou: '✓', falhou: '✗', erro: '!' };
 
+/** Uma saída com as linhas e os trechos que diferem do outro lado coloridos. */
+function Saida({ linhas, lado }) {
+  return html`<pre class=${cls('saida-diff', lado)}>${linhas.map((l) => html`<span class=${cls('diff-linha', l.mudou && 'mudou')}>${
+    l.mudou && !l.partes.length ? html`<mark>⏎</mark>` : l.partes.map((p) => (p.mudou ? html`<mark>${p.texto}</mark>` : p.texto))
+  }</span>`)}</pre>`;
+}
+
 function Caso({ c }) {
+  // Saída cortada no começo ("…") não alinha com a esperada: aí vai sem cores.
+  const d = !c.passou && c.obtido && !c.obtido.startsWith('…') && diferencas(c.esperado, c.obtido);
   return html`
     <li class=${cls('caso', c.passou ? 'passou' : 'falhou')}>
       <p><strong>${c.nome}</strong>${!c.passou && html` — ${c.motivo}`}</p>
       ${!c.passou && html`
         <div class="caso-par">
           <div><span>Entrada</span><pre>${c.entrada || '(vazia)'}</pre></div>
-          <div><span>Esperado</span><pre>${c.esperado}</pre></div>
-          <div><span>Obtido</span><pre>${c.obtido || '(nada)'}</pre></div>
+          <div><span>Esperado</span>${d ? html`<${Saida} linhas=${d.esperado} lado="esperado" />` : html`<pre>${c.esperado}</pre>`}</div>
+          <div><span>Obtido</span>${d ? html`<${Saida} linhas=${d.obtido} lado="obtido" />` : html`<pre>${c.obtido || '(nada)'}</pre>`}</div>
         </div>
         ${c.erro && html`<div class="caso-erro"><span>Fim do erro</span><pre>${c.erro}</pre></div>`}
       `}

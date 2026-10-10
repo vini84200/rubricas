@@ -791,13 +791,19 @@ details.checagem[open] > summary .checagem-resumo::after { content: ' ▾'; }
 .casos { display: grid; gap: 8px; padding: 4px 10px 10px; }
 .caso p { font-size: 15px; }
 .caso-par { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 4px; }
-.caso-par span, .caso-erro span { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
+.caso-par > div > span, .caso-erro > span { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
 .caso pre, .checagem-saida {
   margin: 0; padding: 6px 8px; border-radius: 6px; background: #0b1813; color: #e6efe7;
   font: 13px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto;
 }
 .checagem-saida { margin: 0 10px 10px; }
 .caso-erro { margin-top: 6px; }
+.diff-linha { display: block; min-height: 1.4em; }
+.saida-diff.esperado .diff-linha.mudou { background: color-mix(in srgb, var(--sim-giz) 12%, transparent); }
+.saida-diff.obtido .diff-linha.mudou { background: color-mix(in srgb, var(--nao-giz) 12%, transparent); }
+.saida-diff mark { color: inherit; border-radius: 2px; }
+.saida-diff.esperado mark { background: color-mix(in srgb, var(--sim-giz) 40%, transparent); }
+.saida-diff.obtido mark { background: color-mix(in srgb, var(--nao-giz) 40%, transparent); }
 @media (max-width: 520px) { .caso-par { grid-template-columns: minmax(0, 1fr); } }
 
 /* Entregas na tela da avaliação */
